@@ -293,6 +293,8 @@
                 firstFrameShown : false,
                 timeUpdateCount : 0,
                 maxCurrentTimeSeen : 0,
+                _lastDurationShown : NaN,
+                _scrubTimer : null,
                 _isAudioOnly : false,
                 get isAudioOnly() { return this._isAudioOnly; },
                 set isAudioOnly(val) {
@@ -486,6 +488,7 @@
                         case "play":
                             this.setPlayButtonState(false);
                             this.setupStatusFader();
+                            this.startScrubTimer();   // Jihad: smooth the scrubber (see startScrubTimer)
                             if (!this._triggeredByControls && this.dynamicControls && this.videocontrols.isTouchControl)
                                 this.startFadeOut(this.controlBar);
                             if (!this._triggeredByControls)
@@ -497,14 +500,21 @@
                             // while dragging the scrubber, don't change the button state.
                             if (!this.scrubber.isDragging)
                                 this.setPlayButtonState(true);
+                            this.stopScrubTimer();    // Jihad: no interpolation while paused
                             this.setupStatusFader();
                             break;
                         case "ended":
                             this.setPlayButtonState(true);
-                            // We throttle timechange events, so the thumb might not be
-                            // exactly at the end when the video finishes.
-                            this.showPosition(Math.round(this.video.currentTime * 1000),
-                                              Math.round(this.video.duration * 1000));
+                            this.stopScrubTimer();    // Jihad: playback done, stop interpolating
+                            // timeupdate is throttled, so the last position reported before "ended"
+                            // is a few ms short of the duration, which left the thumb resting short of
+                            // the end on the offscreen surface ("doesn't come to rest at clip end").
+                            // At "ended" the position IS the end, so snap the thumb there. Streams
+                            // (non-finite duration) keep the last-seen position.
+                            var endDurMs = Math.round(this.video.duration * 1000);
+                            var endPosMs = isFinite(endDurMs) ? endDurMs
+                                                             : Math.round(this.video.currentTime * 1000);
+                            this.showPosition(endPosMs, endDurMs);
                             this.startFadeIn(this.controlBar);
                             this.setupStatusFader();
                             break;
@@ -607,6 +617,10 @@
                         case "playing":
                         case "canplay":
                         case "canplaythrough":
+                            // Jihad: resume smoothing if playback picked back up after buffering
+                            // (idempotent; no-op if already running or if still paused/ended).
+                            if (!this.video.paused && !this.video.ended)
+                                this.startScrubTimer();
                             this.setupStatusFader();
                             break;
                         case "error":
@@ -641,6 +655,7 @@
                 },
 
                 terminateEventListeners : function () {
+                    this.stopScrubTimer();   // Jihad: don't leak the smoothing interval on detach
                     if (this.videoEvents) {
                       for (let event of this.videoEvents) {
                           this.video.removeEventListener(event, this, {
@@ -746,6 +761,19 @@
 
                 showDuration : function (duration) {
                     let isInfinite = (duration == Infinity);
+
+                    // Jihad: showPosition() calls this every timeupdate, but for a normal clip the
+                    // duration is finite and constant. Re-running it each tick re-sets scrubber.max
+                    // (forcing the native <scale> to re-lay-out its whole range -> a jittery thumb on
+                    // the offscreen surface) and re-sets scrubberThumb.showHours via setAttribute
+                    // (restyling the thumb bubble every tick -> the "0:00 flashes in and out" defect).
+                    // Skip the redundant work when the finite duration is unchanged. Streams (Infinite
+                    // /NaN duration) fall through because scrubber.max must track the growing
+                    // maxCurrentTimeSeen.
+                    if (!isInfinite && !isNaN(duration) && duration === this._lastDurationShown)
+                        return;
+                    this._lastDurationShown = duration;
+
                     this.log("Duration is " + duration + "ms.\n");
 
                     if (isNaN(duration) || isInfinite)
@@ -800,6 +828,47 @@
 
                     this.positionLabel.setAttribute("value", this.formatTime(currentTime));
                     this.scrubber.value = currentTime;
+                },
+
+                // Jihad: timeupdate fires only a few times a second, so the scrubber thumb steps
+                // forward in visible jumps ("moving in ticks"). currentTime is a live clock that
+                // advances continuously between those events, so while playing we drive the thumb
+                // from it on a short interval for smooth motion. Safe now that the offscreen ghost
+                // bug is fixed (per-buffer damage, BrowserPageGoanna): the daemon coalesces the
+                // extra damage and paces the actual repaints, so this cannot over-drive it. Stopped
+                // on pause/ended and when the binding detaches.
+                // Jihad: timeupdate fires only a few times a second, so the scrubber thumb steps
+                // forward in visible jumps ("moving in ticks"). currentTime is a live clock that
+                // advances continuously between those events, so while playing we drive the thumb
+                // from it on a short interval. The tick ONLY nudges the thumb position
+                // (scrubber.value) — never showDuration/showPosition, which re-set scrubber.max and
+                // thrash the scale range — and is guarded on a known finite duration so it never
+                // runs before metadata (max would be 0 and the thumb would freeze). Bare setInterval
+                // matches the touch binding's timer usage.
+                startScrubTimer : function() {
+                    if (this._scrubTimer)
+                        return;
+                    var self = this;
+                    this._scrubTimer = setInterval(function() {
+                        if (self.video.paused || self.video.ended || self.scrubber.isDragging)
+                            return;
+                        var dur = self.video.duration;
+                        if (!(dur > 0) || !isFinite(dur))
+                            return;
+                        var ct = Math.round(self.video.currentTime * 1000);
+                        if (ct > self.maxCurrentTimeSeen)
+                            self.maxCurrentTimeSeen = ct;
+                        self.positionLabel.setAttribute("value", self.formatTime(ct));
+                        self.scrubber.value = ct;
+                    }, 40);   // 25fps: the practical ceiling. Faster (tried 25ms/40fps) overruns the
+                              // adapter's drain rate for this region — paints defer and the thumb +
+                              // time freeze. The offscreen paint pipeline caps the achievable smoothness.
+                },
+                stopScrubTimer : function() {
+                    if (this._scrubTimer) {
+                        clearInterval(this._scrubTimer);
+                        this._scrubTimer = null;
+                    }
                 },
 
                 showBuffered : function() {
