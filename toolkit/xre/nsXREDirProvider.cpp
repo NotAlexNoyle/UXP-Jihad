@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsAppRunner.h"
+#include "GeckoProfiler.h"  // Jihad headless: PROFILER_LABEL_FUNC/js::ProfileEntry (was transitively included in the gtk unified build)
 #include "nsToolkitCompsCID.h"
 #include "nsXREDirProvider.h"
 

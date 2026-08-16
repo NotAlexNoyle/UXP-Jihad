@@ -1878,13 +1878,21 @@ var AddonManagerInternal = {
     // notify front-end that install events came from the outer-browser (the
     // main tab's browser). Check this by seeing if the browser we've been
     // passed is in a content type docshell and if so get the outer-browser.
+    // JIHAD (browser-services R3): aBrowser is documented above as optional ("aSource must be
+    // a nsIDOMElement, or null") and every caller in a browser passes the <browser> element the
+    // page lives in — but this embedding has no browser chrome and therefore no such element, so
+    // the walk below dereferenced null and cancelled the install before the prompt was reached.
+    // With no element there is no outer-browser to notify either, so the whole remapping is
+    // simply skipped and topBrowser stays null, which the listener path already tolerates.
     let topBrowser = aBrowser;
-    let docShell = aBrowser.ownerDocument.defaultView
-                           .QueryInterface(Ci.nsIInterfaceRequestor)
-                           .getInterface(Ci.nsIDocShell)
-                           .QueryInterface(Ci.nsIDocShellTreeItem);
-    if (docShell.itemType == Ci.nsIDocShellTreeItem.typeContent)
-      topBrowser = docShell.chromeEventHandler;
+    if (aBrowser) {
+      let docShell = aBrowser.ownerDocument.defaultView
+                             .QueryInterface(Ci.nsIInterfaceRequestor)
+                             .getInterface(Ci.nsIDocShell)
+                             .QueryInterface(Ci.nsIDocShellTreeItem);
+      if (docShell.itemType == Ci.nsIDocShellTreeItem.typeContent)
+        topBrowser = docShell.chromeEventHandler;
+    }
 
     try {
       let weblistener = Cc["@mozilla.org/addons/web-install-listener;1"].
@@ -1898,7 +1906,13 @@ var AddonManagerInternal = {
                                          aInstalls, aInstalls.length);
         return;
       }
-      else if (!aBrowser.contentPrincipal || !aInstallingPrincipal.subsumes(aBrowser.contentPrincipal)) {
+      // JIHAD: the same optional-aBrowser problem as above. This check compares the principal
+      // that triggered the install against the principal of the page currently in the browser
+      // element, to catch a page that navigated away mid-install; with no browser element there
+      // is nothing to compare against and no navigation to race, so the check is skipped rather
+      // than treated as a failed comparison (which cancelled every install).
+      else if (aBrowser &&
+               (!aBrowser.contentPrincipal || !aInstallingPrincipal.subsumes(aBrowser.contentPrincipal))) {
         for (let install of aInstalls)
           install.cancel();
 
@@ -1912,7 +1926,10 @@ var AddonManagerInternal = {
       // The installs may start now depending on the web install listener,
       // listen for the browser navigating to a new origin and cancel the
       // installs in that case.
-      new BrowserListener(aBrowser, aInstallingPrincipal, aInstalls);
+      // Same reason: BrowserListener watches a browser element for a navigation that should
+      // cancel the installs. With no element there is nothing to attach to.
+      if (aBrowser)
+        new BrowserListener(aBrowser, aInstallingPrincipal, aInstalls);
 
       if (!this.isInstallAllowed(aMimetype, aInstallingPrincipal)) {
         if (weblistener.onWebInstallBlocked(topBrowser, aInstallingPrincipal.URI,

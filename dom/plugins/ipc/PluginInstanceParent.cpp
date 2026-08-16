@@ -115,6 +115,16 @@ PluginInstanceParent::LookupPluginInstanceByID(uintptr_t aId)
 }
 #endif
 
+// Jihad: every live instance, so a C entry point can reach one. jihad_plugin_frame_seq needs no
+// instance because it only counts; a frame REQUEST has to be sent on an actual actor.
+//
+// A plain file-static array maintained in the ctor/dtor below, not a hashtable: this is at most a
+// couple of entries on a single-card embedding, it is only ever touched on the main thread (the
+// daemon calls the export from inside its own tick, on that same thread), and the alternative —
+// walking nsPluginHost's nsNPAPIPluginInstance list the way jihad_plugin_palm_spotlight does —
+// would still have to get from there to the PluginInstanceParent actor to call Send on it.
+static nsTArray<PluginInstanceParent*>* gJihadLiveInstances = nullptr;
+
 PluginInstanceParent::PluginInstanceParent(PluginModuleParent* parent,
                                            NPP npp,
                                            const nsCString& aMimeType,
@@ -145,10 +155,24 @@ PluginInstanceParent::PluginInstanceParent(PluginModuleParent* parent,
         sPluginInstanceList = new nsClassHashtable<nsVoidPtrHashKey, PluginInstanceParent>();
     }
 #endif
+    // Jihad: join the live list that jihad_plugin_request_frame walks. Leaked on purpose — it
+    // outlives every instance and there is no shutdown hook here that is guaranteed to run
+    // after the last dtor.
+    if (!gJihadLiveInstances) {
+        gJihadLiveInstances = new nsTArray<PluginInstanceParent*>();
+    }
+    gJihadLiveInstances->AppendElement(this);
 }
 
 PluginInstanceParent::~PluginInstanceParent()
 {
+    // Jihad: leave the live list FIRST. Anything below can run script or spin the loop, and a
+    // frame request delivered to a half-destroyed actor is a use-after-free rather than a
+    // dropped frame.
+    if (gJihadLiveInstances) {
+        gJihadLiveInstances->RemoveElement(this);
+    }
+
     if (mNPP)
         mNPP->pdata = nullptr;
 
@@ -269,6 +293,8 @@ PluginInstanceParent::AnswerNPN_GetValue_NPNVnetscapeWindow(NativeWindowHandle* 
     XID id;
 #elif defined(XP_DARWIN)
     intptr_t id;
+#elif defined(MOZ_WIDGET_HEADLESS)
+    intptr_t id; // Jihad headless: no native window id
 #else
 #warning Implement me
 #endif
@@ -769,6 +795,51 @@ PluginInstanceParent::RecvShowDirectBitmap(Shmem&& buffer,
         return false;
     }
 
+    // NO COMPOSITOR PROCESS: composite the plugin's bitmap directly.
+    //
+    // Everything below this point routes the plugin's pixels through a TextureClient to a
+    // compositor, and that requires ImageBridgeChild — which only exists with off-main-thread
+    // composition. This embedder deliberately runs OMTC off (the offscreen renderer uses the
+    // in-process BasicLayerManager and hands finished frames to the browser adapter itself),
+    // so ImageBridgeChild::GetSingleton() is null and TextureClientRecycleAllocator is built
+    // around a null KnowsCompositor. The first plugin paint then dereferenced it and took the
+    // whole daemon down with it — upstream never sees this because the DXGI path a few
+    // hundred lines up checks the forwarder and the direct-bitmap path does not.
+    //
+    // A BasicLayerManager does not need a TextureClient at all: it draws an ImageLayer from
+    // the image's own SourceSurface. So wrap the pixels in a plain SourceSurfaceImage and
+    // hand that to the container.
+    //
+    // The pixels are COPIED, not wrapped. `source` above wraps the shmem the plugin drew
+    // into, and the plugin owns that buffer and may draw the next frame into it as soon as
+    // this call returns; the texture path's UpdateFromSurface copies for the same reason.
+    if (!ImageBridgeChild::GetSingleton()) {
+        RefPtr<gfx::DataSourceSurface> copy =
+            gfx::Factory::CreateDataSourceSurface(size, format);
+        if (!copy) {
+            NS_WARNING("Could not allocate a surface for plugin bitmap!");
+            return false;
+        }
+        {
+            gfx::DataSourceSurface::ScopedMap srcMap(source, gfx::DataSourceSurface::READ);
+            gfx::DataSourceSurface::ScopedMap dstMap(copy, gfx::DataSourceSurface::WRITE);
+            if (!srcMap.IsMapped() || !dstMap.IsMapped()) {
+                return false;
+            }
+            const int32_t bpp = BytesPerPixel(format);
+            const int32_t rowBytes = size.width * bpp;
+            for (int32_t y = 0; y < size.height; y++) {
+                memcpy(dstMap.GetData() + (ptrdiff_t)y * dstMap.GetStride(),
+                       srcMap.GetData() + (ptrdiff_t)y * srcMap.GetStride(),
+                       rowBytes);
+            }
+        }
+
+        RefPtr<SourceSurfaceImage> image = new SourceSurfaceImage(size, copy);
+        SetCurrentImage(image);
+        return true;
+    }
+
     // Allocate a texture for the compositor.
     RefPtr<TextureClientRecycleAllocator> allocator = mParent->EnsureTextureAllocatorForDirectBitmap();
     RefPtr<TextureClient> texture = allocator->CreateOrRecycle(
@@ -864,6 +935,55 @@ PluginInstanceParent::RecvShowDirectDXGISurface(const WindowsHandle& handle,
 }
 #endif // MOZ_ENABLE_NPAPI
 
+// Jihad: monotonic count of plugin frames that have reached the parent. Process-wide rather
+// than per-instance, matching how the daemon consumes it — the embedding is single-page and the
+// question it answers is "has ANY plugin produced a new frame since I last published". A plain
+// uint32_t incremented and read on the same (main) thread; the daemon reads it from the same
+// thread inside its tick, so no atomics are needed and none are used elsewhere in this bridge.
+static uint32_t gJihadPluginFrameSeq = 0;
+
+extern "C" {
+// Weak-linked from the daemon (render/goanna/GoannaRenderPage.cpp), the same way
+// jihad_offscreen_take_dirty is: an older libxul simply does not export it, and the daemon then
+// falls back to its dirty-flag behaviour instead of failing to load.
+MOZ_EXPORT uint32_t jihad_plugin_frame_seq(void)
+{
+    return gJihadPluginFrameSeq;
+}
+}
+
+extern "C" {
+// Ask every live plugin for one frame. Returns how many were asked, so the daemon can tell "no
+// plugin" from "delivered" — the same contract as jihad_plugin_palm_spotlight.
+//
+// WEAK on the daemon side: a libxul without this symbol keeps the child's own timer as the frame
+// clock (patch 0026 behaviour), which is slower to settle but never wrong.
+MOZ_EXPORT int jihad_plugin_request_frame(void)
+{
+#ifdef MOZ_ENABLE_NPAPI
+    if (!gJihadLiveInstances) {
+        return 0;
+    }
+    // Copy first: SendJihadRequestFrame can fail and tear the actor down, which would mutate the
+    // array underneath the loop. Same reasoning as the instance-list copy in
+    // jihad_plugin_palm_spotlight (nsPluginHost.cpp).
+    nsTArray<PluginInstanceParent*> snap(*gJihadLiveInstances);
+    int asked = 0;
+    for (uint32_t i = 0; i < snap.Length(); ++i) {
+        if (!gJihadLiveInstances->Contains(snap[i])) {
+            continue;   // torn down by an earlier Send in this same loop
+        }
+        if (snap[i]->SendJihadRequestFrame()) {
+            asked++;
+        }
+    }
+    return asked;
+#else
+    return 0;
+#endif
+}
+}
+
 bool
 PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                                const SurfaceDescriptor& newSurface,
@@ -876,6 +996,27 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
          updatedRect.bottom - updatedRect.top));
 
     MOZ_ASSERT(!IsUsingDirectDrawing());
+
+    // FRAME-RATE READOUT, parent side. Paired with the child's `palm draw:` line: the child
+    // reports how often the plugin was ASKED to draw, this reports how many of those frames
+    // actually crossed the process boundary. A gap between the two numbers is the difference
+    // between "the plugin is slow" and "we are dropping its frames", which are opposite bugs.
+    {
+        static uint32_t sShows = 0;
+        static uint32_t sLastReport = 0;
+        sShows++;
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        if (!sLastReport) {
+            sLastReport = nowMs;
+        } else if (nowMs - sLastReport >= 2000) {
+            fprintf(stderr, "[jihad-npapi] RecvShow: %u in %ums (%.1f fps)\n",
+                    sShows, nowMs - sLastReport,
+                    sShows * 1000.0 / double(nowMs - sLastReport));
+            fflush(stderr);
+            sShows = 0;
+            sLastReport = nowMs;
+        }
+    }
 
     // XXXjwatt rewrite to use Moz2D
     RefPtr<gfxASurface> surface;
@@ -959,14 +1100,75 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                    updatedRect.bottom - updatedRect.top);
         surface->MarkDirty(ur);
 
-        bool isPlugin = true;
-        RefPtr<gfx::SourceSurface> sourceSurface =
-            gfxPlatform::GetPlatform()->GetSourceSurfaceForSurface(nullptr, surface, isPlugin);
-        RefPtr<SourceSurfaceImage> image = new SourceSurfaceImage(surface->GetSize(), sourceSurface);
+        // JIHAD (2026-08-09): route the legacy windowless show through the SAME
+        // representation the direct-bitmap path uses, for the SAME reasons.
+        //
+        // Background: the webOS npPalmDrawEvent path (PaintRectToPlatformSurface) makes Flash
+        // blit its stage into mCurrentSurface — measured full-magenta in the child — and ships
+        // it here via SendShow. The control plugin's pixels reach the screen through
+        // RecvShowDirectBitmap; Flash's did not, although both feed the one mImageContainer the
+        // BasicLayerManager reads. Two concrete differences made the legacy path invisible:
+        //   1. It WRAPPED the shmem (GetSourceSurfaceForSurface(nullptr,…)) instead of copying.
+        //      The child double-buffers and SwapSurfaces() immediately after SendShow returns,
+        //      so a wrapped front buffer is the very buffer the child repaints next — the image
+        //      the layer later samples is racing the child. RecvShowDirectBitmap copies for
+        //      exactly this reason ("the plugin owns that buffer and may draw the next frame
+        //      into it as soon as this call returns").
+        //   2. It stamped no frameID. SetCurrentImage() on the working path assigns a monotonic
+        //      ++mFrameID; the ImageContainer/ImageLayer treats a repeated frameID as "no new
+        //      frame". A fixed 0 can be coalesced away.
+        // Copying into a fresh DataSourceSurface and stamping a monotonic frameID makes this
+        // path identical in substance to the one already proven to composite here.
+        IntSize ssize = surface->GetSize();
+        RefPtr<Image> image;
+        RefPtr<gfxImageSurface> imgSurf = surface->GetAsImageSurface();
+        if (imgSurf) {
+            // Always present the copy as B8G8R8A8, and force the alpha channel opaque when the
+            // source carries no alpha (RGB24 / B8G8R8X8). This is Bug 1196927 in this file's own
+            // words (see PluginInstanceChild::PaintRectToSurface): Cairo/Skia leave the X byte of
+            // a BGRX surface zeroed, and a BasicImageLayer then composites those pixels multiplied
+            // by alpha 0 — i.e. fully transparent. That is exactly why Flash's magenta stage
+            // arrived here (RecvShow logged px0=0xffff00ff) yet BasicImageLayer::Paint drew
+            // nothing visible, while the control plugin — which ships B8G8R8A8 — composited fine
+            // through the identical layer path. webOS windowless plugins are opaque
+            // (wmode=opaque forces the windowless instance in the first place), so forcing alpha
+            // opaque is correct here.
+            const SurfaceFormat srcFmt = surface->GetSurfaceFormat();
+            const bool srcHasAlpha =
+                srcFmt != SurfaceFormat::B8G8R8X8 &&
+                srcFmt != SurfaceFormat::R8G8B8X8;
+            RefPtr<gfx::DataSourceSurface> copy =
+                gfx::Factory::CreateDataSourceSurface(ssize, SurfaceFormat::B8G8R8A8);
+            if (copy) {
+                gfx::DataSourceSurface::ScopedMap dstMap(copy, gfx::DataSourceSurface::WRITE);
+                if (dstMap.IsMapped()) {
+                    const int32_t rowBytes = ssize.width * 4;
+                    for (int32_t y = 0; y < ssize.height; y++) {
+                        uint8_t* dstRow = dstMap.GetData() + (ptrdiff_t)y * dstMap.GetStride();
+                        memcpy(dstRow, imgSurf->Data() + (ptrdiff_t)y * imgSurf->Stride(),
+                               rowBytes);
+                        if (!srcHasAlpha) {
+                            for (int32_t x = 0; x < ssize.width; x++) {
+                                dstRow[x * 4 + 3] = 0xff;  // BGRA: byte 3 is alpha
+                            }
+                        }
+                    }
+                    image = new SourceSurfaceImage(ssize, copy);
+                }
+            }
+        }
+        if (!image) {
+            // Fallback to the original wrap if the copy path could not be taken.
+            bool isPlugin = true;
+            RefPtr<gfx::SourceSurface> sourceSurface =
+                gfxPlatform::GetPlatform()->GetSourceSurfaceForSurface(nullptr, surface, isPlugin);
+            image = new SourceSurfaceImage(ssize, sourceSurface);
+        }
 
+        ImageContainer::NonOwningImage holder(image);
+        holder.mFrameID = ++mFrameID;
         AutoTArray<ImageContainer::NonOwningImage,1> imageList;
-        imageList.AppendElement(
-            ImageContainer::NonOwningImage(image));
+        imageList.AppendElement(holder);
 
         ImageContainer *container = GetImageContainer();
         container->SetCurrentImages(imageList);
@@ -976,6 +1178,17 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     }
 
     mFrontSurface = surface;
+    // Jihad: count DELIVERED plugin frames so the embedder can tell a new one from a repeat.
+    // The daemon's only frame signal is PuppetWidget's sticky dirty boolean, which carries no
+    // identity: the refresh driver and ordinary page damage set the same flag, so "there is
+    // damage" cannot answer "did the plugin draw again". Measured 2026-08-10 on a 30 fps SWF,
+    // that ambiguity is what made both available policies wrong — publishing on every dirty
+    // tick sent ~78 card frames for ~60 plugin frames (duplicates, and 22-44 deferred because
+    // the adapter could not drain them), while pacing on a fixed 33 ms grid sent ~57 for ~68
+    // (dropped frames, so the animation stepped two positions at once). The stock webOS host
+    // never had to choose: it pulls the plugin synchronously inside the page paint, so it is
+    // 1:1 by construction. This counter is what lets the daemon be 1:1 too.
+    ++gJihadPluginFrameSeq;
     RecvNPN_InvalidateRect(updatedRect);
 
     PLUGIN_LOG_DEBUG(("   (RecvShow invalidated for surface %p)",
@@ -1301,7 +1514,11 @@ PluginInstanceParent::GetImageContainer()
     return mImageContainer;
   }
 
-  if (IsUsingDirectDrawing()) {
+  if (IsUsingDirectDrawing() && ImageBridgeChild::GetSingleton()) {
+      // ASYNCHRONOUS means "shared with the compositor through ImageBridge". Without an
+      // ImageBridge the async container silently gets no image client and never publishes
+      // anything, so with OMTC off this has to be an ordinary local container — which is
+      // what the BasicLayerManager reads from. See RecvShowDirectBitmap.
       mImageContainer = LayerManager::CreateImageContainer(ImageContainer::ASYNCHRONOUS);
   } else {
       mImageContainer = LayerManager::CreateImageContainer();

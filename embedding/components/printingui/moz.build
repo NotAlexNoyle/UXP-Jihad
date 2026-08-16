@@ -12,5 +12,6 @@ if CONFIG['NS_PRINTING']:
         DIRS += ['win']
     elif toolkit == 'cocoa':
         DIRS += ['mac']
-    elif CONFIG['MOZ_PDF_PRINTING']:
+    elif CONFIG['MOZ_PDF_PRINTING'] or toolkit == 'headless':
+        # Jihad headless: reuse the gtk-free PDF printing prompt service.
         DIRS += ['unixshared']

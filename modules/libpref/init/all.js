@@ -245,7 +245,7 @@ pref("dom.compartment_per_addon", true);
 pref("browser.sessionhistory.max_total_viewers", -1);
 
 // Whether to store 'about:newtab' in the session history, disabled by default.
-// See https://github.com/MoonchildProductions/UXP/issues/719
+// See (upstream issue 719)
 pref("browser.newtabpage.add_to_session_history", false);
 
 // Determines whether the browser's current theme should be light or dark.
@@ -1193,7 +1193,7 @@ pref("dom.webapps.useCurrentProfile", false);
 
 // Use incremental cycle collection?
 // In practice this gave a noticeable performance hit. Default off.
-// See forum topic https://forum.palemoon.org/viewtopic.php?f=62&t=29887
+// See forum topic (upstream forum)
 pref("dom.cycle_collector.incremental", false);
 
 // Parsing perf prefs. For now just mimic what the old code did.
@@ -2232,7 +2232,7 @@ pref("extensions.blocklist.interval", 86400);
 // Required blocklist freshness for OneCRL OCSP bypass
 // (default is 1.25x extensions.blocklist.interval, or 30 hours)
 pref("security.onecrl.maximum_staleness_in_seconds", 108000);
-pref("extensions.blocklist.url", "https://blocklist.basilisk-browser.org/blocklist/%APP_ID%/%APP_VERSION%/%PRODUCT%/%BUILD_ID%/%BUILD_TARGET%/%LOCALE%/%CHANNEL%/%OS_VERSION%/");
+pref("extensions.blocklist.url", "about:blank");
 pref("extensions.blocklist.detailsURL", "https://www.mozilla.com/%LOCALE%/blocklist/");
 pref("extensions.blocklist.itemURL", "https://blocklist.addons.mozilla.org/%LOCALE%/%APP%/blocked/%blockID%");
 // Controls what level the blocklist switches from warning about items to forcibly
@@ -4779,7 +4779,7 @@ pref("network.captive-portal-service.maxInterval", 1500000); // 25 minutes
 pref("network.captive-portal-service.backoffFactor", "5.0");
 pref("network.captive-portal-service.enabled", false);
 
-pref("captivedetect.canonicalURL", "http://detectportal.palemoon.org/success.txt");
+pref("captivedetect.canonicalURL", "http://example.com/success.txt");
 pref("captivedetect.canonicalContent", "success\n");
 pref("captivedetect.maxWaitingTime", 5000);
 pref("captivedetect.pollingTime", 3000);

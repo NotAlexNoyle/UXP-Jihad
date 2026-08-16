@@ -31,6 +31,7 @@ using mozilla::gfx::SharedDIBSurface;
 #endif
 #endif
 #include "gfxSharedImageSurface.h"
+#include <dlfcn.h>   // Jihad R7: reach the plugin's own glib for npPalmEventLoopValue
 #include "gfxUtils.h"
 #include "gfxAlphaRecovery.h"
 
@@ -49,6 +50,61 @@ using namespace mozilla::layers;
 using namespace mozilla::gfx;
 using namespace mozilla::widget;
 using namespace std;
+
+// Defined next to JihadPumpGlib, far below; declared here because DoNPP_New starts it.
+static void JihadStartGlibPump(PluginInstanceChild* aInstance);
+
+// The instance the host clock repaints, and the count of repaints the PLUGIN asked for. Both
+// live here rather than on the instance because the pump is a process-wide free function.
+// Cleared in ~PluginInstanceChild so the clock cannot outlive what it points at.
+static PluginInstanceChild* sJihadPalmInstance = nullptr;
+static uint64_t gJihadPalmDrawEvents = 0;
+// Defined in JihadNPNInterpose.cpp, which deliberately includes no NPAPI headers.
+extern "C" unsigned gJihadNPNInvalidateRectCalls;
+
+// ── WHICH CALL SITE ACTUALLY DRIVES PLUGIN DRAWS (Jihad, addons R7) ──────────────────────
+//
+// Three sessions have now attributed the plugin's draw rate to a specific clock by READING the
+// code, and every attribution was wrong. Patch 0029 finally put a counter on the request side
+// and the numbers did not agree with any of them: 3988 draws against 3072 host requests, with
+// the child's own timer provably stood down (one "frame clock -> HOST" transition, no fallback)
+// and Flash provably not self-invalidating (gJihadNPNInvalidateRectCalls stays 0). So roughly a
+// quarter of all draws come from a fourth place, and at an 8 ms tick that share DOMINATES.
+//
+// Every path to a draw funnels through AsyncShowPluginFrame, so tagging its call sites answers
+// the question directly rather than by elimination. Reported next to `palm draw`, which is the
+// count these have to add up to. Declared up here with the other file statics because the first
+// tagged site is in AnswerNPP_SetWindow, well above the frame-clock block further down.
+enum {
+    kJihadShowSetWindow = 0,   // AnswerNPP_SetWindow / AsyncSetWindow, accumulated rect
+    kJihadShowInvalidate,      // InvalidateRect reached from OUR host repaint tick
+    kJihadShowPluginSelf,      // InvalidateRect reached from the PLUGIN's own NPN_InvalidateRect
+    kJihadShowRetry,           // InvalidateRectDelayed's retry when ShowPluginFrame refused
+    kJihadShowBgUpdate,        // RecvUpdateBackground, background changed
+    kJihadShowBgUpdateTail,    // RecvUpdateBackground, unconditional tail
+    kJihadShowBgDestroy,       // background destroyer
+    kJihadShowSites
+};
+static uint32_t gJihadShowFrom[kJihadShowSites];
+static const char* const kJihadShowNames[kJihadShowSites] = {
+    "setwin", "hostinval", "plugininval", "retry", "bgupd", "bgtail", "bgdestroy"
+};
+
+// True only while JihadPalmRepaintTick's own InvalidateRect call is on the stack, so the two
+// producers can be told apart AT the shared funnel.
+//
+// WHY THIS EXISTS, and it invalidates a premise the port has carried since patch 0026:
+// gJihadNPNInvalidateRectCalls — the counter used to decide "the plugin never asks to be
+// repainted, so the host must drive it" — is STRUCTURALLY BLIND. It lives in
+// JihadNPNInterpose.cpp and only counts calls that bind the NPN_InvalidateRect SYMBOL. An
+// ordinary NPAPI plugin calls through the NPNetscapeFuncs table instead, which
+// PluginModuleChild fills with its own _invalidaterect (PluginModuleChild.cpp:986); that
+// forwards straight to InstCast(aNPP)->InvalidateRect (:1302-1310) and never touches the
+// interpose. So the counter can read 0 for the whole run while the plugin invalidates
+// constantly — which is exactly what was measured: 1344 host requests against 2662 invalidates
+// with the child's timer provably off (one "frame clock -> HOST", no fallback).
+static bool sJihadInHostRepaint = false;
+
 
 #ifdef MOZ_WIDGET_GTK
 
@@ -193,6 +249,8 @@ PluginInstanceChild::PluginInstanceChild(const NPPluginFuncs* aPluginIface,
 #endif
     , mAccumulatedInvalidRect(0,0,0,0)
     , mIsTransparent(false)
+    , mJihadSentPalmGainFocus(false)
+    , mJihadInputEventsLogged(0)
     , mSurfaceType(gfxSurfaceType::Max)
     , mPendingPluginCall(false)
     , mDoAlphaExtraction(false)
@@ -231,6 +289,11 @@ PluginInstanceChild::PluginInstanceChild(const NPPluginFuncs* aPluginIface,
 
 PluginInstanceChild::~PluginInstanceChild()
 {
+    // The host repaint clock outlives any single instance (it is bound to the process-wide
+    // GMainLoop), so it must not be left holding this pointer.
+    if (sJihadPalmInstance == this) {
+        sJihadPalmInstance = nullptr;
+    }
 #if defined(OS_WIN)
     NS_ASSERTION(!mPluginWindowHWND, "Destroying PluginInstanceChild without NPP_Destroy?");
     if (GetQuirks() & QUIRK_UNITY_FIXUP_MOUSE_CAPTURE) {
@@ -260,6 +323,65 @@ PluginInstanceChild::~PluginInstanceChild()
 #endif
 }
 
+// ── THE webOS PLUGIN ABI (Jihad, addons R7) ───────────────────────────────────────────────
+//
+// None of this is in our npapi.h; it is Palm's XP_WEBOS block, and every layout below was
+// checked TWICE — against WebKit/Source/WebCore/plugins/npapi.h, and against the machine code
+// of the host that actually shipped on the device. That host is NOT the Qt one in our WebKit
+// checkout (PluginViewQt.cpp passes a QPainter* and Flash has no Qt dependency at all); it is
+// WebCore::PluginView compiled from PluginViewPalm.cpp into /usr/lib/libWebKitLuna.so, which
+// is unstripped on the device and can simply be read. Offsets cited below are into that
+// library. Get these wrong and the plugin reads garbage, silently.
+//
+// The event union itself now lives in npapi.h as the real `NPEvent` for this platform, so the
+// parent (nsPluginInstanceOwner::ProcessEvent) and the child cannot drift and the type survives
+// the NPRemoteEvent memcpy. What used to be here was a TRUNCATED private mirror —
+// systemEvent held only `type`, which is enough for gain-focus and silently wrong for a
+// spotlight event, whose rect lives in the four fields the mirror did not have.
+//
+// These assertions are the actual contract. Each offset was read out of the shipped host's
+// machine code, and a mismatch here means the plugin reads a different field than the one
+// written — a failure with no symptom other than wrong behaviour.
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+static_assert(sizeof(NPEvent) == 48, "webOS NPEvent is 48 bytes");
+static_assert(offsetof(NPEvent, data) == 4, "eventType is a 4-byte field at 0");
+// PluginView::handleMouseEvent (libWebKitLuna 0x4e9458/0x4e9460/0x4e9464) stores x, y and
+// modifiers to [sp+4], [sp+8], [sp+12] with eventType at [sp].
+static_assert(offsetof(NPEvent, data.penEvent.xCoord) == 4, "penEvent.xCoord @4");
+static_assert(offsetof(NPEvent, data.penEvent.yCoord) == 8, "penEvent.yCoord @8");
+static_assert(offsetof(NPEvent, data.penEvent.modifiers) == 12, "penEvent.modifiers @12");
+// PluginView::handleKeyboardEvent (0x4e8ebc/0x4e8e80/0x4e8ef4/0x4e8f04).
+static_assert(offsetof(NPEvent, data.keyEvent.chr) == 4, "keyEvent.chr @4");
+static_assert(offsetof(NPEvent, data.keyEvent.modifiers) == 8, "keyEvent.modifiers @8");
+static_assert(offsetof(NPEvent, data.keyEvent.rawkeyCode) == 12, "keyEvent.rawkeyCode @12");
+static_assert(offsetof(NPEvent, data.keyEvent.rawModifier) == 16, "keyEvent.rawModifier @16");
+// PluginView::handlePluginSpotlightStart (0x4e6cec-0x4e6d20) writes 0x100 at [sp], 11 at
+// [sp+4], then left/right/top/bottom at [sp+12]/[sp+16]/[sp+20]/[sp+24] — note it never
+// initialises `value` at [sp+8].
+static_assert(offsetof(NPEvent, data.systemEvent.type) == 4, "systemEvent.type @4");
+static_assert(offsetof(NPEvent, data.systemEvent.viewLeft) == 12, "systemEvent.viewLeft @12");
+static_assert(offsetof(NPEvent, data.systemEvent.viewRight) == 16, "systemEvent.viewRight @16");
+static_assert(offsetof(NPEvent, data.systemEvent.viewTop) == 20, "systemEvent.viewTop @20");
+static_assert(offsetof(NPEvent, data.systemEvent.viewBottom) == 24, "systemEvent.viewBottom @24");
+// PluginView::paint (0x4e7e30-0x4e7e44) stores platformContext() at frame+52 and the four
+// scaled dst coords at +56/+60/+64/+68, i.e. +24/+28/+32/+36 inside the draw member.
+static_assert(offsetof(NPEvent, data.drawEvent.graphicsContext) == 28, "drawEvent.gc @28");
+static_assert(offsetof(NPEvent, data.drawEvent.dstLeft) == 32, "drawEvent.dstLeft @32");
+#endif  // XP_UNIX && MOZ_WIDGET_HEADLESS
+
+// NPWindow.window for a webOS plugin. Palm's host never calls setwindow without one:
+// PluginView::setNPWindowRect (libWebKitLuna 0x4e74e0) builds it as a STACK LOCAL, points
+// m_npWindow.window at it (0x4e7570 `str sp, [r4, #520]`), calls setwindow, and immediately
+// re-nulls the pointer (0x4e7614) so the dangling stack address is never left behind.
+// Field offsets read straight off that function: visible is a byte at +0 (0x4e755c
+// `strbne r3, [sp]`), bpp is 32 at +4 (0x4e75dc `mov ip,#32; str ip,[sp,#4]`), and scaleFactor
+// is the double from ScrollView::getScale() at +8 (0x4e7588 `strd r6, [sp, #8]`).
+struct JihadNpPalmWindow {
+    bool     visible;
+    uint32_t bpp;
+    double   scaleFactor;
+};
+
 NPError
 PluginInstanceChild::DoNPP_New()
 {
@@ -284,6 +406,44 @@ PluginInstanceChild::DoNPP_New()
                                     mMode, argc, argn.get(), argv.get(), 0);
     if (NPERR_NO_ERROR != rv) {
         return rv;
+    }
+
+    // WEBOS EVENT LOOP (Jihad, addons R7).
+    //
+    // Palm's own host does this right after NPP_New and before anything else
+    // (WebKit/Source/WebCore/plugins/qt/PluginViewQt.cpp, PluginView::platformStart):
+    // it hands the plugin a GMainLoop* through npPalmEventLoopValue. A webOS plugin drives
+    // its own frame scheduling off that loop, so a plugin that never receives one is a
+    // plugin that instantiates and then never asks to paint — exactly the symptom this port
+    // had.
+    //
+    // glib is not linked into this process; it arrives as a dependency of the plugin, so it
+    // can only be reached by name once the plugin is loaded — which it is by now. A plugin
+    // that does not know the variable just returns an error, so this is safe for any plugin.
+    if (mPluginIface->setvalue) {
+        static void* sMainLoop = nullptr;
+        if (!sMainLoop) {
+            if (void* glib = dlopen("libglib-2.0.so.0", RTLD_NOW | RTLD_GLOBAL)) {
+                typedef void* (*GMainLoopNewFn)(void*, int);
+                GMainLoopNewFn newLoop = (GMainLoopNewFn)dlsym(glib, "g_main_loop_new");
+                if (newLoop) {
+                    sMainLoop = newLoop(nullptr, 1 /* is_running */);
+                }
+            }
+        }
+        if (sMainLoop) {
+            const uint32_t kNpPalmEventLoopValue = 10000;
+            NPError lerr = mPluginIface->setvalue(npp, (NPNVariable)kNpPalmEventLoopValue,
+                                                  sMainLoop);
+            fprintf(stderr, "[jihad-npapi-child] npPalmEventLoopValue loop=%p err=%d\n",
+                    sMainLoop, (int)lerr);
+            // The plugin now has a loop to hang sources off; start running it. See
+            // JihadStartGlibPump for why this cannot wait for the first paint.
+            JihadStartGlibPump(this);
+        } else {
+            fprintf(stderr, "[jihad-npapi-child] npPalmEventLoopValue: no glib main loop\n");
+        }
+        fflush(stderr);
     }
 
     Initialize();
@@ -964,6 +1124,35 @@ PluginInstanceChild::AnswerNPP_HandleEvent(const NPRemoteEvent& event,
     else
         *handled = mPluginIface->event(&mData, reinterpret_cast<void*>(&evcopy));
 
+    // Guard MUST match the one npapi.h uses to define NPEvent as Palm's union. Any other
+    // predicate compiles this against `typedef void* NPEvent` and does not build.
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+    // JIHAD (webOS R7): the only field-visible evidence that host input reached the plugin.
+    // A closed-source plugin acknowledges nothing — Flash returns its `handled` flag before it
+    // even looks at the event (its NPP_HandleEvent sets the return, then dispatches), so this
+    // line proves DELIVERY and nothing more. Capped, because a pen-move stream would otherwise
+    // flood the daemon log, which is the only channel this device has.
+    if (mJihadInputEventsLogged < 24) {
+        mJihadInputEventsLogged++;
+        if (evcopy.eventType == npPalmKeyDownEvent ||
+            evcopy.eventType == npPalmKeyUpEvent ||
+            evcopy.eventType == npPalmKeyPressEvent) {
+            fprintf(stderr, "[jihad-npapi-child] palm key 0x%x chr=%d raw=%d mods=0x%x "
+                            "handled=%d\n",
+                    (unsigned)evcopy.eventType, (int)evcopy.data.keyEvent.chr,
+                    (int)evcopy.data.keyEvent.rawkeyCode,
+                    (unsigned)evcopy.data.keyEvent.modifiers, (int)*handled);
+        } else {
+            fprintf(stderr, "[jihad-npapi-child] palm event 0x%x at %d,%d mods=0x%x "
+                            "handled=%d\n",
+                    (unsigned)evcopy.eventType, (int)evcopy.data.penEvent.xCoord,
+                    (int)evcopy.data.penEvent.yCoord,
+                    (unsigned)evcopy.data.penEvent.modifiers, (int)*handled);
+        }
+        fflush(stderr);
+    }
+#endif
+
 #ifdef XP_MACOSX
     // Release any reference counted objects created in the child process.
     if (evcopy.type == NPCocoaEventKeyDown ||
@@ -1449,6 +1638,8 @@ PluginInstanceChild::AnswerNPP_SetWindow(const NPRemoteWindow& aWindow)
 
     if (mPluginIface->setwindow)
         (void) mPluginIface->setwindow(&mData, &mWindow);
+#elif defined(MOZ_WIDGET_HEADLESS)
+    // Jihad headless: no windowed plugins; nothing to do.
 #else
 #  error Implement me for your OS
 #endif
@@ -2827,6 +3018,12 @@ PluginInstanceChild::DoNPP_NewStream(BrowserStreamChild* actor,
     AssertPluginThread();
     AutoStackHelper guard(this);
     NPError rv = actor->StreamConstructed(mimeType, seekable, stype);
+    // JIHAD DIAGNOSTIC (R7): does content actually reach the plugin? A plugin that was
+    // never handed its stream draws nothing for a completely different reason than a
+    // plugin that cannot draw, and on screen the two are identical (an empty box).
+    fprintf(stderr, "[jihad-npapi-child] NPP_NewStream mime=%s seekable=%d rv=%d stype=%d\n",
+            mimeType.get(), (int)seekable, (int)rv, (int)*stype);
+    fflush(stderr);
     return rv;
 }
 
@@ -3417,6 +3614,7 @@ PluginInstanceChild::DoAsyncSetWindow(const gfxSurfaceType& aSurfaceType,
 #endif
 
     if (!mAccumulatedInvalidRect.IsEmpty()) {
+        gJihadShowFrom[kJihadShowSetWindow]++;
         AsyncShowPluginFrame();
     }
 }
@@ -3741,8 +3939,465 @@ PluginInstanceChild::UpdateWindowAttributes(bool aForceSetWindow)
          mWindow.clipRect.left, mWindow.clipRect.top, mWindow.clipRect.right, mWindow.clipRect.bottom));
 
     if (mPluginIface->setwindow) {
+        // WEBOS: hand the plugin an NpPalmWindow, exactly as Palm's host does.
+        //
+        // Out of the box this embedder passes NPWindow.window = nullptr for every windowless
+        // plugin (DoAsyncSetWindow hard-nulls it, and the MOZ_WIDGET_HEADLESS branch of
+        // AnswerNPP_SetWindow is a no-op), which is correct for an X11 windowless plugin — the
+        // slot means "native window handle" there, and there isn't one. On webOS the same slot
+        // means something completely different: it carries the plugin's visibility, the
+        // surface depth and the page scale. A webOS plugin told window=NULL has been told
+        // nothing about the surface it is supposed to draw into.
+        //
+        // Scoped to the call and re-nulled afterwards, because this is a stack address and
+        // Palm's host is careful about exactly that (libWebKitLuna 0x4e7570 / 0x4e7614).
+        //
+        // scaleFactor is 1.0 rather than the card's fit-zoom: Palm passes ScrollView::getScale()
+        // because its plugin drew into the page's own scaled surface, whereas here the plugin
+        // owns an unscaled CSS-sized buffer and the compositor applies the zoom afterwards.
+        JihadNpPalmWindow palmWindow;
+        palmWindow.visible     = true;
+        palmWindow.bpp         = 32;
+        palmWindow.scaleFactor = 1.0;
+        void* savedWindow = mWindow.window;
+        mWindow.window = &palmWindow;
+
         mPluginIface->setwindow(&mData, &mWindow);
+
+        mWindow.window = savedWindow;
+
+        static int sLoggedSetWindow = 0;
+        if (sLoggedSetWindow < 3) {
+            sLoggedSetWindow++;
+            fprintf(stderr, "[jihad-npapi-child] NPP_SetWindow %dx%d at %d,%d type=%d "
+                            "palmWindow{visible=1 bpp=32 scale=1.0}\n",
+                    (int)mWindow.width, (int)mWindow.height, (int)mWindow.x, (int)mWindow.y,
+                    (int)mWindow.type);
+            fflush(stderr);
+        }
+
+        // WEBOS: the last thing Palm's PluginView::platformStart does is tell the plugin it has
+        // focus — handlePageGainFocus (libWebKitLuna 0x4e6df0) builds
+        // {eventType = 0x100 (npPalmSystemEvent), systemEvent.type = 3 (npPalmGainFocusEvent)}
+        // and dispatches it. A plugin that is never told it is focused and visible has no
+        // reason to start animating.
+        //
+        // Only gain-focus: Flash's own system-event dispatcher (libflashplayer.so 0x44da0)
+        // routes npPalmPageLoadingEvent(8), npPalmPageLoadCompleteEvent(9) and
+        // npPalmViewPortChangedEvent(10) to a bare `mov r0,#0; pop {pc}`, so those three are
+        // inert in this build and sending them would prove nothing.
+        //
+        // After setwindow, not before, and once: the plugin needs its geometry first, and
+        // UpdateWindowAttributes runs on every resize and every scroll.
+        if (mPluginIface->event && !mJihadSentPalmGainFocus) {
+            mJihadSentPalmGainFocus = true;
+            NPEvent ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.eventType = npPalmSystemEvent;
+            ev.data.systemEvent.type = npPalmGainFocusEvent;
+            int16_t handled = mPluginIface->event(&mData, reinterpret_cast<void*>(&ev));
+            fprintf(stderr, "[jihad-npapi-child] npPalmSystemEvent gainFocus handled=%d\n",
+                    (int)handled);
+            fflush(stderr);
+        }
     }
+}
+
+// Run any work the plugin scheduled on glib.
+//
+// A webOS plugin is handed a GMainLoop through npPalmEventLoopValue and hangs its timers and
+// idle sources off it — but this process's main loop is chromium's MessageLoop, so unless
+// glib is pumped explicitly those sources NEVER RUN. The visible symptom is a plugin that
+// initialises, clears its stage, and then sits on frame zero forever: it is not stuck, it is
+// simply never being given the chance to advance.
+//
+// Bounded so a busy plugin cannot starve the paint it is being pumped for.
+static int
+JihadPumpGlib(int aMaxIterations)
+{
+    typedef int (*GMainContextIterationFn)(void*, int);
+    typedef int (*GMainContextPendingFn)(void*);
+    static bool sTried = false;
+    static GMainContextIterationFn sIterate = nullptr;
+    static GMainContextPendingFn sPending = nullptr;
+
+    if (!sTried) {
+        sTried = true;
+        if (void* glib = dlopen("libglib-2.0.so.0", RTLD_NOW | RTLD_GLOBAL)) {
+            sIterate = (GMainContextIterationFn)dlsym(glib, "g_main_context_iteration");
+            sPending = (GMainContextPendingFn)dlsym(glib, "g_main_context_pending");
+        }
+        fprintf(stderr, "[jihad-npapi-child] glib pump iterate=%p pending=%p\n",
+                (void*)sIterate, (void*)sPending);
+        fflush(stderr);
+    }
+    if (!sIterate) {
+        return 0;
+    }
+    int n = 0;
+    while (n < aMaxIterations) {
+        if (sPending && !sPending(nullptr)) {
+            break;
+        }
+        sIterate(nullptr, 0 /* may_block = FALSE */);
+        n++;
+    }
+    return n;
+}
+
+// ── RUN THE PLUGIN'S EVENT LOOP CONTINUOUSLY (Jihad, addons R7) ───────────────────────────
+//
+// Pumping glib only just before a paint deadlocks a webOS plugin, because its startup is
+// asynchronous: Flash registers com.palm.flashgraphics on the LS2 bus, attaches that socket to
+// the loop it was handed, and then waits on round-trips to com.palm.systemservice
+// (getPreferences), com.palm.display (status) and com.palm.db (find) before it starts its frame
+// clock. Until the clock runs it never calls NPN_InvalidateRect, so nothing ever asks it to
+// paint — and the only pump was on the paint path. No paint, no pump; no pump, no paint.
+//
+// So the pump has to be independent of painting. This reposts itself on the child's own
+// MessageLoop, which is the SAME thread every other NPAPI call into the plugin runs on — the
+// arrangement Palm's host gave it, since BrowserServer's main loop simply WAS a GMainLoop.
+// g_main_loop_run() on a dedicated thread would be the wrong shape: the plugin's timer
+// callbacks would then fire off the NPAPI thread and reenter us from it.
+//
+// MEASURED: before the LS2 role allowed com.palm.flashgraphics, LSRegisterPalmService failed
+// with -1027, nothing was ever attached to the loop, and g_main_context_pending() returned
+// FALSE forever. That is fixed in packaging/gen-variant-scripts.sh; the pump only has anything
+// to run because of it.
+static const int kJihadGlibPumpIntervalMs = 16;   // ~60Hz, the rate a frame clock wants
+static const int kJihadGlibPumpMaxIters   = 20;   // bounded: never starve the MessageLoop
+
+// Host-driven repaint divisor: one repaint every Nth 16 ms tick. 2 is ~30 Hz, which is what
+// ordinary Flash content is authored at; 4 was ~15 Hz and was the measured ceiling on the
+// WHOLE pipeline — device 2026-08-10, single instance: plugin draw 21.6-24 fps and RecvShow
+// 21.3-24.2 fps while the daemon was already compositing 28.4-29.4 fps, i.e. the host was
+// asking for frames more slowly than it could consume them.
+//
+// Env-tunable because the right value is a property of the device under load, not of the
+// source, and a rebuild per candidate costs a 44 MB push. Clamped: 0 or a negative divisor
+// would be a modulo-by-zero, and anything past 8 is slower than the pump itself.
+// Disable the child's OWN repaint timer entirely. $JIHAD_PLUGIN_SELF_DRIVE=0.
+//
+// This exists to isolate ONE producer. Measured 2026-08-10, there are two: our host pull and the
+// plugin invalidating itself (~26/s and ~23/s). Turning off only the daemon's pull
+// (JIHAD_PLUGIN_PULL=0) does NOT isolate the plugin, because the child's host-drive lease then
+// expires and this timer takes over — that run reproduces patch 0026 rather than answering the
+// question, and it measured WORSE than the pull on both rate (24-29 vs 30-33 fps) and spread.
+// With both switches off the plugin's own NPN_InvalidateRect is the only frame source left, which
+// is the experiment that decides whether a host clock should exist here at all.
+static bool JihadChildSelfDriveEnabled()
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("JIHAD_PLUGIN_SELF_DRIVE");
+        s_on = (e && *e && atoi(e) == 0) ? 0 : 1;   // default ON; only an explicit 0 disables
+        fprintf(stderr, "[jihad-npapi-child] self-drive timer %s\n", s_on ? "enabled" : "DISABLED");
+        fflush(stderr);
+    }
+    return s_on != 0;
+}
+
+static int JihadRepaintEveryTicks()
+{
+    static int sDiv = 0;
+    if (!sDiv) {
+        sDiv = 2;
+        const char* e = getenv("JIHAD_PLUGIN_REPAINT_DIV");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 8) sDiv = v;
+        }
+        fprintf(stderr, "[jihad-npapi-child] host repaint divisor=%d (~%d Hz)\n",
+                sDiv, 1000 / (kJihadGlibPumpIntervalMs * sDiv));
+        fflush(stderr);
+    }
+    return sDiv;
+}
+
+// ── REPAINT A webOS PLUGIN FROM THE HOST'S CLOCK (Jihad, addons R7) ──────────────────────
+//
+// Gecko paints a windowless plugin only when something invalidates it, and for an ordinary
+// NPAPI plugin that is the plugin itself calling NPN_InvalidateRect. A webOS plugin is under
+// no such obligation, because the host it was written for never made it one: Palm's
+// PluginView::paint (libWebKitLuna 0x4e7a3c) issues npPalmDrawEvent every time the PAGE
+// paints, and BrowserServer's compositor painted continuously. Flash on that host could sit
+// on its frame clock and simply expect to be asked.
+//
+// So this drives the repaint until the plugin proves it drives itself, then gets out of the
+// way — a plugin that calls NPN_InvalidateRect gets Gecko's normal damage-driven painting and
+// none of this cost. Measured: with no host clock, Flash produced exactly 3 draw events in
+// 30 s and 0 invalidates.
+void
+PluginInstanceChild::JihadPalmRepaintTick()
+{
+    if (!mLayersRendering || mWindow.width <= 0 || mWindow.height <= 0) {
+        return;
+    }
+    NPRect windowRect = { 0, 0,
+                          uint16_t(mWindow.height), uint16_t(mWindow.width) };
+    sJihadInHostRepaint = true;
+    InvalidateRect(&windowRect);
+    sJihadInHostRepaint = false;
+}
+
+// ── HOST-DRIVEN FRAME CLOCK (Jihad, addons R7) ───────────────────────────────────────────
+//
+// When the daemon is pulling (it calls jihad_plugin_request_frame after each card frame it
+// publishes), the timer above must get out of the way, or the plugin has TWO drivers and the
+// extra draws are exactly the drift the pull exists to remove.
+//
+// The handoff is timestamp-based rather than a latch because there is no unregister: the daemon
+// can stop asking at any moment — the card is backgrounded (BrowserPageGoanna::freeze returns
+// early from maybePaint), the page navigates, the daemon is stopped or crashes — and a latched
+// plugin would then never paint again. So host-driven is a LEASE that must be renewed. If no
+// request arrives for kJihadHostDriveLeaseMs the timer resumes on its own.
+//
+// THE LEASE MUST EXCEED THE DAEMON'S WORST-CASE GAP BETWEEN REQUESTS, and the first version of
+// this got that wrong in a way that is worth keeping written down, because the symptom looked
+// like a mysterious third party rather than like a bug.
+//
+// The daemon does not ask again while a request is outstanding; it waits out
+// kJihadPluginReqTimeoutMs (250 ms) before re-asking. The lease here was 150 ms — SHORTER — so a
+// single late frame guaranteed the lease expired, the child resumed self-driving, and the two
+// clocks this patch exists to collapse were both running again. Measured on device before the
+// fix: the child logged HOST -> SELF -> HOST, and the invalidate counter split almost exactly in
+// half, 1856 requests from the host against 1846 from the child's own timer, summing to the 3702
+// total. The 23% of "unexplained" draws that sent an earlier session hunting through
+// RecvUpdateBackground were this, and the background paths were measured at exactly ZERO.
+//
+// So the invariant, not a tuned number: lease > request timeout + one grid period + margin.
+// 500 ms is 250 + 33 + slack. A card that really stopped publishing still resumes self-drawing
+// in half a second, which is well inside what a resume can absorb.
+static const uint32_t kJihadHostDriveLeaseMs = 500;
+static uint32_t sJihadLastHostRequestMs = 0;
+static bool sJihadEverHostDriven = false;
+
+static bool JihadHostIsDrivingFrames()
+{
+    bool driving = false;
+    if (sJihadEverHostDriven) {
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        // Unsigned subtraction, so the 32-bit PR_IntervalNow wrap is handled without a signed
+        // compare that would read as "lease expired" for one interval every wrap.
+        driving = (nowMs - sJihadLastHostRequestMs) < kJihadHostDriveLeaseMs;
+    }
+
+    // LOG EVERY TRANSITION. A watchdog that silently resumes self-driving would make a BROKEN
+    // pull look like "no change" in the frame numbers instead of "the feature is off" — the same
+    // trap family as an empty log passing every grep, and a wedged plugin reading as a pacing
+    // regression. Both of those cost real time in this tree already; this one is cheap to close.
+    static bool sWas = false;
+    if (driving != sWas) {
+        sWas = driving;
+        fprintf(stderr, "[jihad-npapi-child] frame clock -> %s\n",
+                driving ? "HOST (daemon pull)" : "SELF (timer; host lease expired)");
+        fflush(stderr);
+    }
+    return driving;
+}
+
+bool
+PluginInstanceChild::RecvJihadRequestFrame()
+{
+    sJihadEverHostDriven = true;
+    sJihadLastHostRequestMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+
+    // A plugin that drives itself gets Gecko's normal damage-driven painting, exactly as the
+    // timer path decides below; asking such a plugin for frames would double its draw rate.
+    if (gJihadNPNInvalidateRectCalls != 0) {
+        return true;
+    }
+
+    static uint64_t sHostFrames = 0;
+    static uint32_t sReportMs = 0;
+    if (!(++sHostFrames % 64)) {
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        if (sReportMs) {
+            fprintf(stderr, "[jihad-npapi-child] host-driven: 64 requests in %ums\n",
+                    nowMs - sReportMs);
+            fflush(stderr);
+        }
+        sReportMs = nowMs;
+    }
+
+    JihadPalmRepaintTick();
+    return true;
+}
+
+namespace {
+class JihadGlibPumpTask final : public Runnable
+{
+public:
+    NS_IMETHOD Run() override
+    {
+        int n = JihadPumpGlib(kJihadGlibPumpMaxIters);
+
+        // The pump itself keeps running at 16 ms whatever drives the frames — Flash's LS2
+        // socket, its timers and its audio sources all live on this GMainLoop, and starving
+        // them is what deadlocked startup before patch 0026. Only the REPAINT defers.
+        static uint64_t sRepaintTicks = 0;
+        if (sJihadPalmInstance && gJihadNPNInvalidateRectCalls == 0 &&
+            JihadChildSelfDriveEnabled() && !JihadHostIsDrivingFrames() &&
+            (++sRepaintTicks % JihadRepaintEveryTicks()) == 0) {
+            sJihadPalmInstance->JihadPalmRepaintTick();
+        }
+
+        // One-shot liveness, because "the plugin is idle" and "the pump died" look
+        // identical on screen. Report the first tick that actually ran a source.
+        static bool sSawFirstSource = false;
+        static uint64_t sTicks = 0;
+        sTicks++;
+        if (n && !sSawFirstSource) {
+            sSawFirstSource = true;
+            fprintf(stderr, "[jihad-npapi-child] glib pump: first source ran on tick %llu\n",
+                    (unsigned long long)sTicks);
+            fflush(stderr);
+        }
+
+        MessageLoop::current()->PostDelayedTask(
+            RefPtr<Runnable>(new JihadGlibPumpTask()).forget(),
+            kJihadGlibPumpIntervalMs);
+        return NS_OK;
+    }
+};
+} // namespace
+
+// Idempotent: several plugin instances share one GMainLoop, so they share one pump.
+static void
+JihadStartGlibPump(PluginInstanceChild* aInstance)
+{
+    sJihadPalmInstance = aInstance;
+    static bool sStarted = false;
+    if (sStarted) {
+        return;
+    }
+    MessageLoop* loop = MessageLoop::current();
+    if (!loop) {
+        fprintf(stderr, "[jihad-npapi-child] glib pump: no MessageLoop, not starting\n");
+        fflush(stderr);
+        return;
+    }
+    sStarted = true;
+    fprintf(stderr, "[jihad-npapi-child] glib pump: starting, every %dms\n",
+            kJihadGlibPumpIntervalMs);
+    fflush(stderr);
+    loop->PostDelayedTask(RefPtr<Runnable>(new JihadGlibPumpTask()).forget(),
+                          kJihadGlibPumpIntervalMs);
+}
+
+// ── PIRANHA CONTEXT FOR A WEBOS PLUGIN (Jihad, addons R7) ────────────────────────────────
+//
+// webOS plugins that answer npPalmUseGraphicsContext=true expect NpPalmDrawEvent to carry a
+// Piranha PGContext* rather than a raster pointer. Piranha ships on the device inside
+// libWebKitLuna.so (PGContext/PGSurface) and libPiranha.so; neither is linked into this
+// process, so everything is resolved by dlsym on the mangled names — no webOS headers, and
+// nothing breaks on a desktop build where the libraries simply are not there.
+//
+// Feasibility was established separately before any of this was written; see
+// render/goanna/test/piranha_offscreen_probe.c, which does exactly this sequence in a bare
+// process and confirms the pixels land in caller-owned memory.
+//
+// The context is cached per (buffer,size) because a plugin repaints constantly and both
+// objects would otherwise leak once per frame.
+static void*
+JihadPiranhaContextFor(unsigned char* aData, int aWidth, int aHeight, int aStride)
+{
+    // PGSurface::wrap() has no stride parameter, so it can only describe tightly packed
+    // rows. Refuse rather than hand Piranha a buffer it would misread into a sheared image.
+    if (!aData || aWidth <= 0 || aHeight <= 0 || aStride != aWidth * 4) {
+        static bool sWarnedStride = false;
+        if (!sWarnedStride) {
+            sWarnedStride = true;
+            fprintf(stderr, "[jihad-npapi-child] piranha: stride %d != %d*4, not wrapping\n",
+                    aStride, aWidth);
+            fflush(stderr);
+        }
+        return nullptr;
+    }
+
+    typedef void* (*PGSurfaceWrapFn)(unsigned, unsigned, const unsigned char*, bool);
+    typedef void* (*PGContextCreateFn)(void);
+    typedef void  (*PGContextSetSurfaceFn)(void*, void*);
+
+    static bool sTried = false;
+    static PGSurfaceWrapFn sWrap = nullptr;
+    static PGContextCreateFn sCreate = nullptr;
+    static PGContextSetSurfaceFn sSetSurface = nullptr;
+
+    if (!sTried) {
+        sTried = true;
+        // g_thread_init() MUST run before libWebKitLuna loads or its constructors abort with
+        // "GLib-ERROR **: The thread system is not yet initialized". It lives in
+        // libgthread-2.0.so.0, NOT libglib-2.0.so.0. Measured, not guessed.
+        if (void* gthread = dlopen("libgthread-2.0.so.0", RTLD_NOW | RTLD_GLOBAL)) {
+            typedef void (*GThreadInitFn)(void*);
+            if (GThreadInitFn init = (GThreadInitFn)dlsym(gthread, "g_thread_init")) {
+                typedef int (*GThreadGetInitFn)(void);
+                GThreadGetInitFn got =
+                    (GThreadGetInitFn)dlsym(gthread, "g_thread_get_initialized");
+                if (!got || !got()) {
+                    init(nullptr);
+                }
+            }
+        }
+        void* wk = dlopen("libWebKitLuna.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!wk) {
+            fprintf(stderr, "[jihad-npapi-child] piranha: no libWebKitLuna (%s)\n", dlerror());
+            fflush(stderr);
+        } else {
+            sWrap       = (PGSurfaceWrapFn)dlsym(wk, "_ZN9PGSurface4wrapEjjPKhb");
+            sCreate     = (PGContextCreateFn)dlsym(wk, "_ZN9PGContext6createEv");
+            sSetSurface = (PGContextSetSurfaceFn)dlsym(wk, "_ZN9PGContext10setSurfaceEP9PGSurface");
+            fprintf(stderr, "[jihad-npapi-child] piranha syms wrap=%p create=%p setSurface=%p\n",
+                    (void*)sWrap, (void*)sCreate, (void*)sSetSurface);
+            fflush(stderr);
+        }
+    }
+    if (!sWrap || !sCreate || !sSetSurface) {
+        return nullptr;
+    }
+
+    // A SET of cached contexts, not one. Palm got away with a single context because its
+    // buffer was one process-global screen-sized allocation that never moved; here the child
+    // rotates between a front and a back gfxSharedImageSurface, so a one-entry cache keyed on
+    // the buffer address misses on EVERY frame. That was invisible while the plugin was only
+    // painted twice, and turned into a PGSurface + PGContext leaked per frame the moment the
+    // host started driving repaints at 15Hz.
+    //
+    // Four entries: two buffers is the observed case, and a small fixed array keeps this
+    // allocation-free and bounded even if the surface pool grows. On overflow the oldest entry
+    // is dropped — leaking that one context rather than freeing an object the plugin may still
+    // be holding, which is the safer of the two mistakes and is bounded by the buffer count.
+    struct CacheEntry { unsigned char* data; int w, h; void* ctx; };
+    static CacheEntry sCache[4] = {};
+    static unsigned sCacheNext = 0;
+
+    for (size_t i = 0; i < MOZ_ARRAY_LENGTH(sCache); ++i) {
+        if (sCache[i].ctx && sCache[i].data == aData &&
+            sCache[i].w == aWidth && sCache[i].h == aHeight) {
+            return sCache[i].ctx;
+        }
+    }
+
+    void* surf = sWrap((unsigned)aWidth, (unsigned)aHeight, aData, true);
+    void* ctx  = surf ? sCreate() : nullptr;
+    if (ctx) {
+        sSetSurface(ctx, surf);
+    }
+    // Rate-limited: this is now a cache MISS log, and a miss storm is exactly the symptom
+    // worth seeing — but only the first few, or it floods the daemon log at frame rate.
+    static int sLoggedCtx = 0;
+    if (sLoggedCtx < 8) {
+        sLoggedCtx++;
+        fprintf(stderr, "[jihad-npapi-child] piranha ctx %dx%d buf=%p surface=%p context=%p\n",
+                aWidth, aHeight, aData, surf, ctx);
+        fflush(stderr);
+    }
+
+    CacheEntry& slot = sCache[sCacheNext % MOZ_ARRAY_LENGTH(sCache)];
+    sCacheNext++;
+    slot.data = aData; slot.w = aWidth; slot.h = aHeight; slot.ctx = ctx;
+    return ctx;
 }
 
 void
@@ -3799,7 +4454,187 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
     ::IntersectClipRect((HDC) mWindow.window, rect.left, rect.top, rect.right, rect.bottom);
     mPluginIface->event(&mData, reinterpret_cast<void*>(&paintEvent));
 #else
-    NS_RUNTIMEABORT("Surface type not implemented.");
+    // No platform surface to paint onto.
+    //
+    // This is the CLASSIC windowless paint path, and on Unix it is X11 and nothing else: the
+    // browser hands the plugin a Drawable and sends it an XGraphicsExposeEvent. A build with
+    // no X (a headless toolkit) has nothing it can hand over, and NPAPI defines no
+    // alternative for Unix — a plugin that wants to draw without X has to opt into a bitmap
+    // drawing model (NPDrawingModelAsyncBitmapSurface), which is a different path entirely
+    // and is fully supported here.
+    //
+    // Aborting is wrong for an embedder: the plugin process dies, the parent respawns it,
+    // and the whole cycle repeats for every paint, so one plugin that cannot draw becomes an
+    // endless crash loop. Warn once and leave the surface untouched instead — the plugin
+    // stays loaded and scriptable and simply shows nothing, which is a bounded failure the
+    // embedder can report.
+    // fprintf, not NS_WARNING: NS_WARNING compiles to nothing in a release build, and this is
+    // the ONLY signal distinguishing "the plugin drew nothing" from "the plugin was never
+    // asked to draw" — a distinction that is invisible on screen (both are a blank box).
+    // WEBOS RASTER DRAW EVENT (Jihad, addons R7).
+    //
+    // webOS plugins do not use the X11 protocol at all — they are painted by an
+    // npPalmDrawEvent, and NpPalmDrawEvent carries BOTH a raster destination (dstBuffer +
+    // dstRowBytes, "only valid in API version 1.0") and a Piranha PGContext
+    // ("must be used to draw in API version 2.0"). See Palm's own npapi.h, XP_WEBOS block.
+    //
+    // The device's Flash answers npPalmUseGraphicsContext = true, which per that header means
+    // the HOST may then pass a null raster — it is a statement about host behaviour, NOT a
+    // promise that the plugin refuses a non-null dstBuffer. There is no API-version
+    // negotiation anywhere in the contract, so the only way to find out whether a plugin
+    // honours the raster path is to hand it one and look. That is what this does.
+    //
+    // The surface here is already an ordinary shared-memory image (gfxSharedImageSurface,
+    // created a few hundred lines up), living in this process, whose pixels the parent
+    // already composites — so the raster the plugin needs costs nothing to produce.
+    if (aSurface->GetType() == gfxSurfaceType::Image) {
+        gfxImageSurface* img = static_cast<gfxImageSurface*>(aSurface);
+        uint8_t* data = img->Data();
+        int32_t stride = img->Stride();
+
+        if (data && stride > 0) {
+            // NPEvent is Palm's own event union on this platform (npapi.h); the offsets it
+            // depends on are asserted at the top of this file against libWebKitLuna.
+            // THE DRAW ALWAYS COVERS THE WHOLE SURFACE, whatever sub-rect was requested.
+            //
+            // Two things forced this. The PGContext below is built for the FULL surface
+            // (PGSurface::wrap takes width/height and assumes tightly packed rows), so pairing
+            // it with a dstBuffer offset into the middle of that surface makes the plugin's
+            // blit start partway in and run off the end — measured as `FAULT sig=7` (SIGBUS)
+            // in the plugin child the moment the host began sending partial invalidations.
+            // And Palm's own host never sent a partial rect either: PluginView::paint passes
+            // the plugin's whole frame rect, which is why a 2.0 plugin is entitled to assume
+            // the two agree. Redrawing the whole plugin box costs the plugin nothing it was
+            // not already doing every frame.
+            nsIntRect drawRect(0, 0, img->Width(), img->Height());
+            NPEvent ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.eventType = npPalmDrawEvent;
+            // "points to top-left of area to paint"
+            ev.data.drawEvent.dstBuffer = data;
+            ev.data.drawEvent.dstRowBytes = (uint32_t)stride;
+            ev.data.drawEvent.srcLeft   = drawRect.x;
+            ev.data.drawEvent.srcTop    = drawRect.y;
+            ev.data.drawEvent.srcRight  = drawRect.XMost();
+            ev.data.drawEvent.srcBottom = drawRect.YMost();
+            ev.data.drawEvent.dstLeft   = ev.data.drawEvent.srcLeft;
+            ev.data.drawEvent.dstTop    = ev.data.drawEvent.srcTop;
+            ev.data.drawEvent.dstRight  = ev.data.drawEvent.srcRight;
+            ev.data.drawEvent.dstBottom = ev.data.drawEvent.srcBottom;
+            // API 2.0: a real Piranha PGContext bound to the very same pixels.
+            //
+            // The device's Flash answers npPalmUseGraphicsContext = true, and although it
+            // accepts a raster draw event (returns handled=1) it writes nothing into the
+            // buffer — so "handled" evidently means "consumed", not "drew". This gives it
+            // what it actually asked for. Proven possible by
+            // render/goanna/test/piranha_offscreen_probe.c: a PGContext can be created over
+            // wrapped memory in an ordinary process with no display and no compositor.
+            //
+            // PGSurface::wrap() takes no stride, so it assumes tightly-packed w*4 rows. That
+            // holds here (a 320-wide surface has stride 1280) but is asserted rather than
+            // assumed, because a padded stride would silently shear the image.
+            ev.data.drawEvent.graphicsContext = JihadPiranhaContextFor(data, img->Width(),
+                                                                       img->Height(), stride);
+            // BOTH fields stay populated, including for a plugin that answered
+            // npPalmUseGraphicsContext = true.
+            //
+            // npapi.h says the raster pointer "is then passed in as null" for such plugins, and
+            // this code used to believe it. The host that actually shipped does not: PluginView
+            // ::paint (libWebKitLuna 0x4e7c70 / 0x4e7c5c) stores a live dstBuffer and a live
+            // dstRowBytes into the event on the SAME branch that stores the PGContext — the
+            // graphics-context case is precisely the one where it computes
+            // dstBuffer = <shared buffer> + (y*screenWidth + x)*4 and
+            // dstRowBytes = screenWidth*4 (0x4e7e04-0x4e7e18). The header comment describes
+            // what a 2.0 plugin is expected to USE, not what the host is allowed to omit, and
+            // handing Flash a null raster is a difference from the reference host that costs
+            // nothing to remove.
+
+            // Let the plugin's own scheduled work run before we ask it to draw, so the
+            // frame it paints is current rather than whatever it had at instantiation.
+            JihadPumpGlib(50);
+
+            int16_t handled = mPluginIface->event
+                ? mPluginIface->event(&mData, reinterpret_cast<void*>(&ev)) : -1;
+            gJihadPalmDrawEvents++;
+
+            static int sLogged = 0;
+            // FRAME-RATE READOUT. A static SWF and a 30fps game are indistinguishable from
+            // a per-event log (capped) or a screenshot (one instant), and the difference is
+            // the whole question for animated content. One line every 2s costs nothing and
+            // is the only way to see the plugin's real cadence in the field.
+            {
+                static uint32_t sDraws = 0;
+                static uint32_t sLastReport = 0;
+                sDraws++;
+                uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+                if (!sLastReport) {
+                    sLastReport = nowMs;
+                } else if (nowMs - sLastReport >= 2000) {
+                    fprintf(stderr, "[jihad-npapi-child] palm draw: %u in %ums (%.1f fps)\n",
+                            sDraws, nowMs - sLastReport,
+                            sDraws * 1000.0 / double(nowMs - sLastReport));
+                    // WHICH SITE ASKED FOR THOSE DRAWS. These are requests to draw, not draws:
+                    // AsyncShowPluginFrame coalesces while an invalidate task is already pending,
+                    // so the sum is an UPPER bound on sDraws and the interesting number is the
+                    // SHARE each site holds, not the total. Printed on the same 2 s boundary so a
+                    // reader can line them up without correlating timestamps.
+                    {
+                        char buf[192];
+                        size_t n = 0;
+                        buf[0] = '\0';
+                        for (int i = 0; i < kJihadShowSites; ++i) {
+                            // Clamp rather than trust the running total: snprintf returns the
+                            // length it WANTED, so an overflow would make the next call pass a
+                            // negative size as size_t and write off the end.
+                            if (n < sizeof(buf) - 1) {
+                                int w = snprintf(buf + n, sizeof(buf) - n, " %s=%u",
+                                                 kJihadShowNames[i], gJihadShowFrom[i]);
+                                if (w > 0) {
+                                    n += size_t(w);
+                                    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+                                }
+                            }
+                            gJihadShowFrom[i] = 0;
+                        }
+                        fprintf(stderr, "[jihad-npapi-child]   show req:%s\n", buf);
+                    }
+                    fflush(stderr);
+                    sDraws = 0;
+                    sLastReport = nowMs;
+                }
+            }
+            if (sLogged < 3) {
+                sLogged++;
+                // handled= is reported but means nothing on its own: Flash's NPP_HandleEvent
+                // sets its return to 1 (libflashplayer.so 0x45274) BEFORE calling the draw
+                // handler and returns it unconditionally, so handled=1 is emitted even when
+                // the handler bails without touching the surface. Only pixels are evidence.
+                fprintf(stderr, "[jihad-npapi-child] npPalmDrawEvent %s %d,%d %dx%d "
+                                "stride=%d ctx=%p handled=%d\n",
+                        ev.data.drawEvent.graphicsContext ? "pgcontext" : "raster",
+                        drawRect.x, drawRect.y, drawRect.width, drawRect.height,
+                        (int)stride, ev.data.drawEvent.graphicsContext, (int)handled);
+                fflush(stderr);
+            }
+            return;
+        }
+    }
+
+    // Nothing we can paint onto at all.
+    //
+    // Aborting is wrong for an embedder: the plugin process dies, the parent respawns it,
+    // and the whole cycle repeats for every paint, so one plugin that cannot draw becomes an
+    // endless crash loop. Warn once and leave the surface untouched instead.
+    // fprintf, not NS_WARNING: NS_WARNING compiles to nothing in a release build, and this is
+    // the ONLY signal distinguishing "the plugin drew nothing" from "the plugin was never
+    // asked to draw" — a distinction that is invisible on screen (both are a blank box).
+    static bool sWarned = false;
+    if (!sWarned) {
+        sWarned = true;
+        fprintf(stderr, "[jihad-npapi-child] no paintable surface for this windowless "
+                        "plugin (type=%d); it will NOT paint.\n", (int)aSurface->GetType());
+        fflush(stderr);
+    }
 #endif
 }
 
@@ -4264,6 +5099,7 @@ PluginInstanceChild::InvalidateRectDelayed(void)
     }
 
     if (!ShowPluginFrame()) {
+        gJihadShowFrom[kJihadShowRetry]++;
         AsyncShowPluginFrame();
     }
 }
@@ -4317,6 +5153,8 @@ PluginInstanceChild::InvalidateRect(NPRect* aInvalidRect)
         mAccumulatedInvalidRect.UnionRect(r, mAccumulatedInvalidRect);
         // If we are able to paint and invalidate sent, then reset
         // accumulated rectangle
+        gJihadShowFrom[sJihadInHostRepaint ? kJihadShowInvalidate
+                                          : kJihadShowPluginSelf]++;
         AsyncShowPluginFrame();
         return;
     }
@@ -4360,6 +5198,7 @@ PluginInstanceChild::RecvUpdateBackground(const SurfaceDescriptor& aBackground,
         IntSize bgSize = mBackground->GetSize();
         mAccumulatedInvalidRect.UnionRect(mAccumulatedInvalidRect,
                                           nsIntRect(0, 0, bgSize.width, bgSize.height));
+        gJihadShowFrom[kJihadShowBgUpdate]++;
         AsyncShowPluginFrame();
         return true;
     }
@@ -4369,6 +5208,7 @@ PluginInstanceChild::RecvUpdateBackground(const SurfaceDescriptor& aBackground,
 
     // This must be asynchronous, because we may be nested within RPC messages
     // which do not expect to receiving paint events.
+    gJihadShowFrom[kJihadShowBgUpdateTail]++;
     AsyncShowPluginFrame();
 
     return true;
@@ -4401,6 +5241,7 @@ PluginInstanceChild::RecvPPluginBackgroundDestroyerConstructor(
         // NB: we don't have to XSync here because only ShowPluginFrame()
         // uses mBackground, and it always XSyncs after finishing.
         mBackground = nullptr;
+        gJihadShowFrom[kJihadShowBgDestroy]++;
         AsyncShowPluginFrame();
     }
 

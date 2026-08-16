@@ -25,6 +25,8 @@
 #include "mozilla/ContentCache.h"
 #include "mozilla/EventForwards.h"
 
+class nsIDocShell;   // Jihad offscreen render (JihadRenderDocument)
+
 namespace mozilla {
 
 namespace dom {
@@ -200,6 +202,72 @@ public:
   // Paint the widget immediately if any paints are queued up.
   void PaintNowIfNeeded();
 
+  // --- Jihad offscreen render support ---
+  // When the env var JIHAD_OFFSCREEN is set, a (null-TabChild) PuppetWidget
+  // renders through an in-process CPU BasicLayerManager into an in-memory
+  // DrawTarget (no compositor, no native window, no X/GTK), so a headless
+  // render daemon can read the pixels straight out. See the extern "C"
+  // jihad_offscreen_* entry points in PuppetWidget.cpp.
+  static bool JihadOffscreen();
+  void JihadEnsureDrawTarget();
+  already_AddRefed<mozilla::gfx::SourceSurface> JihadSnapshot();
+  // Render the docShell's document straight into mDrawTarget via the presShell
+  // (the canonical offscreen path, like canvas drawWindow / tab thumbnails). The
+  // widget Paint() path does NOT paint the embedded content into this widget, so
+  // relying on it produced a black frame; this renders the actual document.
+  bool JihadRenderDocument(nsIDocShell* aDocShell, double aZoom = 1.0,
+                           double aPanX = 0.0, double aPanY = 0.0);
+  // Sticky invalidation flag for the render daemon (jihad_offscreen_take_dirty):
+  // set on every Invalidate() so the daemon knows CONTENT CHANGED and a repaint is
+  // due — the offscreen embedding has no compositor/paint-event feedback loop, so
+  // without this the daemon's frame delivery is input-driven only and JS/SPA DOM
+  // updates, async image decode, and incremental page render leave the shared
+  // buffer stale (the on-device "old page sticks around until you drag" bug).
+  // Deliberately separate from mDirtyRegion, which the PaintTask self-clears.
+  //
+  // DRAINS THE CHILD CHAIN: the embedding's view hierarchy does not paint through
+  // the top-level widget the daemon created — nsView::CreateWidgetForParent goes
+  // through PuppetWidget::CreateChild, which makes a SEPARATE child PuppetWidget
+  // (linked back via SetChild). Every Invalidate() from the view manager lands on
+  // that CHILD, setting the child's mJihadDirty, while the daemon polls the
+  // top-level parent — whose flag nothing ever set. That inert dirty loop is why
+  // anything that became visually ready after the last load/input-driven paint
+  // (async image decode — the about:addons icons — JS/SPA DOM updates) never
+  // appeared on the device: no repaint was ever triggered. Draining the chain
+  // here makes the poll see the child's invalidations.
+  bool JihadTakeDirty() {
+    bool d = mJihadDirty; mJihadDirty = false;
+    for (PuppetWidget* c = mChild.get(); c; c = c->mChild.get()) {
+      if (c->mJihadDirty) { d = true; c->mJihadDirty = false; }
+    }
+    return d;
+  }
+
+  // The BOUNDING BOX of everything invalidated since the last drain, in the widget's own
+  // device px, drained with the flag. A whole-viewport software repaint costs ~40 ms on this
+  // hardware, which caps anything animated at ~20 fps no matter how fast the source runs; a
+  // plugin animating in a 320x240 box only needs those rows. Accumulated as a bounding box
+  // rather than a region on purpose: the consumer can only issue rectangular renders, so a
+  // precise region would be discarded at the first use anyway.
+  bool JihadTakeDirtyRect(int32_t* aX, int32_t* aY, int32_t* aW, int32_t* aH) {
+    LayoutDeviceIntRect r = mJihadDirtyRect;
+    mJihadDirtyRect.SetEmpty();
+    for (PuppetWidget* c = mChild.get(); c; c = c->mChild.get()) {
+      if (!c->mJihadDirtyRect.IsEmpty()) {
+        r = r.IsEmpty() ? c->mJihadDirtyRect : r.Union(c->mJihadDirtyRect);
+        c->mJihadDirtyRect.SetEmpty();
+      }
+    }
+    if (r.IsEmpty()) {
+      return false;
+    }
+    if (aX) *aX = r.x;
+    if (aY) *aY = r.y;
+    if (aW) *aW = r.width;
+    if (aH) *aH = r.height;
+    return true;
+  }
+
   virtual TabChild* GetOwningTabChild() override { return mTabChild; }
 
   void UpdateBackingScaleCache(float aDpi, int32_t aRounding, double aScale)
@@ -342,6 +410,11 @@ private:
   // event handler.
   RefPtr<PuppetWidget> mChild;
   LayoutDeviceIntRegion mDirtyRegion;
+  bool mJihadDirty = false;   // sticky Invalidate() flag, drained by JihadTakeDirty()
+  // Bounding box of the same invalidations, drained by JihadTakeDirtyRect(). Kept beside the
+  // flag rather than replacing it: the flag answers "is anything dirty" for callers that do a
+  // full repaint, and must keep working unchanged if the rect is ignored.
+  LayoutDeviceIntRect mJihadDirtyRect;
   nsRevocableEventPtr<PaintTask> mPaintTask;
   RefPtr<MemoryPressureObserver> mMemoryPressureObserver;
   // XXX/cjones: keeping this around until we teach LayerManager to do

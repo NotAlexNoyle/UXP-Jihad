@@ -74,6 +74,22 @@ if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'cocoa':
         'gfxQuartzSurface.cpp',
         'PrintTargetCG.cpp',
     ]
+elif CONFIG['MOZ_WIDGET_TOOLKIT'] == 'headless':
+    # Jihad headless (no X/GTK): fontconfig/freetype fonts + a memory gfxPlatform.
+    EXPORTS += [
+        'gfxFT2FontBase.h',
+        'gfxPlatformHeadless.h',
+    ]
+    EXPORTS.mozilla.gfx += [
+        'PrintTargetPDF.h',
+    ]
+    SOURCES += [
+        'gfxFcPlatformFontList.cpp',
+        'gfxFT2FontBase.cpp',
+        'gfxFT2Utils.cpp',
+        'gfxPlatformHeadless.cpp',
+        'PrintTargetPDF.cpp',
+    ]
 elif 'gtk' in CONFIG['MOZ_WIDGET_TOOLKIT']:
     EXPORTS += [
         'gfxFT2FontBase.h',

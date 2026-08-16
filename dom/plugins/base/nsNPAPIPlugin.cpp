@@ -341,6 +341,10 @@ nsNPAPIPlugin::CreatePlugin(nsPluginTag *aPluginTag, nsNPAPIPlugin** aResult)
   RefPtr<nsNPAPIPlugin> plugin = new nsNPAPIPlugin();
 
   PluginLibrary* pluginLib = GetNewPluginLibrary(aPluginTag);
+  // JIHAD DIAGNOSTIC (R7): GetNewPluginLibrary is where the OOP decision is made —
+  // RunPluginOOP() ? PluginModuleParent::LoadModule (launches plugin-container) : a
+  // PluginPRLibrary loaded in-process. A null here is the plugin-container launch failing.
+  fprintf(stderr, "[jihad-npapi] GetNewPluginLibrary lib=%d\n", (int)!!pluginLib);
   if (!pluginLib) {
     return NS_ERROR_FAILURE;
   }
@@ -386,6 +390,7 @@ nsNPAPIPlugin::CreatePlugin(nsPluginTag *aPluginTag, nsNPAPIPlugin** aResult)
 #else
   NPError pluginCallError;
   nsresult rv = pluginLib->NP_Initialize(&sBrowserFuncs, &plugin->mPluginFuncs, &pluginCallError);
+  fprintf(stderr, "[jihad-npapi] NP_Initialize rv=0x%x npErr=%d\n", (unsigned)rv, (int)pluginCallError);
   if (rv != NS_OK || pluginCallError != NPERR_NO_ERROR) {
     return NS_ERROR_FAILURE;
   }
@@ -1939,7 +1944,16 @@ _getvalue(NPP npp, NPNVariable variable, void *result)
   }
 
   case NPNVSupportsWindowless: {
-#if defined(XP_WIN) || defined(XP_MACOSX) || \
+    // MOZ_WIDGET_HEADLESS added for Jihad Browser. This list enumerates the toolkits that can
+    // host a windowless plugin, and it was written before a headless toolkit existed — so a
+    // cairo-headless build answered "windowless unsupported" to every plugin, which is the
+    // opposite of the truth. Headless is the toolkit that MOST needs windowless: there is no X
+    // server, no Drawable and no XEmbed, so windowed hosting is impossible and drawing into a
+    // memory bitmap we own is the only thing that can work. gfxPlatformHeadless already returns
+    // true from SupportsPluginDirectBitmapDrawing(), i.e. the drawing model this unlocks
+    // (NPDrawingModelAsyncBitmapSurface) is implemented for this platform; only this
+    // advertisement was missing, and with it false no plugin would ever choose windowless.
+#if defined(XP_WIN) || defined(XP_MACOSX) || defined(MOZ_WIDGET_HEADLESS) || \
     (defined(MOZ_X11) && defined(MOZ_WIDGET_GTK))
     *(NPBool*)result = true;
 #else

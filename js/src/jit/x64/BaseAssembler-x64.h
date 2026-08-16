@@ -8,6 +8,14 @@
 
 #include "jit/x86-shared/BaseAssembler-x86-shared.h"
 
+// Jihad Browser: GCC 9+ -Wformat-overflow raises false positives on the debug
+// spew() format strings below (it deduces a null %s arg via value-range
+// analysis). js/src forces -Werror=format, which re-escalates this even when
+// downgraded on the command line, so silence the diagnostic at the source.
+#if defined(__GNUC__) && !defined(__clang__)
+# pragma GCC diagnostic ignored "-Wformat-overflow"
+#endif
+
 namespace js {
 namespace jit {
 

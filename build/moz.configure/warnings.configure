@@ -88,6 +88,11 @@ check_and_add_gcc_warning('-Wno-error=deprecated-declarations')
 # false positives depending on optimization
 check_and_add_gcc_warning('-Wno-error=array-bounds')
 
+# GCC 9+ value-range analysis trips -Wformat-overflow on null %s args in debug
+# spew (e.g. js/src/jit/x64/BaseAssembler-x64.h:595); harmless for our build,
+# and js/src forces -Werror=format so this must be downgraded here to reach it.
+check_and_add_gcc_warning('-Wno-error=format-overflow')
+
 # can't get rid of those PGO warnings
 check_and_add_gcc_warning('-Wno-error=coverage-mismatch', when='MOZ_PGO')
 

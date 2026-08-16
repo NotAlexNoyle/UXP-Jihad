@@ -569,6 +569,75 @@ NS_IMETHODIMP nsPluginInstanceOwner::InvalidateRect(NPRect *invalidRect)
   GetContentsScaleFactor(&scaleFactor);
   rect.ScaleRoundOut(scaleFactor);
   mPluginFrame->InvalidateLayer(nsDisplayItem::TYPE_PLUGIN, &rect);
+
+  // JIHAD (2026-08-09): drive the offscreen daemon's re-capture for WINDOWLESS plugins.
+  //
+  // A windowless plugin has no mWidget, so the mWidget->Invalidate() branch above (which is what
+  // ultimately reaches PuppetWidget::Invalidate and sets the daemon's mJihadDirty flag) never
+  // runs. InvalidateLayer() alone only marks the plugin's ImageLayer for recomposition; with the
+  // in-process BasicLayerManager and no separate compositor, that repaints the widget's own layer
+  // backbuffer but never triggers jihad_offscreen_render_region, the path that actually renders a
+  // frame into the adapter's shared buffer for the card. Measured: Flash pushes a fresh magenta
+  // frame into its ImageContainer ~15x/s and BasicImageLayer::Paint runs on each, yet
+  // render_region fired ONCE (at load) so the card froze on the pre-content frame. The control
+  // plugin only appeared to work because its static fill was already present at that single
+  // capture. Invalidate the nearest real widget here so every async plugin frame marks the daemon
+  // dirty and gets composited to the card.
+  //
+  // THE RECT MATTERS, and the first version of this got it wrong. It invalidated
+  // nearest->GetBounds() — the WIDGET's bounds, i.e. the whole viewport — on the reasoning
+  // that the daemon re-renders the whole document per capture anyway. That reasoning stopped
+  // being true when the daemon learned to repaint only the damaged rows: a whole-viewport
+  // software render costs ~40 ms on this hardware against ~4 ms for a 320x240 plugin box, and
+  // a full-viewport damage box silently forced the expensive path on every single frame.
+  // Measured: an animated SWF ran at 19 fps with 1 partial repaint in 39, and the damage box
+  // logged as 768x942 with the plugin's own 320x240 unioned uselessly into it.
+  //
+  // So invalidate the plugin's own area, translated from plugin-local into the widget's
+  // coordinates the same way the rest of this file does it: content-box origin relative to the
+  // frame, offset to the widget, in device px.
+  if (!mWidget) {
+    nsIWidget* nearest = mPluginFrame->GetNearestWidget();
+    if (nearest) {
+      nsIntRect widgetRect = rect;
+      nsPresContext* pc = mPluginFrame->PresContext();
+      // Offset to the ROOT frame, which is what the widget's coordinates are relative to.
+      // GetReferenceFrame() was the first attempt and it is wrong here: for a plugin it
+      // resolves to a frame that makes the offset come out 0, so every invalidation landed at
+      // the viewport's top-left corner instead of on the plugin. That is not a small error —
+      // the damage-only repaint then faithfully refreshed the wrong 320x240 box and the
+      // plugin's own area never updated again, which reads on screen as the animation
+      // freezing after its first frame. This is the same offset nsPluginFrame itself uses to
+      // build NPWindow.x/y.
+      nsIFrame* rootFrame = nullptr;
+      if (nsIPresShell* ps = mPluginFrame->PresContext()->GetPresShell()) {
+        rootFrame = ps->GetRootFrame();
+      }
+      nsPoint origin = mPluginFrame->GetContentRectRelativeToSelf().TopLeft() +
+                       (rootFrame ? mPluginFrame->GetOffsetToCrossDoc(rootFrame) : nsPoint());
+      widgetRect.MoveBy(pc->AppUnitsToDevPixels(origin.x),
+                        pc->AppUnitsToDevPixels(origin.y));
+      // A plugin is entitled to report an invalid rect larger than itself, and an empty one
+      // would invalidate nothing at all; clamp to the plugin's own box, and fall back to the
+      // widget bounds if that leaves nothing (correctness before speed).
+      nsIntRect pluginBox(pc->AppUnitsToDevPixels(origin.x),
+                          pc->AppUnitsToDevPixels(origin.y),
+                          pc->AppUnitsToDevPixels(
+                              mPluginFrame->GetContentRectRelativeToSelf().width),
+                          pc->AppUnitsToDevPixels(
+                              mPluginFrame->GetContentRectRelativeToSelf().height));
+      widgetRect = widgetRect.Intersect(pluginBox);
+      if (widgetRect.IsEmpty()) {
+        widgetRect = pluginBox;
+      }
+      if (widgetRect.IsEmpty()) {
+        nearest->Invalidate(nearest->GetBounds());
+      } else {
+        nearest->Invalidate(LayoutDeviceIntRect(widgetRect.x, widgetRect.y,
+                                                widgetRect.width, widgetRect.height));
+      }
+    }
+  }
   return NS_OK;
 }
 
@@ -2528,6 +2597,122 @@ nsEventStatus nsPluginInstanceOwner::ProcessEvent(const WidgetGUIEvent& anEvent)
   mInstance->HandleEvent(&pluginEvent, &response, NS_PLUGIN_CALL_SAFE_TO_REENTER_GECKO);
   if (response == kNPEventHandled)
     rv = nsEventStatus_eConsumeNoDefault;
+#endif
+
+// Guard MUST match the one npapi.h uses to define NPEvent as Palm's union. Any other
+// predicate compiles this against `typedef void* NPEvent` and does not build.
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+  // JIHAD (webOS, cavekit-addons-extensions.md R7) — DELIVER INPUT IN THE PALM PROTOCOL.
+  //
+  // Everything above this point is a platform arm: XP_MACOSX, XP_WIN, MOZ_X11. A
+  // cairo-headless build matches none of them, so this function used to reduce to
+  // `return nsEventStatus_eIgnore;` and a windowless plugin received no mouse, key, focus or
+  // blur event in its whole lifetime. Measured on the TouchPad before this branch existed: a
+  // tap hit-tested the <EMBED>, the daemon logged `mouseSend <EMBED> ... : down`, and the
+  // plugin's NPP_HandleEvent was called exactly once ever — for the child's own gain-focus
+  // injection. Nothing upstream is at fault; the DOM listeners, the hit test, the windowless
+  // guards and the IPC hop are all live and correct (see the Dispatch*ToPlugin callers).
+  //
+  // The event shape is Palm's, because NPEvent on this platform IS Palm's union (npapi.h) and
+  // the device's Flash was compiled against that declaration.
+  {
+    NPEvent pluginEvent;
+    memset(&pluginEvent, 0, sizeof(pluginEvent));
+
+    if (anEvent.mClass == eMouseEventClass) {
+      const WidgetMouseEvent& mouseEvent = *anEvent.AsMouseEvent();
+
+      switch (anEvent.mMessage) {
+        case eMouseDown:   pluginEvent.eventType = npPalmPenDownEvent; break;
+        case eMouseUp:     pluginEvent.eventType = npPalmPenUpEvent;   break;
+        case eMouseMove:   pluginEvent.eventType = npPalmPenMoveEvent; break;
+        // The synthesized click/dblclick that follows a down/up pair. Palm's host sends these
+        // as their own event types rather than swallowing them (libWebKitLuna
+        // handleMouseEvent 0x4e946c-0x4e94d8 maps click -> 65536 and dblclick -> 32768, in
+        // ADDITION to the down/up pair, not instead of it), so this is what a plugin written
+        // for webOS was built to see. The X11 arm above drops them instead, which is right
+        // for X11 and wrong here.
+        //
+        // Flash itself ignores both: its NPP_HandleEvent jump table (libflashplayer.so
+        // 0x4514c-0x4522c) compares only against 1/2/4/8/16/64/128/256/512, and anything
+        // else falls through to "not handled" — confirmed on device, where a tap logs
+        // `palm event 0x10000 ... handled=0` between two handled pen events. Sending them
+        // anyway is deliberate: the contract is the host's, not this one plugin's, and a
+        // plugin that acts only on the click is otherwise silently unusable.
+        case eMouseClick:       pluginEvent.eventType = npPalmPenClickEvent;       break;
+        case eMouseDoubleClick: pluginEvent.eventType = npPalmPenDoubleClickEvent; break;
+        default: break;   // over/out/wheel/aux: no Palm equivalent, drop
+      }
+
+      if (pluginEvent.eventType) {
+        // The plugin-local point, computed exactly as the MOZ_X11 arm above computes it. This
+        // is also what Palm's own host does — PluginView's webOS block uses the renderer's
+        // absoluteToLocal() on the same absolute location — so the two hosts agree on the
+        // space without either being ported to the other.
+        //
+        // Deliberately NO zoom or scroll arithmetic here. The card's fit-zoom is not an engine
+        // zoom (it is applied when the daemon scales the capture context), layout.css.
+        // devPixelsPerPx is pinned to 1.0, and the daemon has already mapped card px to CSS
+        // viewport px before dispatching. Adding a factor here is how plugin input drifts away
+        // from where page content thinks it was clicked; the criterion is that both go through
+        // the same transform, and they do precisely because this arm adds none.
+        const nsPresContext* presContext = mPluginFrame->PresContext();
+        nsPoint appPoint =
+          nsLayoutUtils::GetEventCoordinatesRelativeTo(&anEvent, mPluginFrame) -
+          mPluginFrame->GetContentRectRelativeToSelf().TopLeft();
+        pluginEvent.data.penEvent.xCoord =
+          presContext->AppUnitsToDevPixels(appPoint.x);
+        pluginEvent.data.penEvent.yCoord =
+          presContext->AppUnitsToDevPixels(appPoint.y);
+        pluginEvent.data.penEvent.modifiers =
+          (mouseEvent.IsControl() ? npPalmCtrlKeyModifier  : 0) |
+          (mouseEvent.IsAlt()     ? npPalmAltKeyModifier   : 0) |
+          (mouseEvent.IsShift()   ? npPalmShiftKeyModifier : 0) |
+          (mouseEvent.IsMeta()    ? npPalmMetaKeyModifier  : 0);
+      }
+    } else if (anEvent.mClass == eKeyboardEventClass) {
+      const WidgetKeyboardEvent& keyEvent = *anEvent.AsKeyboardEvent();
+
+      switch (anEvent.mMessage) {
+        case eKeyDown:  pluginEvent.eventType = npPalmKeyDownEvent;  break;
+        case eKeyUp:    pluginEvent.eventType = npPalmKeyUpEvent;    break;
+        case eKeyPress: pluginEvent.eventType = npPalmKeyPressEvent; break;
+        default: break;
+      }
+
+      if (pluginEvent.eventType) {
+        // There is no native key event to copy from on this platform (mPluginEvent is a
+        // Windows concept), so the Palm fields are synthesized from the widget event.
+        // rawkeyCode/rawModifier are Palm's "pass the unprocessed event through" pair, which
+        // for a synthesized event is the same key code and modifier set.
+        int32_t mods =
+          (keyEvent.IsControl() ? npPalmCtrlKeyModifier  : 0) |
+          (keyEvent.IsAlt()     ? npPalmAltKeyModifier   : 0) |
+          (keyEvent.IsShift()   ? npPalmShiftKeyModifier : 0) |
+          (keyEvent.IsMeta()    ? npPalmMetaKeyModifier  : 0);
+        pluginEvent.data.keyEvent.chr =
+          static_cast<int32_t>(keyEvent.PseudoCharCode());
+        pluginEvent.data.keyEvent.modifiers   = mods;
+        pluginEvent.data.keyEvent.rawkeyCode  = static_cast<int32_t>(keyEvent.mKeyCode);
+        pluginEvent.data.keyEvent.rawModifier = mods;
+      }
+    } else if (anEvent.mMessage == eFocus || anEvent.mMessage == eBlur) {
+      // Focus arrives as a bare WidgetGUIEvent with a null widget (see DispatchFocusToPlugin),
+      // so it must not touch the coordinate path above.
+      pluginEvent.eventType = npPalmSystemEvent;
+      pluginEvent.data.systemEvent.type =
+        (anEvent.mMessage == eFocus) ? npPalmGainFocusEvent : npPalmLoseFocusEvent;
+    }
+
+    if (pluginEvent.eventType) {
+      int16_t response = kNPEventNotHandled;
+      mInstance->HandleEvent(&pluginEvent, &response,
+                             NS_PLUGIN_CALL_SAFE_TO_REENTER_GECKO);
+      if (response == kNPEventHandled) {
+        rv = nsEventStatus_eConsumeNoDefault;
+      }
+    }
+  }
 #endif
 
   return rv;

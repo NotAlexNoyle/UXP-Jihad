@@ -1374,7 +1374,7 @@ public:
   static already_AddRefed<ScaledFont>
     CreateScaledFontForNativeFont(const NativeFont &aNativeFont, Float aSize);
 
-#ifdef MOZ_WIDGET_GTK
+#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_HEADLESS)
   static already_AddRefed<ScaledFont>
     CreateScaledFontForFontconfigFont(cairo_scaled_font_t* aScaledFont, FcPattern* aPattern, Float aSize);
 #endif

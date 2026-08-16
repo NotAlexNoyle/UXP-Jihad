@@ -444,6 +444,8 @@ PluginModuleChromeParent::LoadModule(const char* aFilePath, uint32_t aPluginId,
     parent->mSubprocess->SetCallRunnableImmediately(!parent->mIsStartingAsync);
     bool launched = parent->mSubprocess->Launch(Move(onLaunchedRunnable),
                                                 aPluginTag->mSandboxLevel);
+    fprintf(stderr, "[jihad-npapi] LoadModule path=%s async=%d launched=%d\n",
+            aFilePath, (int)parent->mIsStartingAsync, (int)launched);
     if (!launched) {
         // We never reached open
         parent->mShutdown = true;
@@ -455,7 +457,10 @@ PluginModuleChromeParent::LoadModule(const char* aFilePath, uint32_t aPluginId,
     parent->mIsBlocklisted = NS_FAILED(rv) || blocklistState != 0;
     if (!parent->mIsStartingAsync) {
         int32_t launchTimeoutSecs = Preferences::GetInt(kLaunchTimeoutPref, 0);
-        if (!parent->mSubprocess->WaitUntilConnected(launchTimeoutSecs * 1000)) {
+        bool connected = parent->mSubprocess->WaitUntilConnected(launchTimeoutSecs * 1000);
+        fprintf(stderr, "[jihad-npapi] LoadModule WaitUntilConnected(%ds) = %d\n",
+                (int)launchTimeoutSecs, (int)connected);
+        if (!connected) {
             parent->mShutdown = true;
             return nullptr;
         }
@@ -1134,9 +1139,20 @@ PluginModuleChromeParent::OnHangUIContinue()
 }
 #endif // XP_WIN
 
+// Defined with the rest of the Jihad CPU-boost helpers further down this file.
+namespace { void JihadCpuBoostReleaseAll(); }
+
 void
 PluginModuleParent::ActorDestroy(ActorDestroyReason why)
 {
+    // Release the CPU boost here as well as in NPP_Destroy, because on this port NPP_Destroy is
+    // NOT the path a plugin usually leaves by: navigating away from a Flash page ends in the
+    // child's own mozalloc_abort, so the instance never gets an orderly destroy and the boost
+    // would leak — device-observed 2026-08-10, tunables still at 40/50000 after navigation with
+    // no release logged. This runs for every ActorDestroyReason, normal and abnormal, which also
+    // covers a plugin crash.
+    JihadCpuBoostReleaseAll();
+
     switch (why) {
     case AbnormalShutdown: {
         mShutdown = true;
@@ -1271,6 +1287,172 @@ NP_BEGIN_MACRO                                                                 \
     return i->func;                                                            \
 NP_END_MACRO
 
+// ── Jihad: hold a CPU-frequency boost while a plugin instance is alive ──────────────────────
+//
+// WHY. The TouchPad's governor is Palm's `ondemandtcl`, whose stock `up_threshold` is 95 — it
+// only raises the clock when a single core exceeds 95% load. Flash never gets there: measured on
+// device, the daemon runs ~26% and plugin-container ~11% of two cores, so a passively-watched
+// animation sits at the FLOOR. Sampling `scaling_cur_freq` once a second during playback gave
+// 192000-384000 out of a 1188000 maximum, snapping back to 1188000 the moment the page was
+// navigated away. The whole system was only 69% busy, so this was never a capacity wall.
+//
+// Dropping `up_threshold` to 40 and `sampling_rate` to 50000 pins 1188000 and lifts the card
+// composite from 20.4-27.5 fps to 30.7-35.2, daemon paints 24.0-28.7 to 31.4-33.0, and the frame
+// gap MAXIMUM — the number that reads as stutter — from 63-81 ms to 49-56. It also clears the
+// audio xruns, because MP3 decode at 192 MHz underruns.
+//
+// NEVER WRITE `scaling_governor`. Switching away from `ondemandtcl` DEADLOCKS cpufreq in the
+// kernel: every later reader of any cpufreq node blocks in unkillable D state — the daemon,
+// `powerlog`, and the restore path itself — so the boost is never released and only a reboot
+// clears it (and a clean `reboot` will not run, because init waits on those D-state tasks).
+// Governor TUNABLE writes, which is all this does, are safe and return instantly.
+//
+// These are SYSTEM-WIDE tunables, so they are held only while a plugin instance exists and the
+// ORIGINAL values are read back and restored on teardown. The upstart job restores them again
+// from `post-stop`, because a daemon that dies holding the boost would otherwise leave the whole
+// device tuned for battery burn. Both hooks run on the main thread, so the counter needs no lock.
+namespace {
+
+const char kJihadOndemandDir[] = "/sys/devices/system/cpu/cpufreq/ondemandtcl";
+
+// The stock values, used ONLY as the restore fallback when the current value already equals what
+// we are about to write — which happens when another variant's daemon is holding the boost.
+// Saving the boosted value as "original" there would make the last release pin the device.
+const char kJihadStockUpThreshold[]  = "95";
+const char kJihadStockSamplingRate[] = "200000";
+
+// The instances that actually TOOK a boost, not a bare count. NPP_Destroy also runs for instances
+// that failed before the boost was taken, and decrementing a count there would release the boost
+// out from under a plugin that is still playing.
+nsTArray<NPP> gJihadBoostedInstances;
+bool gJihadBoostHeld = false;
+char gJihadSavedUpThreshold[32];
+char gJihadSavedSamplingRate[32];
+
+bool
+JihadReadTunable(const char* aName, char* aOut, size_t aOutLen)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", kJihadOndemandDir, aName);
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char* got = fgets(aOut, aOutLen, f);
+    fclose(f);
+    if (!got) return false;
+    // Trim the trailing newline so a value read back can be compared and rewritten verbatim.
+    size_t n = strlen(aOut);
+    while (n > 0 && (aOut[n - 1] == '\n' || aOut[n - 1] == '\r')) aOut[--n] = '\0';
+    return n > 0;
+}
+
+bool
+JihadWriteTunable(const char* aName, const char* aValue)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", kJihadOndemandDir, aName);
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+    bool ok = fputs(aValue, f) >= 0;
+    ok = (fclose(f) == 0) && ok;
+    return ok;
+}
+
+// Env-tunable for the same reason the repaint divisor is: the right value is a property of the
+// device under load, not of the source, and a rebuild per candidate costs a 44 MB push.
+void
+JihadCpuBoostTargets(const char** aUpThreshold, const char** aSamplingRate)
+{
+    static char sUp[32]   = "40";
+    static char sRate[32] = "50000";
+    static bool sInit = false;
+    if (!sInit) {
+        sInit = true;
+        const char* e = getenv("JIHAD_PLUGIN_CPU_UP_THRESHOLD");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 5 && v <= 95) snprintf(sUp, sizeof(sUp), "%d", v);
+        }
+        e = getenv("JIHAD_PLUGIN_CPU_SAMPLING_RATE");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 10000 && v <= 1000000) snprintf(sRate, sizeof(sRate), "%d", v);
+        }
+    }
+    *aUpThreshold = sUp;
+    *aSamplingRate = sRate;
+}
+
+bool
+JihadCpuBoostEnabled()
+{
+    const char* e = getenv("JIHAD_PLUGIN_CPU_BOOST");
+    return !(e && e[0] == '0' && e[1] == '\0');
+}
+
+void
+JihadCpuBoostAcquire(NPP aInstance)
+{
+    if (!JihadCpuBoostEnabled() || gJihadBoostedInstances.Contains(aInstance)) return;
+    gJihadBoostedInstances.AppendElement(aInstance);
+    if (gJihadBoostedInstances.Length() != 1 || gJihadBoostHeld) return;
+
+    const char* wantUp;
+    const char* wantRate;
+    JihadCpuBoostTargets(&wantUp, &wantRate);
+
+    if (!JihadReadTunable("up_threshold", gJihadSavedUpThreshold,
+                          sizeof(gJihadSavedUpThreshold)) ||
+        !strcmp(gJihadSavedUpThreshold, wantUp)) {
+        strcpy(gJihadSavedUpThreshold, kJihadStockUpThreshold);
+    }
+    if (!JihadReadTunable("sampling_rate", gJihadSavedSamplingRate,
+                          sizeof(gJihadSavedSamplingRate)) ||
+        !strcmp(gJihadSavedSamplingRate, wantRate)) {
+        strcpy(gJihadSavedSamplingRate, kJihadStockSamplingRate);
+    }
+
+    bool ok = JihadWriteTunable("up_threshold", wantUp);
+    ok = JihadWriteTunable("sampling_rate", wantRate) && ok;
+    gJihadBoostHeld = ok;
+    fprintf(stderr, "[jihad-npapi] cpu boost acquire: up_threshold %s->%s sampling_rate %s->%s%s\n",
+            gJihadSavedUpThreshold, wantUp, gJihadSavedSamplingRate, wantRate,
+            ok ? "" : "  FAILED (not root, or no ondemandtcl)");
+    fflush(stderr);
+}
+
+void
+JihadCpuBoostRelease(NPP aInstance)
+{
+    if (!gJihadBoostedInstances.RemoveElement(aInstance)) return;
+    if (!gJihadBoostedInstances.IsEmpty() || !gJihadBoostHeld) return;
+
+    JihadWriteTunable("up_threshold", gJihadSavedUpThreshold);
+    JihadWriteTunable("sampling_rate", gJihadSavedSamplingRate);
+    gJihadBoostHeld = false;
+    fprintf(stderr, "[jihad-npapi] cpu boost release: up_threshold=%s sampling_rate=%s\n",
+            gJihadSavedUpThreshold, gJihadSavedSamplingRate);
+    fflush(stderr);
+}
+
+// Drop every outstanding boost at once. Used when the plugin module itself goes away, which on
+// this port is the NORMAL exit path (see ActorDestroy), not just the crash path.
+void
+JihadCpuBoostReleaseAll()
+{
+    if (gJihadBoostedInstances.IsEmpty()) return;
+    gJihadBoostedInstances.Clear();
+    if (!gJihadBoostHeld) return;
+
+    JihadWriteTunable("up_threshold", gJihadSavedUpThreshold);
+    JihadWriteTunable("sampling_rate", gJihadSavedSamplingRate);
+    gJihadBoostHeld = false;
+    fprintf(stderr, "[jihad-npapi] cpu boost release (module gone): up_threshold=%s sampling_rate=%s\n",
+            gJihadSavedUpThreshold, gJihadSavedSamplingRate);
+    fflush(stderr);
+}
+
+} // anonymous namespace
+
 NPError
 PluginModuleParent::NPP_Destroy(NPP instance,
                                 NPSavedData** saved)
@@ -1296,6 +1478,7 @@ PluginModuleParent::NPP_Destroy(NPP instance,
     instance->pdata = nullptr;
 
     Unused << PluginInstanceParent::Call__delete__(parentInstance);
+    JihadCpuBoostRelease(instance);
     return retval;
 }
 
@@ -2291,6 +2474,12 @@ PluginModuleParent::NPP_NewInternal(NPMIMEType pluginType, NPP instance,
     }
 
     UpdatePluginTimeout();
+
+    // Taken ONLY here, on the single success path, and released in NPP_Destroy. Every failure
+    // return above this point either deletes |parentInstance| itself or hands it to NPP_Destroy,
+    // and a boost acquired on one of those paths would never be released — which on this device
+    // means leaving the WHOLE system tuned for battery burn with nothing owning it.
+    JihadCpuBoostAcquire(instance);
 
     return NS_OK;
 }

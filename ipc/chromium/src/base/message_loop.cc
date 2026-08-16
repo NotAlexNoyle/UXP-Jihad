@@ -146,7 +146,13 @@ MessageLoop::MessageLoop(Type type, nsIThread* aThread)
 #if defined(OS_MACOSX)
     pump_ = base::MessagePumpMac::Create();
 #elif defined(OS_LINUX) || defined(OS_BSD) || defined(OS_SOLARIS)
+#if defined(MOZ_WIDGET_GTK)
     pump_ = new base::MessagePumpForUI();
+#else
+    // Jihad headless: no GTK UI pump; the embedder drives events via
+    // NS_ProcessNextEvent, so a default (non-UI) message pump suffices.
+    pump_ = new base::MessagePumpDefault();
+#endif
 #endif  // OS_LINUX
   } else if (type_ == TYPE_IO) {
     pump_ = new base::MessagePumpLibevent();

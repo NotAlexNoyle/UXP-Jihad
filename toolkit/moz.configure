@@ -48,7 +48,7 @@ set_config('L10NBASEDIR', l10n_base)
 # reason.
 option('--enable-default-toolkit', nargs=1,
        choices=('cairo-windows', 'cairo-gtk2', 'cairo-gtk2-x11', 'cairo-gtk3',
-                'cairo-cocoa', 'cairo-uikit'),
+                'cairo-cocoa', 'cairo-uikit', 'cairo-headless'),
        help='Select default toolkit')
 
 @depends('--enable-default-toolkit', target, '--help')
@@ -63,7 +63,8 @@ def toolkit(value, target, _):
     elif target.os == 'iOS':
         platform_choices = ('cairo-uikit',)
     else:
-        platform_choices = ('cairo-gtk3', 'cairo-gtk2', 'cairo-gtk2-x11')
+        platform_choices = ('cairo-gtk3', 'cairo-gtk2', 'cairo-gtk2-x11',
+                            'cairo-headless')
 
     if value:
         if value[0] not in platform_choices:
@@ -160,7 +161,9 @@ set_define(gl_provider_define, True)
 # ==============================================================
 @depends(toolkit)
 def pdf_printing(toolkit):
-    if toolkit in ('windows', 'gtk2', 'gtk3'):
+    # 'headless' included: the cairo PDF surface is X/GTK-free and the headless
+    # gfx build uses PrintTargetPDF, so CAIRO_HAS_PDF_SURFACE must be defined.
+    if toolkit in ('windows', 'gtk2', 'gtk3', 'headless'):
         return True
 
 @depends(pdf_printing)

@@ -531,7 +531,20 @@ BackgroundHangMonitor::BackgroundHangMonitor(const char* aName,
   : mThread(aThreadType == THREAD_SHARED ? BackgroundHangThread::FindThread() : nullptr)
 {
 #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
-  if (!BackgroundHangManager::sDisabled && !mThread) {
+  // sInstance is null in a process that never initialized XPCOM — Startup() is called from
+  // NS_InitXPCOM2/NS_InitMinimalXPCOM and from nowhere else, and XRE_InitChildProcess calls
+  // neither. sDisabled does NOT cover that case: it is only set by Shutdown(), so in a
+  // never-started process it is false while sInstance is null, and BackgroundHangThread's
+  // constructor dereferences the manager immediately (mInterval(mManager->mIntervalNow)) for
+  // an instant null crash. FindThread() already makes exactly this check; the named
+  // constructor is missing it.
+  //
+  // Reachable here because MessagePumpDefault::Run constructs one of these unconditionally,
+  // and the plugin child uses a TYPE_UI loop, which on a non-GTK build is a MessagePumpDefault
+  // rather than the glib pump upstream would get. Result: the NPAPI child died with SIGSEGV
+  // the instant it entered its message loop, before answering NP_Initialize.
+  if (!BackgroundHangManager::sDisabled && !mThread &&
+      BackgroundHangManager::sInstance) {
     mThread = new BackgroundHangThread(aName, aTimeoutMs, aMaxTimeoutMs,
                                        aThreadType);
   }

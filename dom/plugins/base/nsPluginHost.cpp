@@ -843,6 +843,9 @@ nsPluginHost::InstantiatePluginInstance(const nsACString& aMimeType, nsIURI* aUR
   }
 
   rv = SetUpPluginInstance(aMimeType, aURL, instanceOwner);
+  // JIHAD DIAGNOSTIC (R7): the real rv is flattened to NS_ERROR_FAILURE below, which is what
+  // made this failure opaque from the caller's side.
+  fprintf(stderr, "[jihad-npapi] SetUpPluginInstance rv=0x%x\n", (unsigned)rv);
   if (NS_FAILED(rv)) {
     instanceOwner->Destroy();
     return NS_ERROR_FAILURE;
@@ -961,7 +964,12 @@ nsPluginHost::TrySetUpPluginInstance(const nsACString &aMimeType,
 #endif
 
   RefPtr<nsNPAPIPlugin> plugin;
-  GetPlugin(aMimeType, getter_AddRefs(plugin));
+  nsresult jihadGetRv = GetPlugin(aMimeType, getter_AddRefs(plugin));
+  // JIHAD DIAGNOSTIC (R7): GetPlugin -> CreateNPAPIPlugin -> nsNPAPIPlugin::CreatePlugin, which
+  // for an OOP build is PluginModuleParent::LoadModule (the plugin-container launch). Its rv is
+  // DISCARDED here; only the null check survives, so a launch failure is invisible.
+  fprintf(stderr, "[jihad-npapi] GetPlugin rv=0x%x plugin=%d\n",
+          (unsigned)jihadGetRv, (int)!!plugin);
   if (!plugin) {
     return NS_ERROR_FAILURE;
   }
@@ -987,6 +995,7 @@ nsPluginHost::TrySetUpPluginInstance(const nsACString &aMimeType,
   // except in some cases not Java, see bug 140931
   // our COM pointer will free the peer
   nsresult rv = instance->Initialize(plugin.get(), aOwner, aMimeType);
+  fprintf(stderr, "[jihad-npapi] instance->Initialize rv=0x%x\n", (unsigned)rv);
   if (NS_FAILED(rv)) {
     mInstances.RemoveElement(instance.get());
     aOwner->SetInstance(nullptr);
@@ -4200,4 +4209,63 @@ PluginDestructionGuard::DelayDestroy(nsNPAPIPluginInstance *aInstance)
   }
 
   return false;
+}
+
+// ── JIHAD (webOS, cavekit-addons-extensions.md R7) ────────────────────────────────────────
+//
+// A C entry point for the render daemon, following the jihad_offscreen_* precedent in
+// widget/PuppetWidget.cpp: the daemon links against libxul but cannot see internal classes,
+// and nsNPAPIPluginInstance::HandleEvent is neither exported nor virtual, so there is no
+// other way to reach a plugin from outside.
+//
+// This exists for the frozen YAP command pair asyncCmdPluginSpotlightStart/End. The card
+// scrims and smart-zooms to a plugin, then tells the server the rect it settled on; the
+// server's job is to pass that on to the plugin as Palm's npPalmSpotlightStartEvent(11) /
+// npPalmSpotlightEndEvent(12). It is not cosmetic: Flash routes 11 to the same handler as
+// npPalmSetFullScreenEvent(6) and 12 to the same as npPalmUnsetFullScreenEvent(7)
+// (libflashplayer.so jump table at 0x44e0c — entries 10 and 11 target 0x44fa0/0x44e80,
+// identical to entries 5 and 6), so this is how a plugin is told it went fullscreen.
+//
+// Broadcast to every running instance rather than targeting one: the spotlight is a
+// page-level, one-plugin-at-a-time state, this daemon serves a single card, and the
+// alternative — matching the rect against each instance's frame — would invent a
+// disambiguation rule that the contract does not define. Returns how many instances were
+// told, so a caller can tell "no plugin" from "delivered".
+extern "C" MOZ_EXPORT int
+jihad_plugin_palm_spotlight(int aOn, int aLeft, int aTop, int aRight, int aBottom)
+{
+#ifdef MOZ_ENABLE_NPAPI
+  RefPtr<nsPluginHost> host = nsPluginHost::GetInst();
+  if (!host) {
+    return 0;
+  }
+
+  NPEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.eventType = npPalmSystemEvent;
+  ev.data.systemEvent.type = aOn ? npPalmSpotlightStartEvent : npPalmSpotlightEndEvent;
+  // Palm's host leaves systemEvent.value uninitialised here and fills only the rect
+  // (libWebKitLuna handlePluginSpotlightStart 0x4e6cec-0x4e6d24, which never writes [sp+8]).
+  // The memset above zeroes it, which is strictly tidier and observably the same.
+  ev.data.systemEvent.viewLeft   = aLeft;
+  ev.data.systemEvent.viewTop    = aTop;
+  ev.data.systemEvent.viewRight  = aRight;
+  ev.data.systemEvent.viewBottom = aBottom;
+
+  int delivered = 0;
+  // Copy the instance list first: HandleEvent re-enters the plugin, which may run script and
+  // tear an instance down underneath us.
+  nsTArray<RefPtr<nsNPAPIPluginInstance>> instances(host->JihadRunningInstances());
+  for (uint32_t i = 0; i < instances.Length(); ++i) {
+    int16_t response = kNPEventNotHandled;
+    if (NS_SUCCEEDED(instances[i]->HandleEvent(&ev, &response,
+                                               NS_PLUGIN_CALL_SAFE_TO_REENTER_GECKO))) {
+      delivered++;
+    }
+  }
+  return delivered;
+#else
+  (void)aOn; (void)aLeft; (void)aTop; (void)aRight; (void)aBottom;
+  return 0;
+#endif
 }

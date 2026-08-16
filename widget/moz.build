@@ -56,6 +56,10 @@ if 'gtk' in CONFIG['MOZ_WIDGET_TOOLKIT']:
             CONFIG['MOZ_ENABLE_NPAPI_GTK2']):
         DIRS += ['gtkxtbin']
 
+# Jihad: X/GTK-free headless widget backend (PuppetWidget-based).
+if toolkit == 'headless':
+    DIRS += ['headless']
+
 XPIDL_SOURCES += [
     'nsIAppShell.idl',
     'nsIBaseWindow.idl',
@@ -229,7 +233,7 @@ if toolkit in ('cocoa', 'windows'):
         'nsBaseClipboard.cpp',
     ]
 
-if toolkit in {'gtk2', 'gtk3', 'cocoa', 'windows'}:
+if toolkit in {'gtk2', 'gtk3', 'cocoa', 'windows', 'headless'}:
     UNIFIED_SOURCES += [
         'nsBaseFilePicker.cpp',
         'nsNativeTheme.cpp',

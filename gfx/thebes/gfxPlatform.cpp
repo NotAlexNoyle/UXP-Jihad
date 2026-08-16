@@ -40,6 +40,8 @@
 #elif defined(XP_MACOSX)
 #include "gfxPlatformMac.h"
 #include "gfxQuartzSurface.h"
+#elif defined(MOZ_WIDGET_HEADLESS)
+#include "gfxPlatformHeadless.h"
 #elif defined(MOZ_WIDGET_GTK)
 #include "gfxPlatformGtk.h"
 #elif defined(ANDROID)
@@ -572,6 +574,8 @@ gfxPlatform::Init()
     gPlatform = new gfxWindowsPlatform;
 #elif defined(XP_MACOSX)
     gPlatform = new gfxPlatformMac;
+#elif defined(MOZ_WIDGET_HEADLESS)
+    gPlatform = new gfxPlatformHeadless;
 #elif defined(MOZ_WIDGET_GTK)
     gPlatform = new gfxPlatformGtk;
 #elif defined(ANDROID)
@@ -2166,6 +2170,13 @@ gfxPlatform::UsesOffMainThreadCompositing()
     result |= gfxPrefs::LayersAccelerationForceEnabledDoNotUseDirectly();
 
 #endif
+    // Jihad Browser: the headless BrowserServer embedder has no compositor
+    // process; allow forcing off-main-thread compositing off (use the in-process
+    // BasicLayerManager) via env, since the gfxPrefs "Once" snapshot can miss a
+    // grepref set during XRE_InitEmbedding2 init ordering.
+    if (getenv("JIHAD_DISABLE_OMTC")) {
+      result = false;
+    }
     firstTime = false;
   }
 

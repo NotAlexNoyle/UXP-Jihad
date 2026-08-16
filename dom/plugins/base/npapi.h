@@ -577,6 +577,166 @@ typedef struct _NPEvent
 } NPEvent;
 #elif defined(XP_UNIX) && defined(MOZ_X11)
 typedef XEvent NPEvent;
+#elif defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+/*
+ * JIHAD (webOS, cavekit-addons-extensions.md R7) — THE PALM EVENT PROTOCOL.
+ *
+ * webOS plugins do not speak X11. Palm's own npapi.h defines NPEvent, under XP_WEBOS, as the
+ * union below; the device's Adobe Flash was compiled against exactly that header and its
+ * NPP_HandleEvent reads these fields. Reproduced here from the webOS WebKit fork's
+ * WebCore/plugins/npapi.h (the XP_WEBOS block, NpPalmEventsEnum through the NPEvent union),
+ * so that the shape crossing our NPAPI boundary is the shape the plugin was built to read.
+ *
+ * This replaces `typedef void* NPEvent` for the headless toolkit, and that arm was not merely
+ * a placeholder — it was load-bearing in the wrong direction. NPRemoteEvent is a raw memcpy of
+ * sizeof(NPEvent) (dom/plugins/ipc/NPEventUnix.h), so with a void* NPEvent the parent shipped
+ * four bytes of its own address space to the child and the child handed the plugin a pointer
+ * into a foreign process. No event could ever have carried a payload. Making NPEvent a real
+ * POD is what lets the whole existing NPP_HandleEvent path work unmodified, parent to child.
+ *
+ * Gated on MOZ_WIDGET_HEADLESS because that is precisely the configuration this port builds
+ * (--enable-default-toolkit=cairo-headless, no X anywhere in the bundle) and the only one that
+ * reaches this arm. A non-webOS headless embedding would get these structs too; that is
+ * harmless, since the alternative it loses is an NPEvent that could not carry an event.
+ *
+ * POINTER-BEARING MEMBERS DO NOT SURVIVE IPC. dstBuffer/graphicsContext (draw),
+ * touches (touch) and reserved (system) are process-local. Pen, key and system events use
+ * none of them; the draw event is built inside the child (PluginInstanceChild.cpp) and never
+ * crosses the boundary, which is why it stays valid.
+ *
+ * One deliberate omission from Palm's union: NpPalmAccelerometerEvent. It is 16 bytes against
+ * NpPalmDrawEvent's 44, so leaving it out changes sizeof(NPEvent) by nothing — and the union
+ * is only ever read through the plugin's OWN copy of this declaration, so an unused member
+ * here is unobservable. It is left out rather than copied because it carries a struct-scoped
+ * `enum Orientation` whose tag would leak to file scope, for no gain.
+ */
+typedef enum NpPalmEventsEnum
+{
+  npPalmPenDownEvent        = 1 << 0,
+  npPalmPenUpEvent          = 1 << 1,
+  npPalmPenMoveEvent        = 1 << 2,
+  npPalmKeyDownEvent        = 1 << 3,
+  npPalmKeyUpEvent          = 1 << 4,
+  npPalmKeyRepeatEvent      = 1 << 5,
+  npPalmKeyPressEvent       = 1 << 6,
+  npPalmDrawEvent           = 1 << 7,
+  npPalmSystemEvent         = 1 << 8,
+  npPalmGestureEvent        = 1 << 9,
+  npPalmAccelerometerEvent  = 1 << 10,
+  npPalmTouchStartEvent     = 1 << 11,
+  npPalmTouchMoveEvent      = 1 << 12,
+  npPalmTouchEndEvent       = 1 << 13,
+  npPalmTouchCancelledEvent = 1 << 14,
+  npPalmPenDoubleClickEvent = 1 << 15,
+  npPalmPenClickEvent       = 1 << 16
+} NpPalmEventsEnum;
+
+typedef enum NpPalmSystemEventsEnum
+{
+  npPalmPauseEvent            = 1,
+  npPalmResumeEvent           = 2,
+  npPalmGainFocusEvent        = 3,
+  npPalmLoseFocusEvent        = 4,
+  npPalmDimmedEvent           = 5,
+  npPalmSetFullScreenEvent    = 6,
+  npPalmUnsetFullScreenEvent  = 7,
+  npPalmPageLoadingEvent      = 8,
+  npPalmPageLoadCompleteEvent = 9,
+  npPalmViewPortChangedEvent  = 10,
+  npPalmSpotlightStartEvent   = 11,
+  npPalmSpotlightEndEvent     = 12
+} NpPalmSystemEventsEnum;
+
+typedef enum NpPalmKeyModifiersEnum
+{
+  npPalmCtrlKeyModifier  = 1 << 0,
+  npPalmAltKeyModifier   = 1 << 1,
+  npPalmShiftKeyModifier = 1 << 2,
+  npPalmMetaKeyModifier  = 1 << 3
+} NpPalmKeyModifiersEnum;
+
+typedef struct NpPalmKeyEvent
+{
+  int32_t chr;         /* 32-bit so any Unicode character fits */
+  int32_t modifiers;
+  int32_t rawkeyCode;
+  int32_t rawModifier;
+} NpPalmKeyEvent;
+
+typedef struct NpPalmPenEvent
+{
+  int32_t xCoord, yCoord;   /* plugin-local, in the plugin's own unscaled pixels */
+  int32_t modifiers;
+} NpPalmPenEvent;
+
+typedef struct NpPalmTouchPoint
+{
+  int32_t xCoord, yCoord;
+} NpPalmTouchPoint;
+
+typedef struct NpPalmTouchEvent
+{
+  int32_t           touchCount;
+  NpPalmTouchPoint* touches;   /* process-local — never send over IPC */
+  int32_t           modifiers;
+} NpPalmTouchEvent;
+
+typedef struct NpPalmDrawEvent
+{
+  void*    dstBuffer;        /* process-local; API 1.0 raster destination */
+  uint32_t dstRowBytes;
+  int32_t  srcLeft;
+  int32_t  srcRight;
+  int32_t  srcTop;
+  int32_t  srcBottom;
+  void*    graphicsContext;  /* process-local; the Piranha PGContext, API 2.0 */
+  int32_t  dstLeft;
+  int32_t  dstRight;
+  int32_t  dstTop;
+  int32_t  dstBottom;
+} NpPalmDrawEvent;
+
+typedef struct NpPalmSystemEvent
+{
+  NpPalmSystemEventsEnum type;
+  int32_t  value;
+  int32_t  viewLeft;
+  int32_t  viewRight;
+  int32_t  viewTop;
+  int32_t  viewBottom;
+  void*    reserved;         /* process-local */
+} NpPalmSystemEvent;
+
+typedef enum NpPalmGestureEventEnum
+{
+  npPalmGestureStartEvent     = 1,
+  npPalmGestureChangeEvent    = 2,
+  npPalmGestureEndEvent       = 3,
+  npPalmGestureSingleTapEvent = 4
+} NpPalmGestureEventEnum;
+
+typedef struct NpPalmGestureEvent
+{
+  NpPalmGestureEventEnum type;
+  int32_t x, y;
+  float   scale, rotate;
+  int32_t center_x, center_y;
+  int32_t modifiers;
+} NpPalmGestureEvent;
+
+typedef struct NPEvent
+{
+  NpPalmEventsEnum eventType;
+
+  union {
+    NpPalmKeyEvent     keyEvent;
+    NpPalmPenEvent     penEvent;
+    NpPalmDrawEvent    drawEvent;
+    NpPalmSystemEvent  systemEvent;
+    NpPalmGestureEvent gestureEvent;
+    NpPalmTouchEvent   touchEvent;
+  } data;
+} NPEvent;
 #else
 typedef void*  NPEvent;
 #endif

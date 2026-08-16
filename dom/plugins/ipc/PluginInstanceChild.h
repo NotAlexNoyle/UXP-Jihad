@@ -141,6 +141,10 @@ protected:
     virtual bool
     RecvContentsScaleFactorChanged(const double& aContentsScaleFactor) override;
 
+    // Jihad: the host is driving the frame clock — draw one now. See PPluginInstance.ipdl.
+    virtual bool
+    RecvJihadRequestFrame() override;
+
     virtual bool
     AnswerNPP_Destroy(NPError* result) override;
 
@@ -640,6 +644,22 @@ private:
     // and does not remember their transparent state
     // and p->getvalue return always false
     bool mIsTransparent;
+
+    // Jihad R7 (webOS): npPalmGainFocusEvent is a once-per-instance startup signal, but the
+    // setwindow that carries it runs again on every resize and scroll.
+    bool mJihadSentPalmGainFocus;
+
+    // Jihad R7 (webOS): cap on the input-delivery breadcrumb in AnswerNPP_HandleEvent. A
+    // pen-move stream is unbounded; the daemon log is the only field-debug channel there is.
+    uint32_t mJihadInputEventsLogged;
+
+public:
+    // Jihad R7 (webOS): repaint this instance from the host's own clock. See
+    // JihadGlibPumpTask::Run — a webOS plugin is not obliged to ask for repaints, because the
+    // host it was written for painted it as part of every page paint.
+    void JihadPalmRepaintTick();
+
+private:
 
     // Surface type optimized of parent process
     gfxSurfaceType mSurfaceType;

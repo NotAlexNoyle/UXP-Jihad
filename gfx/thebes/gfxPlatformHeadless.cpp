@@ -6,7 +6,7 @@
 #define PANGO_ENABLE_BACKEND
 #define PANGO_ENABLE_ENGINE
 
-#include "gfxPlatformGtk.h"
+#include "gfxPlatformHeadless.h"
 #include "prenv.h"
 
 #include "nsUnicharUtils.h"
@@ -31,14 +31,14 @@
 #include "mozilla/gfx/2D.h"
 
 #include "cairo.h"
-#include <gtk/gtk.h>
+
 
 #include "gfxImageSurface.h"
+#include "mozilla/Preferences.h"
 #ifdef MOZ_X11
-#include <gdk/gdkx.h>
+
 #include "gfxXlibSurface.h"
 #include "cairo-xlib.h"
-#include "mozilla/Preferences.h"
 #include "mozilla/X11Util.h"
 
 #ifdef GL_PROVIDER_GLX
@@ -70,7 +70,7 @@ using namespace mozilla::unicode;
 static cairo_user_data_key_t cairo_gdk_drawable_key;
 #endif
 
-gfxPlatformGtk::gfxPlatformGtk()
+gfxPlatformHeadless::gfxPlatformHeadless()
 {
     // Jihad: in JIHAD_OFFSCREEN (headless daemon) mode there is no X server on the
     // device. gtk_init() calls exit() if it cannot open a display; gtk_init_check()
@@ -78,11 +78,7 @@ gfxPlatformGtk::gfxPlatformGtk()
     // freetype font list, image/CPU surfaces via the BasicLayerManager). The X code
     // below is already guarded by GDK_IS_X11_DISPLAY(gdk_display_get_default()),
     // which is false with no display, so it is skipped cleanly.
-    if (getenv("JIHAD_OFFSCREEN")) {
-        gtk_init_check(nullptr, nullptr);
-    } else {
-        gtk_init(nullptr, nullptr);
-    }
+    /* headless: no gtk_init */
 
     mMaxGenericSubstitutions = UNINITIALIZED_VALUE;
 
@@ -115,7 +111,7 @@ gfxPlatformGtk::gfxPlatformGtk()
 #endif // MOZ_X11
 }
 
-gfxPlatformGtk::~gfxPlatformGtk()
+gfxPlatformHeadless::~gfxPlatformHeadless()
 {
 #ifdef MOZ_X11
     if (mCompositorDisplay) {
@@ -125,15 +121,17 @@ gfxPlatformGtk::~gfxPlatformGtk()
 }
 
 void
-gfxPlatformGtk::FlushContentDrawing()
+gfxPlatformHeadless::FlushContentDrawing()
 {
+#ifdef MOZ_X11
     if (gfxVars::UseXRender()) {
         XFlush(DefaultXDisplay());
     }
+#endif
 }
 
 already_AddRefed<gfxASurface>
-gfxPlatformGtk::CreateOffscreenSurface(const IntSize& aSize,
+gfxPlatformHeadless::CreateOffscreenSurface(const IntSize& aSize,
                                        gfxImageFormat aFormat)
 {
     if (!Factory::AllowedSurfaceSize(aSize)) {
@@ -187,7 +185,7 @@ gfxPlatformGtk::CreateOffscreenSurface(const IntSize& aSize,
 }
 
 nsresult
-gfxPlatformGtk::GetFontList(nsIAtom *aLangGroup,
+gfxPlatformHeadless::GetFontList(nsIAtom *aLangGroup,
                             const nsACString& aGenericFamily,
                             nsTArray<nsString>& aListOfFonts)
 {
@@ -198,7 +196,7 @@ gfxPlatformGtk::GetFontList(nsIAtom *aLangGroup,
 }
 
 nsresult
-gfxPlatformGtk::UpdateFontList()
+gfxPlatformHeadless::UpdateFontList()
 {
     gfxPlatformFontList::PlatformFontList()->UpdateFontList();
     return NS_OK;
@@ -217,7 +215,7 @@ static const char kFontWenQuanYiMicroHei[] = "WenQuanYi Micro Hei";
 static const char kFontNanumGothic[] = "NanumGothic";
 
 void
-gfxPlatformGtk::GetCommonFallbackFonts(uint32_t aCh, uint32_t aNextCh,
+gfxPlatformHeadless::GetCommonFallbackFonts(uint32_t aCh, uint32_t aNextCh,
                                        Script aRunScript,
                                        nsTArray<const char*>& aFontList)
 {
@@ -250,7 +248,7 @@ gfxPlatformGtk::GetCommonFallbackFonts(uint32_t aCh, uint32_t aNextCh,
 }
 
 gfxPlatformFontList*
-gfxPlatformGtk::CreatePlatformFontList()
+gfxPlatformHeadless::CreatePlatformFontList()
 {
     gfxPlatformFontList* list = new gfxFcPlatformFontList();
     if (NS_SUCCEEDED(list->InitFontList())) {
@@ -261,7 +259,7 @@ gfxPlatformGtk::CreatePlatformFontList()
 }
 
 nsresult
-gfxPlatformGtk::GetStandardFamilyName(const nsAString& aFontName, nsAString& aFamilyName)
+gfxPlatformHeadless::GetStandardFamilyName(const nsAString& aFontName, nsAString& aFamilyName)
 {
     gfxPlatformFontList::PlatformFontList()->
         GetStandardFamilyName(aFontName, aFamilyName);
@@ -269,7 +267,7 @@ gfxPlatformGtk::GetStandardFamilyName(const nsAString& aFontName, nsAString& aFa
 }
 
 gfxFontGroup *
-gfxPlatformGtk::CreateFontGroup(const FontFamilyList& aFontFamilyList,
+gfxPlatformHeadless::CreateFontGroup(const FontFamilyList& aFontFamilyList,
                                 const gfxFontStyle* aStyle,
                                 gfxTextPerfMetrics* aTextPerf,
                                 gfxUserFontSet* aUserFontSet,
@@ -280,7 +278,7 @@ gfxPlatformGtk::CreateFontGroup(const FontFamilyList& aFontFamilyList,
 }
 
 gfxFontEntry*
-gfxPlatformGtk::LookupLocalFont(const nsAString& aFontName,
+gfxPlatformHeadless::LookupLocalFont(const nsAString& aFontName,
                                 uint16_t aWeight,
                                 int16_t aStretch,
                                 uint8_t aStyle)
@@ -291,7 +289,7 @@ gfxPlatformGtk::LookupLocalFont(const nsAString& aFontName,
 }
 
 gfxFontEntry*
-gfxPlatformGtk::MakePlatformFont(const nsAString& aFontName,
+gfxPlatformHeadless::MakePlatformFont(const nsAString& aFontName,
                                  uint16_t aWeight,
                                  int16_t aStretch,
                                  uint8_t aStyle,
@@ -304,7 +302,7 @@ gfxPlatformGtk::MakePlatformFont(const nsAString& aFontName,
 }
 
 bool
-gfxPlatformGtk::IsFontFormatSupported(nsIURI *aFontURI, uint32_t aFormatFlags)
+gfxPlatformHeadless::IsFontFormatSupported(nsIURI *aFontURI, uint32_t aFormatFlags)
 {
     // check for strange format flags
     NS_ASSERTION(!(aFormatFlags & gfxUserFontSet::FLAG_FORMAT_NOT_USED),
@@ -330,16 +328,12 @@ gfxPlatformGtk::IsFontFormatSupported(nsIURI *aFontURI, uint32_t aFormatFlags)
 static int32_t sDPI = 0;
 
 int32_t
-gfxPlatformGtk::GetDPI()
+gfxPlatformHeadless::GetDPI()
 {
     if (!sDPI) {
         // Make sure init is run so we have a resolution
-        GdkScreen *screen = gdk_screen_get_default();
-        if (screen) {                       // null when headless (no X display)
-            gtk_settings_get_for_screen(screen);
-            sDPI = int32_t(round(gdk_screen_get_resolution(screen)));
-        }
-        if (sDPI <= 0) {
+        sDPI = 96;
+if (sDPI <= 0) {
             // Fall back to something sane
             sDPI = 96;
         }
@@ -348,7 +342,7 @@ gfxPlatformGtk::GetDPI()
 }
 
 double
-gfxPlatformGtk::GetDPIScale()
+gfxPlatformHeadless::GetDPIScale()
 {
     // Integer scale factors work well with GTK window scaling, image scaling,
     // and pixel alignment, but there is a range where 1 is too small and 2 is
@@ -366,25 +360,22 @@ gfxPlatformGtk::GetDPIScale()
 }
 
 bool
-gfxPlatformGtk::UseImageOffscreenSurfaces()
+gfxPlatformHeadless::UseImageOffscreenSurfaces()
 {
     return GetDefaultContentBackend() != mozilla::gfx::BackendType::CAIRO ||
            gfxPrefs::UseImageOffscreenSurfaces();
 }
 
 gfxImageFormat
-gfxPlatformGtk::GetOffscreenFormat()
+gfxPlatformHeadless::GetOffscreenFormat()
 {
     // Make sure there is a screen
-    GdkScreen *screen = gdk_screen_get_default();
-    if (screen && gdk_visual_get_depth(gdk_visual_get_system()) == 16) {
-        return SurfaceFormat::R5G6B5_UINT16;
-    }
+    
 
     return SurfaceFormat::X8R8G8B8_UINT32;
 }
 
-void gfxPlatformGtk::FontsPrefsChanged(const char *aPref)
+void gfxPlatformHeadless::FontsPrefsChanged(const char *aPref)
 {
     // only checking for generic substitions, pass other changes up
     if (strcmp(GFX_PREF_MAX_GENERIC_SUBSTITUTIONS, aPref)) {
@@ -398,7 +389,7 @@ void gfxPlatformGtk::FontsPrefsChanged(const char *aPref)
     FlushFontAndWordCaches();
 }
 
-uint32_t gfxPlatformGtk::MaxGenericSubstitions()
+uint32_t gfxPlatformHeadless::MaxGenericSubstitions()
 {
     if (mMaxGenericSubstitutions == UNINITIALIZED_VALUE) {
         mMaxGenericSubstitutions =
@@ -412,7 +403,7 @@ uint32_t gfxPlatformGtk::MaxGenericSubstitions()
 }
 
 void
-gfxPlatformGtk::GetPlatformCMSOutputProfile(void *&mem, size_t &size)
+gfxPlatformHeadless::GetPlatformCMSOutputProfile(void *&mem, size_t &size)
 {
     mem = nullptr;
     size = 0;
@@ -543,7 +534,7 @@ gfxPlatformGtk::GetPlatformCMSOutputProfile(void *&mem, size_t &size)
 
 #if (MOZ_WIDGET_GTK == 2)
 void
-gfxPlatformGtk::SetGdkDrawable(cairo_surface_t *target,
+gfxPlatformHeadless::SetGdkDrawable(cairo_surface_t *target,
                                GdkDrawable *drawable)
 {
     if (cairo_surface_status(target))
@@ -558,7 +549,7 @@ gfxPlatformGtk::SetGdkDrawable(cairo_surface_t *target,
 }
 
 GdkDrawable *
-gfxPlatformGtk::GetGdkDrawable(cairo_surface_t *target)
+gfxPlatformHeadless::GetGdkDrawable(cairo_surface_t *target)
 {
     if (cairo_surface_status(target))
         return nullptr;
@@ -811,7 +802,7 @@ private:
 };
 
 already_AddRefed<gfx::VsyncSource>
-gfxPlatformGtk::CreateHardwareVsyncSource()
+gfxPlatformHeadless::CreateHardwareVsyncSource()
 {
   // Only use GLX vsync when the OpenGL compositor is being used.
   // The extra cost of initializing a GLX context while blocking the main
@@ -831,11 +822,13 @@ gfxPlatformGtk::CreateHardwareVsyncSource()
   return gfxPlatform::CreateHardwareVsyncSource();
 }
 
+#endif
+
+// Not GLX-specific: must be defined regardless of GL_PROVIDER_GLX so the
+// vtable slot resolves in a headless (no X/GLX) build.
 bool
-gfxPlatformGtk::SupportsApzTouchInput() const
+gfxPlatformHeadless::SupportsApzTouchInput() const
 {
   int value = gfxPrefs::TouchEventsEnabled();
   return value == 1 || value == 2;
 }
-
-#endif

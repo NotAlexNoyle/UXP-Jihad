@@ -3629,8 +3629,8 @@ XREMain::XRE_mainRun()
           // reset the profile.
           // For Basilisk and Pale Moon:
           // Hard-code MOZ_APP_NAME to firefox because of hard-coded type in migrator.
-          aKey = (((MOZ_APP_NAME == "basilisk")
-                     || (MOZ_APP_NAME == "palemoon"))
+          aKey = (((MOZ_APP_NAME == "n/a")
+                     || (MOZ_APP_NAME == "n/a"))
                   ? "firefox" : MOZ_APP_NAME);
 
         }

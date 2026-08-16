@@ -2187,6 +2187,12 @@ gtk2)
     USE_FC_FREETYPE=1
     ;;
 
+headless)
+    dnl Jihad: X/GTK-free headless toolkit. Fonts via fontconfig/freetype
+    dnl (no X); the widget backend is widget/headless (PuppetWidget-based).
+    USE_FC_FREETYPE=1
+    ;;
+
 cocoa)
     LDFLAGS="$LDFLAGS -framework Cocoa -lobjc"
     # Use -Wl as a trick to avoid -framework and framework names from
@@ -4433,6 +4439,14 @@ if test "$MOZ_TREE_CAIRO"; then
         MOZ_ENABLE_CAIRO_FT=1
         CAIRO_FT_CFLAGS="$FT2_CFLAGS"
         AC_SUBST_LIST(CAIRO_FT_CFLAGS)
+        dnl Jihad headless: no toolkit pkg-config supplies the freetype include
+        dnl path (gtk normally carries it in TK_CFLAGS via its gtk cflags).
+        dnl Inject it so gfx/thebes and other cairo-ft consumers find
+        dnl <ft2build.h> and the fontconfig headers.
+        if test "$MOZ_WIDGET_TOOLKIT" = "headless"; then
+            TK_CFLAGS="$TK_CFLAGS $FT2_CFLAGS"
+            TK_LIBS="$TK_LIBS $FT2_LIBS"
+        fi
     fi
 
     case "$MOZ_WIDGET_TOOLKIT" in
