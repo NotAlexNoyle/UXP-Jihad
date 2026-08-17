@@ -40,6 +40,9 @@
   X(pa_operation_get_state)                     \
   X(pa_operation_unref)                         \
   X(pa_proplist_gets)                           \
+  X(pa_proplist_new)                            \
+  X(pa_proplist_sets)                           \
+  X(pa_proplist_free)                           \
   X(pa_rtclock_now)                             \
   X(pa_stream_begin_write)                      \
   X(pa_stream_cancel_write)                     \
@@ -53,6 +56,7 @@
   X(pa_stream_get_state)                        \
   X(pa_stream_get_time)                         \
   X(pa_stream_new)                              \
+  X(pa_stream_new_with_proplist)                \
   X(pa_stream_set_state_callback)               \
   X(pa_stream_set_write_callback)               \
   X(pa_stream_unref)                            \
@@ -114,7 +118,19 @@ struct cubeb_stream {
   int shutdown;
   float volume;
   cubeb_state state;
+  int jihad_active;   /* Jihad: counted in jihad_pulse_active_count while this stream is playing */
 };
+
+/* Jihad/webOS: number of currently-PLAYING (uncorked) output streams. The daemon
+   (render/goanna/BrowserPageGoanna) polls jihad_pulse_active_streams() and, on 0<->N transitions,
+   runs $JIHAD_STATE_DIR/audio-{on,off}.sh to hold the audiod media scenario + force the speaker
+   mixer, so engine media audio respects the system volume and can reach the built-in speaker (the
+   media.role set below gets the stream onto the media policy path in the first place). Weak-linked
+   from the daemon; on desktop nothing reads it and it is inert. */
+static int jihad_pulse_active_count = 0;
+/* visibility("default"): libxul is built -fvisibility=hidden, so export it explicitly (same as the
+   MOZ_EXPORT on jihad_plugin_frame_seq) or the daemon's weak extern resolves to null. */
+__attribute__((visibility("default"))) int jihad_pulse_active_streams(void) { return jihad_pulse_active_count; }
 
 static const float PULSE_NO_GAIN = -1.0;
 
@@ -680,7 +696,41 @@ create_pa_stream(cubeb_stream * stm,
   ss.rate = stream_params->rate;
   ss.channels = stream_params->channels;
 
-  *pa_stm = WRAP(pa_stream_new)(stm->context->context, stream_name, &ss, NULL);
+  /* Jihad/webOS: module-palm-policy powers the hardware codec route (and the built-in speaker)
+     only for a stream it CLASSIFIES as media, via a pa_proplist property our stream otherwise
+     lacks (see impl-audio-backend.md). The exact property/value is not yet pinned, so read
+     "key=value" lines from a WRITABLE file, $JIHAD_STATE_DIR/pulse.props, and set each on the
+     stream proplist — this lets the routing property be tuned on-device without a libxul rebuild.
+     With no file present, default to media.role=music. On desktop JIHAD_STATE_DIR is unset, no
+     file is read, and the default is a harmless standard PulseAudio role. */
+  pa_proplist * pl = WRAP(pa_proplist_new)();
+  int have_props = 0;
+  char const * sd = getenv("JIHAD_STATE_DIR");
+  if (sd && *sd) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pulse.props", sd);
+    FILE * pf = fopen(path, "r");
+    if (pf) {
+      char line[256];
+      while (fgets(line, sizeof(line), pf)) {
+        char * nl = strchr(line, '\n'); if (nl) { *nl = '\0'; }
+        if (line[0] == '\0' || line[0] == '#') { continue; }
+        char * eq = strchr(line, '=');
+        if (eq) { *eq = '\0'; WRAP(pa_proplist_sets)(pl, line, eq + 1); have_props = 1; }
+      }
+      fclose(pf);
+    }
+  }
+  if (!have_props) {
+    /* Default: classify as media so the stream takes the webOS media-policy path (the pmedia
+       virtual sink) instead of sitting anonymously on pcm_output at a fixed 100%. That classification
+       is what lets the daemon's audio-on.sh hold the audiod media scenario (system-volume-respecting)
+       and force the speaker route on top. See impl-audio-backend.md. Override/disable via the props
+       file. */
+    WRAP(pa_proplist_sets)(pl, "media.role", "music");
+  }
+  *pa_stm = WRAP(pa_stream_new_with_proplist)(stm->context->context, stream_name, &ss, NULL, pl);
+  WRAP(pa_proplist_free)(pl);
   return (*pa_stm == NULL) ? CUBEB_ERROR : CUBEB_OK;
 }
 
@@ -829,6 +879,7 @@ static void
 pulse_stream_destroy(cubeb_stream * stm)
 {
   stream_cork(stm, CORK);
+  if (stm->jihad_active) { stm->jihad_active = 0; if (jihad_pulse_active_count > 0) jihad_pulse_active_count--; }
 
   WRAP(pa_threaded_mainloop_lock)(stm->context->mainloop);
   if (stm->output_stream) {
@@ -872,6 +923,7 @@ pulse_stream_start(cubeb_stream * stm)
 {
   stm->shutdown = 0;
   stream_cork(stm, UNCORK | NOTIFY);
+  if (stm->output_stream && !stm->jihad_active) { stm->jihad_active = 1; jihad_pulse_active_count++; }
 
   if (stm->output_stream && !stm->input_stream) {
     /* On output only case need to manually call user cb once in order to make
@@ -898,6 +950,7 @@ pulse_stream_stop(cubeb_stream * stm)
   WRAP(pa_threaded_mainloop_unlock)(stm->context->mainloop);
 
   stream_cork(stm, CORK | NOTIFY);
+  if (stm->jihad_active) { stm->jihad_active = 0; if (jihad_pulse_active_count > 0) jihad_pulse_active_count--; }
   return CUBEB_OK;
 }
 
