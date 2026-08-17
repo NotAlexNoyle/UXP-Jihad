@@ -337,7 +337,14 @@
 
                     // Explicitly hide the status fader if this
                     // is audio only until bug 619421 is fixed.
-                    if (this.isAudioOnly)
+                    // Jihad: upstream suppressed the overlay for audio-only content (no video box
+                    // to draw a throbber over), but it also hid the ERROR state — so an <audio>
+                    // whose format cannot be decoded (MP3/AAC have no decoder in this build; the
+                    // element ends err=4 MEDIA_ERR_SRC_NOT_SUPPORTED) rendered a live-looking
+                    // control bar with no failure shown: the forbidden "works-looking but silent"
+                    // shape (cavekit-gre-widgets.md R1). Keep the throbber/loading suppression, but
+                    // let a real, non-suppressed media error still surface for audio-only too.
+                    if (this.isAudioOnly && !(this.video.error && !this.suppressError))
                         show = false;
 
                     this.log("Status overlay: seeking=" + this.video.seeking +
