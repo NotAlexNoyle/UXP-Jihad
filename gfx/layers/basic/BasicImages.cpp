@@ -87,10 +87,17 @@ public:
 bool
 BasicPlanarYCbCrImage::CopyData(const Data& aData)
 {
-  RecyclingPlanarYCbCrImage::CopyData(aData);
-
-  if (mDelayedConversion) {
+  if (!RecyclingPlanarYCbCrImage::CopyData(aData)) {
     return false;
+  }
+
+  // The YCbCr copy above succeeded; delaying the RGB conversion is not a
+  // failure. GetAsSourceSurface() converts on demand when mDecodedBuffer is
+  // null. Returning false here made VideoData::CreateAndCopyData report OOM
+  // (MEDIA_ERR_DECODE) for any frame decoded while BasicImageLayer::Paint had
+  // swapped this factory into the video's ImageContainer.
+  if (mDelayedConversion) {
+    return true;
   }
 
   // Do some sanity checks to prevent integer overflow
