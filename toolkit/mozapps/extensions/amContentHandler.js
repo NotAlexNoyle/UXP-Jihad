@@ -60,7 +60,7 @@ amContentHandler.prototype = {
       // When running in the main process this might be a frame inside an
       // in-content UI page, walk up to find the first frame element in a chrome
       // privileged document
-      let element = window.frameElement;
+      let element = window ? window.frameElement : null;
       let ssm = Services.scriptSecurityManager;
       while (element && !ssm.isSystemPrincipal(element.ownerDocument.nodePrincipal))
         element = element.ownerDocument.defaultView.frameElement;
@@ -77,13 +77,21 @@ amContentHandler.prototype = {
       }
     }
 
-    // Fall back to sending through the message manager
-    let messageManager = window.QueryInterface(Ci.nsIInterfaceRequestor)
-                               .getInterface(Ci.nsIDocShell)
-                               .QueryInterface(Ci.nsIInterfaceRequestor)
-                               .getInterface(Ci.nsIContentFrameMessageManager);
-
-    messageManager.sendAsyncMessage(MSG_INSTALL_ADDONS, installs);
+    // JIHAD: this embedding is a single top-level content docShell with no browser chrome
+    // above it — no chrome-privileged frameElement to find above, and no
+    // nsIContentFrameMessageManager below — so both upstream paths fail, and the failure was
+    // silent: the load had already been cancelled above, so following a plain link to an
+    // .xpi (or typing its address) did nothing at all, with no prompt and no error
+    // (device, 2026-10-01). InstallTrigger.install() was fixed the same way in
+    // amInstallTrigger.js; this is the other door into the same room. Call the integration
+    // service directly — the object the parent process reaches when it handles
+    // MSG_INSTALL_ADDONS; only the transport is skipped, because there is no second process.
+    let integration = Cc["@mozilla.org/addons/integration;1"]
+                        .getService(Ci.nsIMessageListener).wrappedJSObject;
+    integration.installAddonsFromWebpage(installs.mimetype, null,
+                                         installs.triggeringPrincipal, installs.uris,
+                                         installs.hashes, installs.names, installs.icons,
+                                         null);
   },
 
   classID: Components.ID("{7beb3ba8-6ec3-41b4-b67c-da89b8518922}"),
