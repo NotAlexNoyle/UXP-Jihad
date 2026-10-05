@@ -3162,23 +3162,40 @@ NS_IMETHODIMP nsPluginInstanceOwner::CreateWidget(void)
     if (!mWidget) {
       // native (single process)
       mWidget = do_CreateInstance(kWidgetCID, &rv);
-      nsWidgetInitData initData;
-      initData.mWindowType = eWindowType_plugin;
-      initData.mUnicode = false;
-      initData.clipChildren = true;
-      initData.clipSiblings = true;
-      rv = mWidget->Create(parentWidget.get(), nullptr,
-                           LayoutDeviceIntRect(0, 0, 0, 0), &initData);
-      if (NS_FAILED(rv)) {
-        mWidget->Destroy();
-        mWidget = nullptr;
-        return rv;
+      if (!mWidget) {
+        // JIHAD (2026-10-05): A BUILD WITH NO CHILD-WINDOW WIDGET HAS NO WINDOWED PLUGINS.
+        // The offscreen embedding registers no widget for kWidgetCID, so this came back
+        // null and the Create() call below dereferenced it: the daemon died with SIGSEGV on
+        // every page whose Flash movie was embedded the ordinary way. A plugin is windowed
+        // unless it asks otherwise, and Flash asks only for wmode=opaque/transparent — the
+        // default, wmode=window, is what most of the web uses (found on two "Flash test"
+        // sites; every test page of ours had wmode=opaque). webOS's own browser never had
+        // plugin windows either and handed every plugin a drawable; its Flash build draws
+        // through the Palm window structure in both modes. So do the same: with no window
+        // to give, the instance is windowless.
+        mInstance->SetWindowless(true);
+        windowless = true;
+      } else {
+        nsWidgetInitData initData;
+        initData.mWindowType = eWindowType_plugin;
+        initData.mUnicode = false;
+        initData.clipChildren = true;
+        initData.clipSiblings = true;
+        rv = mWidget->Create(parentWidget.get(), nullptr,
+                             LayoutDeviceIntRect(0, 0, 0, 0), &initData);
+        if (NS_FAILED(rv)) {
+          mWidget->Destroy();
+          mWidget = nullptr;
+          return rv;
+        }
       }
     }
 
-    mWidget->EnableDragDrop(true);
-    mWidget->Show(false);
-    mWidget->Enable(false);
+    if (mWidget) {
+      mWidget->EnableDragDrop(true);
+      mWidget->Show(false);
+      mWidget->Enable(false);
+    }
   }
 
   if (mPluginFrame) {
