@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <stdlib.h>   // getenv / unsetenv (JIHAD: see main)
 #include "nsXPCOM.h"
 #include "nsXULAppAPI.h"
 #include "nsAutoPtr.h"
@@ -141,6 +142,18 @@ content_process_main(int argc, char* argv[])
       fprintf(stderr, "[jihad-npapi-child]   argv[%d]=%s\n", i, argv[i]);
     }
     fflush(stderr);
+
+    // JIHAD (2026-10-05): DO NOT HAND OUR LIBRARY PATH TO WHAT THE PLUGIN RUNS.
+    // This process is started through the bundled loader with an explicit --library-path,
+    // which is what its own later dlopen()s search; the LD_LIBRARY_PATH it also inherits
+    // is not needed by it. But it is inherited again by anything the plugin spawns, and
+    // Flash for Linux runs `sh -c "ps x | grep netscape"` at start-up: the device's own
+    // /bin/sh (built for its glibc 2.8) then loads the bundled glibc 2.23 and dies with
+    // SIGSEGV, leaving a crash report in /var/log/reports for every page with Flash on it.
+    // Only when the bundled loader is in use; a desktop build keeps its environment.
+    if (getenv("MOZ_CHILD_PROCESS_LOADER")) {
+      unsetenv("LD_LIBRARY_PATH");
+    }
 
 #ifdef MOZ_GMP
     XREChildData childData;
