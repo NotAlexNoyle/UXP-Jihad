@@ -6432,14 +6432,40 @@ AddonInternal.prototype = {
     // Only do this for extensions. Other types should not be allowed.
     if (this.type == "extension") {
       for (let targetApp of this.targetApplications) {
-        if (targetApp.id == APPCOMPATID) // AppCompat GUID
+        if (targetApp.id == APPCOMPATID) { // AppCompat GUID
+          // An add-on may name BOTH the AppCompat GUID and the toolkit: the GUID entry
+          // written for the application that owns that GUID, at that application's
+          // versions, and the toolkit entry for "any other application on this platform".
+          // Taking the GUID entry regardless disabled exactly the add-ons that had gone
+          // to the trouble of declaring generic platform support (one whose GUID entry
+          // says 52.9.*, against an AppCompat version of 56.9). Where the GUID entry does
+          // not fit this application's AppCompat version and a toolkit entry was given,
+          // the toolkit entry is the one that describes us.
+          if (app && !this._fitsAppCompat(targetApp))
+            break;
           return targetApp;
+        }
       }
     }
 #endif
     // Return toolkit ID if toolkit.
     return app;
   },
+
+#ifdef UXP_APPCOMPAT_GUID
+  // Whether aTargetApp (an AppCompat GUID entry) admits this application's AppCompat
+  // version, by the same rule isCompatibleWith applies: both bounds under strict
+  // compatibility, the lower bound alone otherwise.
+  _fitsAppCompat: function AddonInternal_fitsAppCompat(aTargetApp) {
+    let strict = !(this.type in COMPATIBLE_BY_DEFAULT_TYPES) ||
+                 AddonManager.strictCompatibility || this.strictCompatibility ||
+                 this.hasBinaryComponents;
+    if (Services.vc.compare(APPCOMPATVERSION, aTargetApp.minVersion) < 0)
+      return false;
+    return !strict || Services.vc.compare(APPCOMPATVERSION, aTargetApp.maxVersion) <= 0;
+  },
+#endif
+
 
   get blocklistState() {
     let staticItem = findMatchingStaticBlocklistItem(this);
