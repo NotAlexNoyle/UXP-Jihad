@@ -93,14 +93,30 @@ RemoteMediator.prototype = {
       }
     }
 
-    // Fall back to sending through the message manager
-    let messageManager = window.QueryInterface(Ci.nsIInterfaceRequestor)
-                               .getInterface(Ci.nsIWebNavigation)
-                               .QueryInterface(Ci.nsIDocShell)
-                               .QueryInterface(Ci.nsIInterfaceRequestor)
-                               .getInterface(Ci.nsIContentFrameMessageManager);
-
-    return messageManager.sendSyncMessage(MSG_INSTALL_ADDONS, installs)[0];
+    // JIHAD (browser-services R3): this embedding is a single top-level content docShell
+    // with NO browser chrome above it — there is no chrome-privileged frameElement to find
+    // above, and no nsIContentFrameMessageManager below, so BOTH upstream paths fail and
+    // InstallTrigger.install() threw NS_ERROR_UNEXPECTED at the getInterface below for every
+    // web install (measured 2026-08-03). Call the integration service directly: it is the same
+    // object, and the same method, that the parent process reaches when it handles the
+    // MSG_INSTALL_ADDONS message — only the transport is skipped, because there is no second
+    // process to send it to.
+    let integration = Cc["@mozilla.org/addons/integration;1"]
+                        .getService(Ci.nsIMessageListener).wrappedJSObject;
+    let jihadCallback = null;
+    if (callbackID != -1) {
+      jihadCallback = {
+        onInstallEnded: (url, status) => {
+          try {
+            let cb = this._callbacks.get(callbackID);
+            if (cb) cb.callCallback(url, status);
+          } catch (e) {}
+        },
+      };
+    }
+    return integration.installAddonsFromWebpage(installs.mimetype, null, principal,
+                                                installs.uris, installs.hashes, installs.names,
+                                                installs.icons, jihadCallback);
   },
 
   _addCallback: function(callback, urls) {
