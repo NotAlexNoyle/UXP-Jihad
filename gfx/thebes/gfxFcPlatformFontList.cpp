@@ -32,6 +32,9 @@
 #include <gdk/gdk.h>
 #include "gfxPlatformGtk.h"
 #endif
+#ifdef MOZ_WIDGET_HEADLESS
+#include "gfxPlatformHeadless.h"
+#endif
 
 #ifdef MOZ_X11
 #include "mozilla/X11Util.h"
@@ -1764,7 +1767,11 @@ gfxFcPlatformFontList::FindGenericFamilies(const nsAString& aGeneric,
 
     // -- select the fonts to be used for the generic
     prefFonts = new PrefFontList; // can be empty but in practice won't happen
+#ifdef MOZ_WIDGET_HEADLESS
+    uint32_t limit = gfxPlatformHeadless::GetPlatform()->MaxGenericSubstitions();
+#else
     uint32_t limit = gfxPlatformGtk::GetPlatform()->MaxGenericSubstitions();
+#endif
     bool foundFontWithLang = false;
     for (int i = 0; i < faces->nfont; i++) {
         FcPattern* font = faces->fonts[i];

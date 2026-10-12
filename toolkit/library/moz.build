@@ -212,6 +212,10 @@ OS_LIBS += CONFIG['ICONV_LIBS']
 if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('cocoa', 'uikit'):
     OS_LIBS += CONFIG['TK_LIBS']
 
+if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'headless':
+    # Jihad headless: TK_LIBS carries freetype/fontconfig (no gtk/X libs).
+    OS_LIBS += CONFIG['TK_LIBS']
+
 if CONFIG['MOZ_SNDIO']:
     OS_LIBS += [
         'sndio',
