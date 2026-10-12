@@ -269,6 +269,8 @@ PluginInstanceParent::AnswerNPN_GetValue_NPNVnetscapeWindow(NativeWindowHandle* 
     XID id;
 #elif defined(XP_DARWIN)
     intptr_t id;
+#elif defined(MOZ_WIDGET_HEADLESS)
+    intptr_t id; // Jihad headless: no native window id
 #else
 #warning Implement me
 #endif

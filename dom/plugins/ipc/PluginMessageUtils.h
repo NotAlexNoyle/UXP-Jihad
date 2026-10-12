@@ -117,6 +117,8 @@ typedef HWND NativeWindowHandle;
 typedef XID NativeWindowHandle;
 #elif defined(XP_DARWIN)
 typedef intptr_t NativeWindowHandle; // never actually used, will always be 0
+#elif defined(MOZ_WIDGET_HEADLESS)
+typedef intptr_t NativeWindowHandle; // Jihad headless: no native window handle
 #else
 #error Need NativeWindowHandle for this platform
 #endif
