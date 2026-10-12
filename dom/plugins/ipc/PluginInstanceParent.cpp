@@ -1006,14 +1006,75 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                    updatedRect.bottom - updatedRect.top);
         surface->MarkDirty(ur);
 
-        bool isPlugin = true;
-        RefPtr<gfx::SourceSurface> sourceSurface =
-            gfxPlatform::GetPlatform()->GetSourceSurfaceForSurface(nullptr, surface, isPlugin);
-        RefPtr<SourceSurfaceImage> image = new SourceSurfaceImage(surface->GetSize(), sourceSurface);
+        // JIHAD (2026-08-09): route the legacy windowless show through the SAME
+        // representation the direct-bitmap path uses, for the SAME reasons.
+        //
+        // Background: the webOS npPalmDrawEvent path (PaintRectToPlatformSurface) makes Flash
+        // blit its stage into mCurrentSurface — measured full-magenta in the child — and ships
+        // it here via SendShow. The control plugin's pixels reach the screen through
+        // RecvShowDirectBitmap; Flash's did not, although both feed the one mImageContainer the
+        // BasicLayerManager reads. Two concrete differences made the legacy path invisible:
+        //   1. It WRAPPED the shmem (GetSourceSurfaceForSurface(nullptr,…)) instead of copying.
+        //      The child double-buffers and SwapSurfaces() immediately after SendShow returns,
+        //      so a wrapped front buffer is the very buffer the child repaints next — the image
+        //      the layer later samples is racing the child. RecvShowDirectBitmap copies for
+        //      exactly this reason ("the plugin owns that buffer and may draw the next frame
+        //      into it as soon as this call returns").
+        //   2. It stamped no frameID. SetCurrentImage() on the working path assigns a monotonic
+        //      ++mFrameID; the ImageContainer/ImageLayer treats a repeated frameID as "no new
+        //      frame". A fixed 0 can be coalesced away.
+        // Copying into a fresh DataSourceSurface and stamping a monotonic frameID makes this
+        // path identical in substance to the one already proven to composite here.
+        IntSize ssize = surface->GetSize();
+        RefPtr<Image> image;
+        RefPtr<gfxImageSurface> imgSurf = surface->GetAsImageSurface();
+        if (imgSurf) {
+            // Always present the copy as B8G8R8A8, and force the alpha channel opaque when the
+            // source carries no alpha (RGB24 / B8G8R8X8). This is Bug 1196927 in this file's own
+            // words (see PluginInstanceChild::PaintRectToSurface): Cairo/Skia leave the X byte of
+            // a BGRX surface zeroed, and a BasicImageLayer then composites those pixels multiplied
+            // by alpha 0 — i.e. fully transparent. That is exactly why Flash's magenta stage
+            // arrived here (RecvShow logged px0=0xffff00ff) yet BasicImageLayer::Paint drew
+            // nothing visible, while the control plugin — which ships B8G8R8A8 — composited fine
+            // through the identical layer path. webOS windowless plugins are opaque
+            // (wmode=opaque forces the windowless instance in the first place), so forcing alpha
+            // opaque is correct here.
+            const SurfaceFormat srcFmt = surface->GetSurfaceFormat();
+            const bool srcHasAlpha =
+                srcFmt != SurfaceFormat::B8G8R8X8 &&
+                srcFmt != SurfaceFormat::R8G8B8X8;
+            RefPtr<gfx::DataSourceSurface> copy =
+                gfx::Factory::CreateDataSourceSurface(ssize, SurfaceFormat::B8G8R8A8);
+            if (copy) {
+                gfx::DataSourceSurface::ScopedMap dstMap(copy, gfx::DataSourceSurface::WRITE);
+                if (dstMap.IsMapped()) {
+                    const int32_t rowBytes = ssize.width * 4;
+                    for (int32_t y = 0; y < ssize.height; y++) {
+                        uint8_t* dstRow = dstMap.GetData() + (ptrdiff_t)y * dstMap.GetStride();
+                        memcpy(dstRow, imgSurf->Data() + (ptrdiff_t)y * imgSurf->Stride(),
+                               rowBytes);
+                        if (!srcHasAlpha) {
+                            for (int32_t x = 0; x < ssize.width; x++) {
+                                dstRow[x * 4 + 3] = 0xff;  // BGRA: byte 3 is alpha
+                            }
+                        }
+                    }
+                    image = new SourceSurfaceImage(ssize, copy);
+                }
+            }
+        }
+        if (!image) {
+            // Fallback to the original wrap if the copy path could not be taken.
+            bool isPlugin = true;
+            RefPtr<gfx::SourceSurface> sourceSurface =
+                gfxPlatform::GetPlatform()->GetSourceSurfaceForSurface(nullptr, surface, isPlugin);
+            image = new SourceSurfaceImage(ssize, sourceSurface);
+        }
 
+        ImageContainer::NonOwningImage holder(image);
+        holder.mFrameID = ++mFrameID;
         AutoTArray<ImageContainer::NonOwningImage,1> imageList;
-        imageList.AppendElement(
-            ImageContainer::NonOwningImage(image));
+        imageList.AppendElement(holder);
 
         ImageContainer *container = GetImageContainer();
         container->SetCurrentImages(imageList);
