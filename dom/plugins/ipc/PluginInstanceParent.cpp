@@ -911,6 +911,23 @@ PluginInstanceParent::RecvShowDirectDXGISurface(const WindowsHandle& handle,
 }
 #endif // MOZ_ENABLE_NPAPI
 
+// Jihad: monotonic count of plugin frames that have reached the parent. Process-wide rather
+// than per-instance, matching how the daemon consumes it — the embedding is single-page and the
+// question it answers is "has ANY plugin produced a new frame since I last published". A plain
+// uint32_t incremented and read on the same (main) thread; the daemon reads it from the same
+// thread inside its tick, so no atomics are needed and none are used elsewhere in this bridge.
+static uint32_t gJihadPluginFrameSeq = 0;
+
+extern "C" {
+// Weak-linked from the daemon (render/goanna/GoannaRenderPage.cpp), the same way
+// jihad_offscreen_take_dirty is: an older libxul simply does not export it, and the daemon then
+// falls back to its dirty-flag behaviour instead of failing to load.
+MOZ_EXPORT uint32_t jihad_plugin_frame_seq(void)
+{
+    return gJihadPluginFrameSeq;
+}
+}
+
 bool
 PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                                const SurfaceDescriptor& newSurface,
@@ -1105,6 +1122,17 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     }
 
     mFrontSurface = surface;
+    // Jihad: count DELIVERED plugin frames so the embedder can tell a new one from a repeat.
+    // The daemon's only frame signal is PuppetWidget's sticky dirty boolean, which carries no
+    // identity: the refresh driver and ordinary page damage set the same flag, so "there is
+    // damage" cannot answer "did the plugin draw again". Measured 2026-08-10 on a 30 fps SWF,
+    // that ambiguity is what made both available policies wrong — publishing on every dirty
+    // tick sent ~78 card frames for ~60 plugin frames (duplicates, and 22-44 deferred because
+    // the adapter could not drain them), while pacing on a fixed 33 ms grid sent ~57 for ~68
+    // (dropped frames, so the animation stepped two positions at once). The stock webOS host
+    // never had to choose: it pulls the plugin synchronously inside the page paint, so it is
+    // 1:1 by construction. This counter is what lets the daemon be 1:1 too.
+    ++gJihadPluginFrameSeq;
     RecvNPN_InvalidateRect(updatedRect);
 
     PLUGIN_LOG_DEBUG(("   (RecvShow invalidated for surface %p)",
