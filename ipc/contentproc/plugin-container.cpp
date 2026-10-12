@@ -7,6 +7,11 @@
 #include "nsXULAppAPI.h"
 #include "nsAutoPtr.h"
 
+// JihadPmLogSem.c — C, and deliberately carries no header, so it drops unchanged into both
+// this build and the daemon's. Declared here rather than in one because that is the entire
+// interface: one call whose only job is to keep the archive member in the link.
+extern "C" int jihad_pmlog_sem_installed(void);
+
 #ifdef XP_WIN
 #include <windows.h>
 // we want a wmain entry point
@@ -117,6 +122,16 @@ content_process_main(int argc, char* argv[])
 #if defined(OS_POSIX) || defined(XP_UNIX)
     jihad_install_child_fault_handler();
 #endif
+
+    // JIHAD (R7): force JihadPmLogSem.o into the link and say so. It interposes sem_open for
+    // the single name "PmLogLib", without which dlopening the device's Flash deadlocks this
+    // process forever — libPmLogLib's constructor waits on a named semaphore created by
+    // webOS's glibc 2.8, whose sem_t value word our glibc 2.23 reads as "no tokens, waiters
+    // pending". The call is also the only cheap proof the interposer survived the link: it
+    // lives in a static archive, and an archive member with no undefined symbol to satisfy
+    // is silently dropped. See render/goanna/JihadPmLogSem.c.
+    fprintf(stderr, "[jihad-npapi-child] pmlog sem interposition=%d\n",
+            jihad_pmlog_sem_installed());
 
     // JIHAD DIAGNOSTIC (R7): the child's own view of its argv. Doubles as the control that
     // child stderr reaches the parent's log at all — every other child probe is worthless

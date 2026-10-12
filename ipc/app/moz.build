@@ -6,6 +6,14 @@
 GeckoProgram(CONFIG['MOZ_CHILD_PROCESS_NAME'], linkage='dependent')
 
 SOURCES += [
+    # JihadPmLogSem.c interposes sem_open/sem_close for the ONE name "PmLogLib". The device's
+    # Flash pulls in libPmLogLib.so, whose constructor sem_wait()s a named semaphore created
+    # by webOS's glibc 2.8; glibc 2.21 changed sem_t's value word to (tokens << 1), so our
+    # bundled 2.23 reads that semaphore as "no tokens, waiters pending" and the dlopen never
+    # returns. It has to be in THIS directory: a dlopened plugin resolves its PLT against the
+    # global scope, which the program image heads, and ipc/app is where the program is linked
+    # (ipc/contentproc only produces an archive this link does not use).
+    '../contentproc/JihadPmLogSem.c',
     'MozillaRuntimeMain.cpp',
 ]
 
