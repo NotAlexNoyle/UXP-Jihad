@@ -771,6 +771,51 @@ PluginInstanceParent::RecvShowDirectBitmap(Shmem&& buffer,
         return false;
     }
 
+    // NO COMPOSITOR PROCESS: composite the plugin's bitmap directly.
+    //
+    // Everything below this point routes the plugin's pixels through a TextureClient to a
+    // compositor, and that requires ImageBridgeChild — which only exists with off-main-thread
+    // composition. This embedder deliberately runs OMTC off (the offscreen renderer uses the
+    // in-process BasicLayerManager and hands finished frames to the browser adapter itself),
+    // so ImageBridgeChild::GetSingleton() is null and TextureClientRecycleAllocator is built
+    // around a null KnowsCompositor. The first plugin paint then dereferenced it and took the
+    // whole daemon down with it — upstream never sees this because the DXGI path a few
+    // hundred lines up checks the forwarder and the direct-bitmap path does not.
+    //
+    // A BasicLayerManager does not need a TextureClient at all: it draws an ImageLayer from
+    // the image's own SourceSurface. So wrap the pixels in a plain SourceSurfaceImage and
+    // hand that to the container.
+    //
+    // The pixels are COPIED, not wrapped. `source` above wraps the shmem the plugin drew
+    // into, and the plugin owns that buffer and may draw the next frame into it as soon as
+    // this call returns; the texture path's UpdateFromSurface copies for the same reason.
+    if (!ImageBridgeChild::GetSingleton()) {
+        RefPtr<gfx::DataSourceSurface> copy =
+            gfx::Factory::CreateDataSourceSurface(size, format);
+        if (!copy) {
+            NS_WARNING("Could not allocate a surface for plugin bitmap!");
+            return false;
+        }
+        {
+            gfx::DataSourceSurface::ScopedMap srcMap(source, gfx::DataSourceSurface::READ);
+            gfx::DataSourceSurface::ScopedMap dstMap(copy, gfx::DataSourceSurface::WRITE);
+            if (!srcMap.IsMapped() || !dstMap.IsMapped()) {
+                return false;
+            }
+            const int32_t bpp = BytesPerPixel(format);
+            const int32_t rowBytes = size.width * bpp;
+            for (int32_t y = 0; y < size.height; y++) {
+                memcpy(dstMap.GetData() + (ptrdiff_t)y * dstMap.GetStride(),
+                       srcMap.GetData() + (ptrdiff_t)y * srcMap.GetStride(),
+                       rowBytes);
+            }
+        }
+
+        RefPtr<SourceSurfaceImage> image = new SourceSurfaceImage(size, copy);
+        SetCurrentImage(image);
+        return true;
+    }
+
     // Allocate a texture for the compositor.
     RefPtr<TextureClientRecycleAllocator> allocator = mParent->EnsureTextureAllocatorForDirectBitmap();
     RefPtr<TextureClient> texture = allocator->CreateOrRecycle(
@@ -1303,7 +1348,11 @@ PluginInstanceParent::GetImageContainer()
     return mImageContainer;
   }
 
-  if (IsUsingDirectDrawing()) {
+  if (IsUsingDirectDrawing() && ImageBridgeChild::GetSingleton()) {
+      // ASYNCHRONOUS means "shared with the compositor through ImageBridge". Without an
+      // ImageBridge the async container silently gets no image client and never publishes
+      // anything, so with OMTC off this has to be an ordinary local container — which is
+      // what the BasicLayerManager reads from. See RecvShowDirectBitmap.
       mImageContainer = LayerManager::CreateImageContainer(ImageContainer::ASYNCHRONOUS);
   } else {
       mImageContainer = LayerManager::CreateImageContainer();
