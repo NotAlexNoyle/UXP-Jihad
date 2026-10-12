@@ -843,6 +843,9 @@ nsPluginHost::InstantiatePluginInstance(const nsACString& aMimeType, nsIURI* aUR
   }
 
   rv = SetUpPluginInstance(aMimeType, aURL, instanceOwner);
+  // JIHAD DIAGNOSTIC (R7): the real rv is flattened to NS_ERROR_FAILURE below, which is what
+  // made this failure opaque from the caller's side.
+  fprintf(stderr, "[jihad-npapi] SetUpPluginInstance rv=0x%x\n", (unsigned)rv);
   if (NS_FAILED(rv)) {
     instanceOwner->Destroy();
     return NS_ERROR_FAILURE;
@@ -961,7 +964,12 @@ nsPluginHost::TrySetUpPluginInstance(const nsACString &aMimeType,
 #endif
 
   RefPtr<nsNPAPIPlugin> plugin;
-  GetPlugin(aMimeType, getter_AddRefs(plugin));
+  nsresult jihadGetRv = GetPlugin(aMimeType, getter_AddRefs(plugin));
+  // JIHAD DIAGNOSTIC (R7): GetPlugin -> CreateNPAPIPlugin -> nsNPAPIPlugin::CreatePlugin, which
+  // for an OOP build is PluginModuleParent::LoadModule (the plugin-container launch). Its rv is
+  // DISCARDED here; only the null check survives, so a launch failure is invisible.
+  fprintf(stderr, "[jihad-npapi] GetPlugin rv=0x%x plugin=%d\n",
+          (unsigned)jihadGetRv, (int)!!plugin);
   if (!plugin) {
     return NS_ERROR_FAILURE;
   }
@@ -987,6 +995,7 @@ nsPluginHost::TrySetUpPluginInstance(const nsACString &aMimeType,
   // except in some cases not Java, see bug 140931
   // our COM pointer will free the peer
   nsresult rv = instance->Initialize(plugin.get(), aOwner, aMimeType);
+  fprintf(stderr, "[jihad-npapi] instance->Initialize rv=0x%x\n", (unsigned)rv);
   if (NS_FAILED(rv)) {
     mInstances.RemoveElement(instance.get());
     aOwner->SetInstance(nullptr);

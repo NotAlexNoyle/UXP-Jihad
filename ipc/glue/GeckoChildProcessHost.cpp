@@ -160,6 +160,13 @@ GeckoChildProcessHost::GetPathToBinary(FilePath& exePath, GeckoProcessType proce
 
   exePath = exePath.AppendASCII(MOZ_CHILD_PROCESS_NAME);
 
+  // JIHAD DIAGNOSTIC (R7): the resolved child path, and which branch produced it. In this
+  // embedding the daemon is exec'd as `./ld-2.23.so … ./jihad-browserserver`, so argv[0] is the
+  // LOADER — if the directory-service branch is not taken, the fallback dirname(argv[0]) is
+  // relative to that, not to the daemon.
+  fprintf(stderr, "[jihad-npapi] child binary path=%s (dirService=%d)\n",
+          exePath.value().c_str(), (int)ShouldHaveDirectoryService());
+
   return BinaryPathType::PluginContainer;
 }
 

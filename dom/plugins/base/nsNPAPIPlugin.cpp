@@ -341,6 +341,10 @@ nsNPAPIPlugin::CreatePlugin(nsPluginTag *aPluginTag, nsNPAPIPlugin** aResult)
   RefPtr<nsNPAPIPlugin> plugin = new nsNPAPIPlugin();
 
   PluginLibrary* pluginLib = GetNewPluginLibrary(aPluginTag);
+  // JIHAD DIAGNOSTIC (R7): GetNewPluginLibrary is where the OOP decision is made —
+  // RunPluginOOP() ? PluginModuleParent::LoadModule (launches plugin-container) : a
+  // PluginPRLibrary loaded in-process. A null here is the plugin-container launch failing.
+  fprintf(stderr, "[jihad-npapi] GetNewPluginLibrary lib=%d\n", (int)!!pluginLib);
   if (!pluginLib) {
     return NS_ERROR_FAILURE;
   }
@@ -386,6 +390,7 @@ nsNPAPIPlugin::CreatePlugin(nsPluginTag *aPluginTag, nsNPAPIPlugin** aResult)
 #else
   NPError pluginCallError;
   nsresult rv = pluginLib->NP_Initialize(&sBrowserFuncs, &plugin->mPluginFuncs, &pluginCallError);
+  fprintf(stderr, "[jihad-npapi] NP_Initialize rv=0x%x npErr=%d\n", (unsigned)rv, (int)pluginCallError);
   if (rv != NS_OK || pluginCallError != NPERR_NO_ERROR) {
     return NS_ERROR_FAILURE;
   }

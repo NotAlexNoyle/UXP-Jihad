@@ -787,6 +787,12 @@ nsresult
 nsObjectLoadingContent::InstantiatePluginInstance(bool aIsLoading)
 {
 #ifdef MOZ_ENABLE_NPAPI
+  // JIHAD DIAGNOSTIC (R7): entry + the four early-out conditions. If this line never appears the
+  // plugin was never asked for at all (no nsPluginFrame -> no HasNewFrame), which is a different
+  // bug from being asked for and refused.
+  fprintf(stderr, "[jihad-npapi] InstantiatePluginInstance(aIsLoading=%d) owner=%d type=%d "
+          "mIsLoading=%d instantiating=%d\n", (int)aIsLoading, (int)!!mInstanceOwner,
+          (int)mType, (int)mIsLoading, (int)mInstantiating);
   if (mInstanceOwner || mType != eType_Plugin || (mIsLoading != aIsLoading) ||
       mInstantiating) {
     // If we hit this assertion it's probably because LoadObject re-entered :(
@@ -822,10 +828,12 @@ nsObjectLoadingContent::InstantiatePluginInstance(bool aIsLoading)
   NS_ENSURE_TRUE(mInstantiating, NS_OK);
 
   if (!thisContent->GetPrimaryFrame()) {
+    // JIHAD DIAGNOSTIC (R7): a silent NS_OK return — the single most likely place for a plugin
+    // to "do nothing" with no error anywhere.
+    fprintf(stderr, "[jihad-npapi] NO PRIMARY FRAME -> not instantiating\n");
     LOG(("OBJLC [%p]: Not instantiating plugin with no frame", this));
     return NS_OK;
   }
-
   nsresult rv = NS_ERROR_FAILURE;
   RefPtr<nsPluginHost> pluginHost = nsPluginHost::GetInst();
 
@@ -846,6 +854,8 @@ nsObjectLoadingContent::InstantiatePluginInstance(bool aIsLoading)
   rv = pluginHost->InstantiatePluginInstance(mContentType,
                                              mURI.get(), this,
                                              getter_AddRefs(newOwner));
+  fprintf(stderr, "[jihad-npapi] pluginHost->InstantiatePluginInstance rv=0x%x owner=%d\n",
+          (unsigned)rv, (int)!!newOwner);
 
   // XXX(johns): We don't suspend native inside stopping plugins...
   if (appShell) {
@@ -2378,6 +2388,11 @@ nsObjectLoadingContent::LoadObject(bool aNotify,
   FallbackType clickToPlayReason;
   if (!mActivated && (mType == eType_Null || mType == eType_Plugin) &&
       !ShouldPlay(clickToPlayReason, false)) {
+    // JIHAD DIAGNOSTIC (R7): this is where a plugin that resolved fine is silently demoted to
+    // eType_Null. Every path out of ShouldPlay that returns false lands here, so one line here
+    // names the reason instead of instrumenting each exit.
+    fprintf(stderr, "[jihad-npapi] demoted to fallback: mType=%d fallbackReason=%d\n",
+            (int)mType, (int)clickToPlayReason);
     LOG(("OBJLC [%p]: Marking plugin as click-to-play", this));
     mType = eType_Null;
     fallbackType = clickToPlayReason;
@@ -2887,9 +2902,16 @@ nsObjectLoadingContent::GetTypeOfContent(const nsCString& aMIMEType)
 
 #ifdef MOZ_ENABLE_NPAPI
   RefPtr<nsPluginHost> pluginHost = nsPluginHost::GetInst();
-  if ((caps & eSupportPlugins) &&
-      pluginHost &&
-      pluginHost->HavePluginForType(aMIMEType, nsPluginHost::eExcludeNone)) {
+  bool jihadHave = pluginHost &&
+      pluginHost->HavePluginForType(aMIMEType, nsPluginHost::eExcludeNone);
+  // JIHAD DIAGNOSTIC (R7 windowless port): says, for one MIME type, whether the element
+  // advertised plugin capability and whether the host has a plugin — the two facts that decide
+  // if the NPAPI subsystem is entered at all. Added because a plugin that never instantiates
+  // produces NO plugin logging whatsoever, which is indistinguishable from one that was never
+  // asked for.
+  fprintf(stderr, "[jihad-npapi] GetTypeOfContent mime=%s caps=0x%x supportsPlugins=%d have=%d\n",
+          nsCString(aMIMEType).get(), caps, (int)!!(caps & eSupportPlugins), (int)jihadHave);
+  if ((caps & eSupportPlugins) && jihadHave) {
     // ShouldPlay will handle checking for disabled plugins
     return eType_Plugin;
   }
@@ -3486,9 +3508,15 @@ nsObjectLoadingContent::ShouldPlay(FallbackType &aReason, bool aIgnoreCurrentTyp
   aReason = eFallbackClickToPlay;
 
   uint32_t enabledState = nsIPluginTag::STATE_DISABLED;
-  pluginHost->GetStateForType(mContentType, nsPluginHost::eExcludeNone,
+  nsresult jihadStateRv = pluginHost->GetStateForType(mContentType, nsPluginHost::eExcludeNone,
                               &enabledState);
+  // JIHAD DIAGNOSTIC (R7): note that enabledState is pre-set to STATE_DISABLED and the rv of
+  // GetStateForType is NOT checked upstream, so a failing lookup silently blocks the plugin
+  // with no other trace. Log the rv as well as the value.
+  fprintf(stderr, "[jihad-npapi] ShouldPlay type=%s enabledState=%u rv=0x%x\n",
+          mContentType.get(), enabledState, (unsigned)jihadStateRv);
   if (nsIPluginTag::STATE_DISABLED == enabledState) {
+    fprintf(stderr, "[jihad-npapi] ShouldPlay -> FALSE (eFallbackDisabled)\n");
     aReason = eFallbackDisabled;
     return false;
   }

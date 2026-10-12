@@ -444,6 +444,8 @@ PluginModuleChromeParent::LoadModule(const char* aFilePath, uint32_t aPluginId,
     parent->mSubprocess->SetCallRunnableImmediately(!parent->mIsStartingAsync);
     bool launched = parent->mSubprocess->Launch(Move(onLaunchedRunnable),
                                                 aPluginTag->mSandboxLevel);
+    fprintf(stderr, "[jihad-npapi] LoadModule path=%s async=%d launched=%d\n",
+            aFilePath, (int)parent->mIsStartingAsync, (int)launched);
     if (!launched) {
         // We never reached open
         parent->mShutdown = true;
@@ -455,7 +457,10 @@ PluginModuleChromeParent::LoadModule(const char* aFilePath, uint32_t aPluginId,
     parent->mIsBlocklisted = NS_FAILED(rv) || blocklistState != 0;
     if (!parent->mIsStartingAsync) {
         int32_t launchTimeoutSecs = Preferences::GetInt(kLaunchTimeoutPref, 0);
-        if (!parent->mSubprocess->WaitUntilConnected(launchTimeoutSecs * 1000)) {
+        bool connected = parent->mSubprocess->WaitUntilConnected(launchTimeoutSecs * 1000);
+        fprintf(stderr, "[jihad-npapi] LoadModule WaitUntilConnected(%ds) = %d\n",
+                (int)launchTimeoutSecs, (int)connected);
+        if (!connected) {
             parent->mShutdown = true;
             return nullptr;
         }
