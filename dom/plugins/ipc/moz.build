@@ -88,6 +88,10 @@ UNIFIED_SOURCES += [
 ]
 
 SOURCES += [
+    # Jihad: must NOT be unified — it deliberately includes no NPAPI headers so its exported
+    # NPN_* symbols escape the hidden-visibility pragma. Merging it with a TU that includes
+    # npapi.h would reintroduce the prior hidden declaration and silently un-export them.
+    'JihadNPNInterpose.cpp',
     'PluginInstanceChild.cpp', # 'PluginThreadCallback' : ambiguous symbol
     'PluginModuleChild.cpp',   # Redefinition of mozilla::WindowsDllInterceptor sUser32Intercept
 ]
