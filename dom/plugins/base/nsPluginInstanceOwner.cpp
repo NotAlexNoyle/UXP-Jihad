@@ -569,6 +569,27 @@ NS_IMETHODIMP nsPluginInstanceOwner::InvalidateRect(NPRect *invalidRect)
   GetContentsScaleFactor(&scaleFactor);
   rect.ScaleRoundOut(scaleFactor);
   mPluginFrame->InvalidateLayer(nsDisplayItem::TYPE_PLUGIN, &rect);
+
+  // JIHAD (2026-08-09): drive the offscreen daemon's re-capture for WINDOWLESS plugins.
+  //
+  // A windowless plugin has no mWidget, so the mWidget->Invalidate() branch above (which is what
+  // ultimately reaches PuppetWidget::Invalidate and sets the daemon's mJihadDirty flag) never
+  // runs. InvalidateLayer() alone only marks the plugin's ImageLayer for recomposition; with the
+  // in-process BasicLayerManager and no separate compositor, that repaints the widget's own layer
+  // backbuffer but never triggers jihad_offscreen_render_region, the path that actually renders a
+  // frame into the adapter's shared buffer for the card. Measured: Flash pushes a fresh magenta
+  // frame into its ImageContainer ~15x/s and BasicImageLayer::Paint runs on each, yet
+  // render_region fired ONCE (at load) so the card froze on the pre-content frame. The control
+  // plugin only appeared to work because its static fill was already present at that single
+  // capture. Invalidate the nearest real widget here so every async plugin frame marks the daemon
+  // dirty and gets composited to the card. The daemon re-renders the whole document per capture,
+  // so invalidating the widget bounds (rather than a precise sub-rect) is sufficient and correct.
+  if (!mWidget) {
+    nsIWidget* nearest = mPluginFrame->GetNearestWidget();
+    if (nearest) {
+      nearest->Invalidate(nearest->GetBounds());
+    }
+  }
   return NS_OK;
 }
 
