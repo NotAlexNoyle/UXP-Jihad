@@ -199,6 +199,7 @@
 #include "nsICommandManager.h"
 #include "nsIDOMNode.h"
 #include "nsIDocShellTreeOwner.h"
+#include "nsIBadCertListener2.h"   // JIHAD: route cert errors to the embedder chrome
 #include "nsIHttpChannel.h"
 #include "nsIIDNService.h"
 #include "nsIInputStreamChannel.h"
@@ -1074,6 +1075,33 @@ nsDocShell::GetInterface(const nsIID& aIID, void** aSink)
   } else if (aIID.Equals(NS_GET_IID(nsITabChild))) {
     *aSink = GetTabChild().take();
     return *aSink ? NS_OK : NS_ERROR_FAILURE;
+  } else if (aIID.Equals(NS_GET_IID(nsIBadCertListener2))) {
+    // JIHAD: hand the embedder's chrome the certificate error.
+    //
+    // NSS asks the channel's notification callbacks for nsIBadCertListener2
+    // (SSLServerCertVerification.cpp, CertErrorRunnable::CheckCertOverrides) and passes
+    // it the nsISSLStatus carrying the SERVER CERTIFICATE. That call is the one and only
+    // place an embedder is handed the cert while it still exists — the same shape the
+    // Atlas browser gets for free from WebKit's load-failed-with-tls-errors signal, which
+    // delivers the GTlsCertificate as a signal argument.
+    //
+    // Without this hop nothing answers: the docShell's fallthrough is
+    // nsDocLoader::GetInterface, which Queries the docloader ITSELF, so the request never
+    // reaches nsIWebBrowserChrome. The embedder is then left trying to recover the cert
+    // afterwards, and there is no way to: the failed channel's securityInfo has a null
+    // SSLStatus, and UXP has no nsIRecentBadCerts service. Measured 2026-08-04 — the
+    // SSL-confirm dialog worked, the user accepted, and the accept could do nothing
+    // because RememberValidityOverride had no nsIX509Cert to take.
+    //
+    // Routed through the tree owner, exactly as nsIWebBrowserChromeFocus and nsIPrompt
+    // already are (nsDocShellTreeOwner::GetInterface).
+    nsCOMPtr<nsIDocShellTreeOwner> treeOwner;
+    GetTreeOwner(getter_AddRefs(treeOwner));
+    nsCOMPtr<nsIInterfaceRequestor> req(do_QueryInterface(treeOwner));
+    if (req) {
+      return req->GetInterface(aIID, aSink);
+    }
+    return NS_NOINTERFACE;
   } else if (aIID.Equals(NS_GET_IID(nsIContentFrameMessageManager))) {
     nsCOMPtr<nsITabChild> tabChild =
       do_GetInterface(static_cast<nsIDocShell*>(this));
