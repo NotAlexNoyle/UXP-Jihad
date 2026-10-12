@@ -390,6 +390,14 @@ nsWebBrowserFind::SetSelectionAndScroll(nsPIDOMWindowOuter* aWindow,
 
   nsCOMPtr<nsISelection> selection;
 
+  // JIHAD: frame->GetSelectionController can leave selCon NULL, and this dereferenced it
+  // unconditionally — a null deref that took the whole process down. It is reachable in an
+  // offscreen embedding with no chrome: this is the ONLY thing that made find-in-page
+  // unusable there (faultaddr=0x0, measured repeatedly). Guarding costs nothing and the
+  // rest of the function already tolerates a null `selection`.
+  if (!selCon) {
+    return;
+  }
   selCon->SetDisplaySelection(nsISelectionController::SELECTION_ON);
   selCon->GetSelection(nsISelectionController::SELECTION_NORMAL,
                        getter_AddRefs(selection));
@@ -707,7 +715,24 @@ nsWebBrowserFind::SearchInFrame(nsPIDOMWindowOuter* aWindow, bool aWrapping,
     return NS_ERROR_FAILURE;
   }
 
-  if (!nsContentUtils::SubjectPrincipal()->Subsumes(theDoc->NodePrincipal())) {
+  // JIHAD: this same-origin check is why find-in-page took the whole process down in this
+  // embedding, and the engine says why itself. nsContentUtils::SubjectPrincipal() begins:
+  //     JSContext* cx = GetCurrentJSContext();
+  //     if (!cx) {
+  //       MOZ_CRASH("Accessing the Subject Principal without an AutoJSAPI on the stack is forbidden");
+  //     }
+  // An EMBEDDER calls nsIWebBrowserFind::FindNext from C++ with no script on the stack, so
+  // there is no JSContext and MOZ_CRASH fires — a deliberate abort that presents as SIGSEGV at
+  // address 0, which is precisely the fault this port recorded for two weeks and attributed to
+  // "a frame-selection controller the offscreen browser doesn't set up". That was wrong: the
+  // selection machinery is fine and the crash happens BEFORE any of it, on the security check.
+  //
+  // The check is meaningful only when there IS a caller to check. With no JS on the stack the
+  // caller is native embedding code, which is already fully trusted — it is inside libxul's own
+  // process, holding the nsIWebBrowserFind for that very docShell. So: consult the subject
+  // principal only when a JSContext exists, and otherwise proceed.
+  if (nsContentUtils::GetCurrentJSContext() &&
+      !nsContentUtils::SubjectPrincipal()->Subsumes(theDoc->NodePrincipal())) {
     return NS_ERROR_DOM_PROP_ACCESS_DENIED;
   }
 
@@ -809,8 +834,11 @@ nsWebBrowserFind::GetFrameSelection(nsPIDOMWindowOuter* aWindow)
   nsCOMPtr<nsISelection> sel;
   if (frame) {
     frame->GetSelectionController(presContext, getter_AddRefs(selCon));
-    selCon->GetSelection(nsISelectionController::SELECTION_NORMAL,
-                         getter_AddRefs(sel));
+    // JIHAD: same unguarded deref as above — GetSelectionController can yield null.
+    if (selCon) {
+      selCon->GetSelection(nsISelectionController::SELECTION_NORMAL,
+                           getter_AddRefs(sel));
+    }
     if (sel) {
       int32_t count = -1;
       sel->GetRangeCount(&count);
@@ -820,7 +848,12 @@ nsWebBrowserFind::GetFrameSelection(nsPIDOMWindowOuter* aWindow)
     }
   }
 
+  // JIHAD: and the fallback QI is not guaranteed either — if the presShell does not answer
+  // nsISelectionController we must return nothing rather than crash.
   selCon = do_QueryInterface(presShell);
+  if (!selCon) {
+    return nullptr;
+  }
   selCon->GetSelection(nsISelectionController::SELECTION_NORMAL,
                        getter_AddRefs(sel));
   return sel.forget();
