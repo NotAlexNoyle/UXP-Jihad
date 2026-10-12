@@ -76,6 +76,7 @@
 #include "GMPLoader.h"
 #endif
 #include "mozilla/gfx/GPUProcessImpl.h"
+#include "gfxPlatform.h"
 
 #include "GeckoProfiler.h"
 
@@ -176,6 +177,13 @@ XRE_InitEmbedding2(nsIFile *aLibXULDirectory,
     return NS_ERROR_FAILURE;
 
   startupNotifier->Observe(nullptr, APPSTARTUP_TOPIC, nullptr);
+
+  // Jihad Browser: force full gfx init (gfxPlatform/gfxVars/gfxConfig) during
+  // embedding startup. XRE_InitEmbedding2 otherwise leaves gfx lazy, but the
+  // headless paint path (WindowSurfaceProvider -> gfxVars::UseXRender) touches
+  // gfxVars before anything triggers gfxPlatform::Init, crashing on a null
+  // singleton. XRE_main initializes gfx during normal startup.
+  gfxPlatform::GetPlatform();
 
   return NS_OK;
 }

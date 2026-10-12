@@ -72,7 +72,17 @@ static cairo_user_data_key_t cairo_gdk_drawable_key;
 
 gfxPlatformGtk::gfxPlatformGtk()
 {
-    gtk_init(nullptr, nullptr);
+    // Jihad: in JIHAD_OFFSCREEN (headless daemon) mode there is no X server on the
+    // device. gtk_init() calls exit() if it cannot open a display; gtk_init_check()
+    // returns false instead and leaves GTK usable for the non-X paths (fontconfig/
+    // freetype font list, image/CPU surfaces via the BasicLayerManager). The X code
+    // below is already guarded by GDK_IS_X11_DISPLAY(gdk_display_get_default()),
+    // which is false with no display, so it is skipped cleanly.
+    if (getenv("JIHAD_OFFSCREEN")) {
+        gtk_init_check(nullptr, nullptr);
+    } else {
+        gtk_init(nullptr, nullptr);
+    }
 
     mMaxGenericSubstitutions = UNINITIALIZED_VALUE;
 
@@ -325,8 +335,10 @@ gfxPlatformGtk::GetDPI()
     if (!sDPI) {
         // Make sure init is run so we have a resolution
         GdkScreen *screen = gdk_screen_get_default();
-        gtk_settings_get_for_screen(screen);
-        sDPI = int32_t(round(gdk_screen_get_resolution(screen)));
+        if (screen) {                       // null when headless (no X display)
+            gtk_settings_get_for_screen(screen);
+            sDPI = int32_t(round(gdk_screen_get_resolution(screen)));
+        }
         if (sDPI <= 0) {
             // Fall back to something sane
             sDPI = 96;
