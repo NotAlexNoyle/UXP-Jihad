@@ -662,6 +662,27 @@ GeckoChildProcessHost::PerformAsyncLaunchInternal(std::vector<std::string>& aExt
 
   std::vector<std::string> childArgv;
 
+  // Optional ELF loader prefix for the child process.
+  //
+  // An embedder whose bundled glibc differs from the host system's cannot exec the child
+  // binary directly: its PT_INTERP names the SYSTEM loader, which then resolves the child's
+  // libraries against the bundled set and dies before main(). Exporting these two variables
+  // makes the child be launched exactly the way such an embedder launches itself —
+  //     <loader> --library-path <path> <child> <args…>
+  // — which runs the child in the same process image (no extra fork, no shell hop, so the
+  // pid we hand to waitpid and the inherited IPC channel fd are unaffected).
+  //
+  // Both unset is upstream behaviour, unchanged.
+  const char* childLoader = PR_GetEnv("MOZ_CHILD_PROCESS_LOADER");
+  if (childLoader && *childLoader) {
+    childArgv.push_back(childLoader);
+    const char* loaderLibPath = PR_GetEnv("MOZ_CHILD_PROCESS_LOADER_PATH");
+    if (loaderLibPath && *loaderLibPath) {
+      childArgv.push_back("--library-path");
+      childArgv.push_back(loaderLibPath);
+    }
+  }
+
   childArgv.push_back(exePath.value());
 
   if (pathType == BinaryPathType::Self) {
