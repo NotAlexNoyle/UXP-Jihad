@@ -115,6 +115,16 @@ PluginInstanceParent::LookupPluginInstanceByID(uintptr_t aId)
 }
 #endif
 
+// Jihad: every live instance, so a C entry point can reach one. jihad_plugin_frame_seq needs no
+// instance because it only counts; a frame REQUEST has to be sent on an actual actor.
+//
+// A plain file-static array maintained in the ctor/dtor below, not a hashtable: this is at most a
+// couple of entries on a single-card embedding, it is only ever touched on the main thread (the
+// daemon calls the export from inside its own tick, on that same thread), and the alternative —
+// walking nsPluginHost's nsNPAPIPluginInstance list the way jihad_plugin_palm_spotlight does —
+// would still have to get from there to the PluginInstanceParent actor to call Send on it.
+static nsTArray<PluginInstanceParent*>* gJihadLiveInstances = nullptr;
+
 PluginInstanceParent::PluginInstanceParent(PluginModuleParent* parent,
                                            NPP npp,
                                            const nsCString& aMimeType,
@@ -145,10 +155,24 @@ PluginInstanceParent::PluginInstanceParent(PluginModuleParent* parent,
         sPluginInstanceList = new nsClassHashtable<nsVoidPtrHashKey, PluginInstanceParent>();
     }
 #endif
+    // Jihad: join the live list that jihad_plugin_request_frame walks. Leaked on purpose — it
+    // outlives every instance and there is no shutdown hook here that is guaranteed to run
+    // after the last dtor.
+    if (!gJihadLiveInstances) {
+        gJihadLiveInstances = new nsTArray<PluginInstanceParent*>();
+    }
+    gJihadLiveInstances->AppendElement(this);
 }
 
 PluginInstanceParent::~PluginInstanceParent()
 {
+    // Jihad: leave the live list FIRST. Anything below can run script or spin the loop, and a
+    // frame request delivered to a half-destroyed actor is a use-after-free rather than a
+    // dropped frame.
+    if (gJihadLiveInstances) {
+        gJihadLiveInstances->RemoveElement(this);
+    }
+
     if (mNPP)
         mNPP->pdata = nullptr;
 
@@ -925,6 +949,38 @@ extern "C" {
 MOZ_EXPORT uint32_t jihad_plugin_frame_seq(void)
 {
     return gJihadPluginFrameSeq;
+}
+}
+
+extern "C" {
+// Ask every live plugin for one frame. Returns how many were asked, so the daemon can tell "no
+// plugin" from "delivered" — the same contract as jihad_plugin_palm_spotlight.
+//
+// WEAK on the daemon side: a libxul without this symbol keeps the child's own timer as the frame
+// clock (patch 0026 behaviour), which is slower to settle but never wrong.
+MOZ_EXPORT int jihad_plugin_request_frame(void)
+{
+#ifdef MOZ_ENABLE_NPAPI
+    if (!gJihadLiveInstances) {
+        return 0;
+    }
+    // Copy first: SendJihadRequestFrame can fail and tear the actor down, which would mutate the
+    // array underneath the loop. Same reasoning as the instance-list copy in
+    // jihad_plugin_palm_spotlight (nsPluginHost.cpp).
+    nsTArray<PluginInstanceParent*> snap(*gJihadLiveInstances);
+    int asked = 0;
+    for (uint32_t i = 0; i < snap.Length(); ++i) {
+        if (!gJihadLiveInstances->Contains(snap[i])) {
+            continue;   // torn down by an earlier Send in this same loop
+        }
+        if (snap[i]->SendJihadRequestFrame()) {
+            asked++;
+        }
+    }
+    return asked;
+#else
+    return 0;
+#endif
 }
 }
 

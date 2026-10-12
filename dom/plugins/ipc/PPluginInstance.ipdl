@@ -125,6 +125,29 @@ child:
   // of its parent has changed
   async ContentsScaleFactorChanged(double aContentsScaleFactor);
 
+  // Jihad (webOS, cavekit-addons-extensions.md R7): ask the plugin for ONE frame, now.
+  //
+  // Palm's host issued npPalmDrawEvent every time the PAGE painted, so Flash can sit on its own
+  // frame clock and expect to be asked. Patch 0026 got it drawing by giving the CHILD a timer,
+  // but that timer free-runs against the daemon's tick, so a frame lands at a drifting phase and
+  // waits up to a whole tick to be published. Measured on device with a 30 fps SWF: 1:1 delivery
+  // and a 31-34 ms average, but a gap spread of 9-62 ms, which is what the eye reads as stutter.
+  //
+  // CAUTION, measured 2026-08-10 and it contradicts what 0026 assumed: the plugin DOES invalidate
+  // itself, ~22 times a second, alongside our ~27. The counter 0026 reads to conclude otherwise
+  // (gJihadNPNInvalidateRectCalls) only sees calls that bind the NPN_InvalidateRect SYMBOL, and
+  // an ordinary NPAPI plugin goes through the NPNetscapeFuncs table instead. So this message is
+  // currently a SECOND producer rather than the only one, and whether it should exist at all for
+  // a self-invalidating plugin is open — see the R7 frame-rate criterion.
+  //
+  // This is the pull that removes the second clock. ASYNC on purpose: the stock host pulls the
+  // plugin synchronously inside its page paint (PluginViewPalm), but out-of-process that shape
+  // is intr NPP_HandleEvent, which would block the daemon's main thread — and therefore its
+  // tick and its YAP socket — for a full IPC round trip plus a Flash paint on every frame.
+  // Async keeps the phase lock and costs nothing: the child coalesces duplicate requests via
+  // mCurrentInvalidateTask, so an extra request while one is in flight is a no-op.
+  async JihadRequestFrame();
+
   // ********************** Async plugins rendering
   // see https://wiki.mozilla.org/Gecko:AsyncPluginPainting
   // **********************
