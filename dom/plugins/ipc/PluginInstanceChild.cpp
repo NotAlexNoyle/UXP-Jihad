@@ -4022,7 +4022,32 @@ JihadPumpGlib(int aMaxIterations)
 // to run because of it.
 static const int kJihadGlibPumpIntervalMs = 16;   // ~60Hz, the rate a frame clock wants
 static const int kJihadGlibPumpMaxIters   = 20;   // bounded: never starve the MessageLoop
-static const int kJihadRepaintEveryTicks  = 4;    // ~15Hz while the host is driving repaints
+
+// Host-driven repaint divisor: one repaint every Nth 16 ms tick. 2 is ~30 Hz, which is what
+// ordinary Flash content is authored at; 4 was ~15 Hz and was the measured ceiling on the
+// WHOLE pipeline — device 2026-08-10, single instance: plugin draw 21.6-24 fps and RecvShow
+// 21.3-24.2 fps while the daemon was already compositing 28.4-29.4 fps, i.e. the host was
+// asking for frames more slowly than it could consume them.
+//
+// Env-tunable because the right value is a property of the device under load, not of the
+// source, and a rebuild per candidate costs a 44 MB push. Clamped: 0 or a negative divisor
+// would be a modulo-by-zero, and anything past 8 is slower than the pump itself.
+static int JihadRepaintEveryTicks()
+{
+    static int sDiv = 0;
+    if (!sDiv) {
+        sDiv = 2;
+        const char* e = getenv("JIHAD_PLUGIN_REPAINT_DIV");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 8) sDiv = v;
+        }
+        fprintf(stderr, "[jihad-npapi-child] host repaint divisor=%d (~%d Hz)\n",
+                sDiv, 1000 / (kJihadGlibPumpIntervalMs * sDiv));
+        fflush(stderr);
+    }
+    return sDiv;
+}
 
 // ── REPAINT A webOS PLUGIN FROM THE HOST'S CLOCK (Jihad, addons R7) ──────────────────────
 //
@@ -4058,7 +4083,7 @@ public:
 
         static uint64_t sRepaintTicks = 0;
         if (sJihadPalmInstance && gJihadNPNInvalidateRectCalls == 0 &&
-            (++sRepaintTicks % kJihadRepaintEveryTicks) == 0) {
+            (++sRepaintTicks % JihadRepaintEveryTicks()) == 0) {
             sJihadPalmInstance->JihadPalmRepaintTick();
         }
 
