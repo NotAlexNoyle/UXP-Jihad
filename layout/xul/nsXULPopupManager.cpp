@@ -673,6 +673,13 @@ nsXULPopupManager::ShowMenu(nsIContent *aMenu,
                             bool aSelectFirstItem,
                             bool aAsynchronous)
 {
+  // JIHAD popup instrumentation: the toolbarbutton type="menu" path (about:addons
+  // utils menu) enters here; if this line never fires, the DOM activation upstream
+  // (XUL button command/mousedown handling) is where the tap died.
+  if (getenv("JIHAD_OFFSCREEN")) {
+    fprintf(stderr, "[jihad-popup] ShowMenu menu=%p async=%d\n",
+            (void*)aMenu, (int)aAsynchronous);
+  }
   // generate any template content first. Otherwise, the menupopup may not
   // have been created yet.
   if (aMenu) {
@@ -896,6 +903,18 @@ nsXULPopupManager::ShowPopupCallback(nsIContent* aPopup,
 {
   nsPopupType popupType = aPopupFrame->PopupType();
   bool ismenu = (popupType == ePopupTypeMenu);
+
+  // JIHAD popup instrumentation (2026-08-02): EVERY popup that actually opens funnels
+  // through here. Silent until now — "menu never opened" vs "opened but painted
+  // nowhere" were indistinguishable in the headless daemon.
+  if (getenv("JIHAD_OFFSCREEN")) {
+    nsRect r = aPopupFrame->GetRect();
+    fprintf(stderr, "[jihad-popup] ShowPopupCallback type=%d ctx=%d frame=%p rect=%d,%d %dx%d hasView=%d hasWidget=%d\n",
+            (int)popupType, (int)aIsContextMenu, (void*)aPopupFrame,
+            r.x, r.y, r.width, r.height,
+            (int)aPopupFrame->HasView(),
+            (int)(aPopupFrame->GetView() && aPopupFrame->GetView()->HasWidget()));
+  }
 
   nsMenuChainItem* item =
     new nsMenuChainItem(aPopupFrame, aIsContextMenu, popupType);
