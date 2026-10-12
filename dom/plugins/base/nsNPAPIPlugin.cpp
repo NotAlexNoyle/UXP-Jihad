@@ -1939,7 +1939,16 @@ _getvalue(NPP npp, NPNVariable variable, void *result)
   }
 
   case NPNVSupportsWindowless: {
-#if defined(XP_WIN) || defined(XP_MACOSX) || \
+    // MOZ_WIDGET_HEADLESS added for Jihad Browser. This list enumerates the toolkits that can
+    // host a windowless plugin, and it was written before a headless toolkit existed — so a
+    // cairo-headless build answered "windowless unsupported" to every plugin, which is the
+    // opposite of the truth. Headless is the toolkit that MOST needs windowless: there is no X
+    // server, no Drawable and no XEmbed, so windowed hosting is impossible and drawing into a
+    // memory bitmap we own is the only thing that can work. gfxPlatformHeadless already returns
+    // true from SupportsPluginDirectBitmapDrawing(), i.e. the drawing model this unlocks
+    // (NPDrawingModelAsyncBitmapSurface) is implemented for this platform; only this
+    // advertisement was missing, and with it false no plugin would ever choose windowless.
+#if defined(XP_WIN) || defined(XP_MACOSX) || defined(MOZ_WIDGET_HEADLESS) || \
     (defined(MOZ_X11) && defined(MOZ_WIDGET_GTK))
     *(NPBool*)result = true;
 #else
