@@ -4076,6 +4076,27 @@ static const int kJihadGlibPumpMaxIters   = 20;   // bounded: never starve the M
 // Env-tunable because the right value is a property of the device under load, not of the
 // source, and a rebuild per candidate costs a 44 MB push. Clamped: 0 or a negative divisor
 // would be a modulo-by-zero, and anything past 8 is slower than the pump itself.
+// Disable the child's OWN repaint timer entirely. $JIHAD_PLUGIN_SELF_DRIVE=0.
+//
+// This exists to isolate ONE producer. Measured 2026-08-10, there are two: our host pull and the
+// plugin invalidating itself (~26/s and ~23/s). Turning off only the daemon's pull
+// (JIHAD_PLUGIN_PULL=0) does NOT isolate the plugin, because the child's host-drive lease then
+// expires and this timer takes over — that run reproduces patch 0026 rather than answering the
+// question, and it measured WORSE than the pull on both rate (24-29 vs 30-33 fps) and spread.
+// With both switches off the plugin's own NPN_InvalidateRect is the only frame source left, which
+// is the experiment that decides whether a host clock should exist here at all.
+static bool JihadChildSelfDriveEnabled()
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("JIHAD_PLUGIN_SELF_DRIVE");
+        s_on = (e && *e && atoi(e) == 0) ? 0 : 1;   // default ON; only an explicit 0 disables
+        fprintf(stderr, "[jihad-npapi-child] self-drive timer %s\n", s_on ? "enabled" : "DISABLED");
+        fflush(stderr);
+    }
+    return s_on != 0;
+}
+
 static int JihadRepaintEveryTicks()
 {
     static int sDiv = 0;
@@ -4216,7 +4237,7 @@ public:
         // them is what deadlocked startup before patch 0026. Only the REPAINT defers.
         static uint64_t sRepaintTicks = 0;
         if (sJihadPalmInstance && gJihadNPNInvalidateRectCalls == 0 &&
-            !JihadHostIsDrivingFrames() &&
+            JihadChildSelfDriveEnabled() && !JihadHostIsDrivingFrames() &&
             (++sRepaintTicks % JihadRepaintEveryTicks()) == 0) {
             sJihadPalmInstance->JihadPalmRepaintTick();
         }
