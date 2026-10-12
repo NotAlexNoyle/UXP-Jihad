@@ -30,7 +30,7 @@
 #include "NativeFontResourceMac.h"
 #endif
 
-#ifdef MOZ_WIDGET_GTK
+#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_HEADLESS)
 #include "ScaledFontFontconfig.h"
 #endif
 
@@ -584,7 +584,7 @@ Factory::CreateScaledFontWithCairo(const NativeFont& aNativeFont, Float aSize, c
 #endif
 }
 
-#ifdef MOZ_WIDGET_GTK
+#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_HEADLESS)
 already_AddRefed<ScaledFont>
 Factory::CreateScaledFontForFontconfigFont(cairo_scaled_font_t* aScaledFont, FcPattern* aPattern, Float aSize)
 {
