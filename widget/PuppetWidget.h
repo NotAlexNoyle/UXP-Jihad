@@ -243,6 +243,31 @@ public:
     return d;
   }
 
+  // The BOUNDING BOX of everything invalidated since the last drain, in the widget's own
+  // device px, drained with the flag. A whole-viewport software repaint costs ~40 ms on this
+  // hardware, which caps anything animated at ~20 fps no matter how fast the source runs; a
+  // plugin animating in a 320x240 box only needs those rows. Accumulated as a bounding box
+  // rather than a region on purpose: the consumer can only issue rectangular renders, so a
+  // precise region would be discarded at the first use anyway.
+  bool JihadTakeDirtyRect(int32_t* aX, int32_t* aY, int32_t* aW, int32_t* aH) {
+    LayoutDeviceIntRect r = mJihadDirtyRect;
+    mJihadDirtyRect.SetEmpty();
+    for (PuppetWidget* c = mChild.get(); c; c = c->mChild.get()) {
+      if (!c->mJihadDirtyRect.IsEmpty()) {
+        r = r.IsEmpty() ? c->mJihadDirtyRect : r.Union(c->mJihadDirtyRect);
+        c->mJihadDirtyRect.SetEmpty();
+      }
+    }
+    if (r.IsEmpty()) {
+      return false;
+    }
+    if (aX) *aX = r.x;
+    if (aY) *aY = r.y;
+    if (aW) *aW = r.width;
+    if (aH) *aH = r.height;
+    return true;
+  }
+
   virtual TabChild* GetOwningTabChild() override { return mTabChild; }
 
   void UpdateBackingScaleCache(float aDpi, int32_t aRounding, double aScale)
@@ -386,6 +411,10 @@ private:
   RefPtr<PuppetWidget> mChild;
   LayoutDeviceIntRegion mDirtyRegion;
   bool mJihadDirty = false;   // sticky Invalidate() flag, drained by JihadTakeDirty()
+  // Bounding box of the same invalidations, drained by JihadTakeDirtyRect(). Kept beside the
+  // flag rather than replacing it: the flag answers "is anything dirty" for callers that do a
+  // full repaint, and must keep working unchanged if the rect is ignored.
+  LayoutDeviceIntRect mJihadDirtyRect;
   nsRevocableEventPtr<PaintTask> mPaintTask;
   RefPtr<MemoryPressureObserver> mMemoryPressureObserver;
   // XXX/cjones: keeping this around until we teach LayerManager to do

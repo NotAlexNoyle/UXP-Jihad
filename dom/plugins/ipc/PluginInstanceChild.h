@@ -645,6 +645,10 @@ private:
     // setwindow that carries it runs again on every resize and scroll.
     bool mJihadSentPalmGainFocus;
 
+    // Jihad R7 (webOS): cap on the input-delivery breadcrumb in AnswerNPP_HandleEvent. A
+    // pen-move stream is unbounded; the daemon log is the only field-debug channel there is.
+    uint32_t mJihadInputEventsLogged;
+
 public:
     // Jihad R7 (webOS): repaint this instance from the host's own clock. See
     // JihadGlibPumpTask::Run — a webOS plugin is not obliged to ask for repaints, because the

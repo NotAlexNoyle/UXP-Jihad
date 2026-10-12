@@ -343,6 +343,7 @@ PuppetWidget::Invalidate(const LayoutDeviceIntRect& aRect)
   // Jihad: record that content changed so the offscreen render daemon repaints
   // (jihad_offscreen_take_dirty). Sticky — only the daemon's drain clears it.
   mJihadDirty = true;
+  mJihadDirtyRect = mJihadDirtyRect.IsEmpty() ? aRect : mJihadDirtyRect.Union(aRect);
 
   mDirtyRegion.Or(mDirtyRegion, aRect);
 
@@ -830,6 +831,19 @@ jihad_offscreen_take_dirty(nsIWidget* aWidget)
     return false;
   }
   return static_cast<PuppetWidget*>(aWidget)->JihadTakeDirty();
+}
+
+// The bounding box of what changed, so the daemon can repaint only those rows. See
+// PuppetWidget::JihadTakeDirtyRect. Returns false when nothing is dirty, leaving the outs
+// untouched; a caller that ignores this simply keeps doing full-frame repaints.
+MOZ_EXPORT bool
+jihad_offscreen_take_dirty_rect(nsIWidget* aWidget, int32_t* aX, int32_t* aY,
+                                int32_t* aW, int32_t* aH)
+{
+  if (!aWidget) {
+    return false;
+  }
+  return static_cast<PuppetWidget*>(aWidget)->JihadTakeDirtyRect(aX, aY, aW, aH);
 }
 
 // Render the docShell's document into the widget's offscreen DrawTarget via the

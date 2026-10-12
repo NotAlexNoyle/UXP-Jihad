@@ -924,6 +924,27 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
 
     MOZ_ASSERT(!IsUsingDirectDrawing());
 
+    // FRAME-RATE READOUT, parent side. Paired with the child's `palm draw:` line: the child
+    // reports how often the plugin was ASKED to draw, this reports how many of those frames
+    // actually crossed the process boundary. A gap between the two numbers is the difference
+    // between "the plugin is slow" and "we are dropping its frames", which are opposite bugs.
+    {
+        static uint32_t sShows = 0;
+        static uint32_t sLastReport = 0;
+        sShows++;
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        if (!sLastReport) {
+            sLastReport = nowMs;
+        } else if (nowMs - sLastReport >= 2000) {
+            fprintf(stderr, "[jihad-npapi] RecvShow: %u in %ums (%.1f fps)\n",
+                    sShows, nowMs - sLastReport,
+                    sShows * 1000.0 / double(nowMs - sLastReport));
+            fflush(stderr);
+            sShows = 0;
+            sLastReport = nowMs;
+        }
+    }
+
     // XXXjwatt rewrite to use Moz2D
     RefPtr<gfxASurface> surface;
     if (newSurface.type() == SurfaceDescriptor::TShmem) {
