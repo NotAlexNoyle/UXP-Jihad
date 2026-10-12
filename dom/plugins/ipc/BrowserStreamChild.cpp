@@ -133,6 +133,12 @@ BrowserStreamChild::RecvNPP_DestroyStream(const NPReason& reason)
 {
   PLUGIN_LOG_DEBUG_METHOD;
 
+  // Jihad R7: end-of-stream is what tells a Flash player the movie is complete. A player that
+  // is never told stops on frame zero, which looks exactly like a player that cannot draw.
+  fprintf(stderr, "[jihad-npapi-child] RecvNPP_DestroyStream reason=%d state=%d\n",
+          (int)reason, (int)mState);
+  fflush(stderr);
+
   if (ALIVE != mState)
     NS_RUNTIMEABORT("Unexpected state: recevied NPP_DestroyStream twice?");
 
@@ -232,8 +238,12 @@ BrowserStreamChild::Deliver()
     if (kStreamOpen == mStreamStatus)
       mStreamStatus = NPRES_DONE;
 
-    (void) mInstance->mPluginIface
+    NPError dsrv = mInstance->mPluginIface
       ->destroystream(&mInstance->mData, &mStream, mStreamStatus);
+    // Jihad R7: the delivery site, as opposed to RecvNPP_DestroyStream which only queues it.
+    fprintf(stderr, "[jihad-npapi-child] NPP_DestroyStream status=%d rv=%d\n",
+            (int)mStreamStatus, (int)dsrv);
+    fflush(stderr);
   }
   if (DESTROYED == mDestroyPending && mNotifyPending) {
     NS_ASSERTION(mStreamNotify, "mDestroyPending but no mStreamNotify?");
