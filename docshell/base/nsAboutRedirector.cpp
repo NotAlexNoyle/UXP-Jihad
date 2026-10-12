@@ -52,7 +52,7 @@ static RedirEntry kRedirMap[] = {
   { "config", "chrome://global/content/config.xul", 0 },
   { "console", "chrome://global/content/console.xul", 0 },
   {
-    "credits", "http://www.palemoon.org/Contributors.shtml",
+    "credits", "https://net.riverstonerelay.jihad-browser/credits",
     nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT |
     nsIAboutModule::MAKE_LINKABLE
   },
