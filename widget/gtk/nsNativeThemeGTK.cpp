@@ -1838,6 +1838,14 @@ nsNativeThemeGTK::ThemeSupportsWidget(nsPresContext* aPresContext,
                                       nsIFrame* aFrame,
                                       uint8_t aWidgetType)
 {
+  // Jihad: headless (no X display, JIHAD_OFFSCREEN daemon on the device). Native
+  // GTK theming draws through gtk2drawing.c, which realizes GTK widgets
+  // (ensure_window_widget -> gtk_widget_realize -> gdk_window_new) and crashes
+  // without a display. Report no native-theme support so Gecko falls back to its
+  // own non-native control rendering. Controls look non-native; content is fine.
+  if (!gdk_display_get_default())
+    return false;
+
   if (IsWidgetTypeDisabled(mDisabledWidgetTypes, aWidgetType))
     return false;
 

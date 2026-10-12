@@ -1060,6 +1060,21 @@ nsLookAndFeel::Init()
     GdkColor colorValue;
     GdkColor *colorValuePtr;
 
+    // Jihad: headless (no X display, JIHAD_OFFSCREEN daemon on the device). The
+    // GTK theme cannot be queried; every gtk_invisible_new()/gtk_widget_realize()
+    // below would crash (gdk_window_new asserts 'GDK_IS_SCREEN'/'GDK_IS_WINDOW'
+    // and then a null-deref). Provide a default GtkStyle so GetColor()'s mStyle
+    // reads stay valid, and skip all widget realization. System colours fall back
+    // to GTK defaults; CSS-styled web content does not depend on them.
+    if (!gdk_display_get_default()) {
+#if (MOZ_WIDGET_GTK == 2)
+        if (!mStyle) {
+            mStyle = gtk_style_new();
+        }
+#endif
+        return;
+    }
+
 #if (MOZ_WIDGET_GTK == 2)
     NS_ASSERTION(!mStyle, "already initialized");
     // GtkInvisibles come with a refcount that is not floating
