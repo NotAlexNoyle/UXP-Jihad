@@ -5,6 +5,7 @@
 
 // Local Includes
 #include "nsDocShellTreeOwner.h"
+#include "nsIBadCertListener2.h"   // JIHAD: route cert errors to the embedder chrome
 #include "nsWebBrowser.h"
 
 // Helper Classes
@@ -141,6 +142,15 @@ nsDocShellTreeOwner::GetInterface(const nsIID& aIID, void** aSink)
 
   if (NS_SUCCEEDED(QueryInterface(aIID, aSink))) {
     return NS_OK;
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIBadCertListener2))) {
+    // JIHAD: the embedder's chrome is what implements this — see the matching comment in
+    // nsDocShell::GetInterface. Same forwarding shape as nsIWebBrowserChromeFocus below.
+    if (mWebBrowserChromeWeak != nullptr) {
+      return mWebBrowserChromeWeak->QueryReferent(aIID, aSink);
+    }
+    return mOwnerWin ? mOwnerWin->QueryInterface(aIID, aSink) : NS_NOINTERFACE;
   }
 
   if (aIID.Equals(NS_GET_IID(nsIWebBrowserChromeFocus))) {
