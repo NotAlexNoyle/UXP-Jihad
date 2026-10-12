@@ -9,6 +9,10 @@ SOURCES += [
     'plugin-container.cpp',
 ]
 
+# JihadPmLogSem.c lives here next to its only caller but is compiled by ipc/app, which is
+# where the plugin-container PROGRAM is linked; this directory only produces an archive that
+# that link does not use. See ipc/app/moz.build.
+
 include('/ipc/chromium/chromium-config.mozbuild')
 
 if CONFIG['OS_ARCH'] == 'WINNT':
