@@ -274,6 +274,13 @@ public:
                              InfallibleTArray<nsCString>& result,
                              bool firstMatchOnly);
 
+  // Jihad R7 (webOS): a snapshot of the live instances, for jihad_plugin_palm_spotlight.
+  // A COPY, not a reference: dispatching an event re-enters the plugin, which can run script
+  // and destroy an instance, and mInstances is mutated by that teardown.
+  const nsTArray<RefPtr<nsNPAPIPluginInstance>>& JihadRunningInstances() const {
+    return mInstances;
+  }
+
 private:
   friend class nsPluginUnloadRunnable;
 
