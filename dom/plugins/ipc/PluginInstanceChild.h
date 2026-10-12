@@ -641,6 +641,18 @@ private:
     // and p->getvalue return always false
     bool mIsTransparent;
 
+    // Jihad R7 (webOS): npPalmGainFocusEvent is a once-per-instance startup signal, but the
+    // setwindow that carries it runs again on every resize and scroll.
+    bool mJihadSentPalmGainFocus;
+
+public:
+    // Jihad R7 (webOS): repaint this instance from the host's own clock. See
+    // JihadGlibPumpTask::Run — a webOS plugin is not obliged to ask for repaints, because the
+    // host it was written for painted it as part of every page paint.
+    void JihadPalmRepaintTick();
+
+private:
+
     // Surface type optimized of parent process
     gfxSurfaceType mSurfaceType;
 

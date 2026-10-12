@@ -60,6 +60,9 @@ using namespace mozilla::ipc;
 using namespace mozilla::plugins;
 using namespace mozilla::widget;
 
+// Defined at the bottom of this file; see the NPN SYMBOL INTERPOSITION block there.
+namespace mozilla { namespace plugins { void JihadInstallNPNInterposition(); } }
+
 #if defined(XP_WIN)
 const wchar_t * kFlashFullscreenClass = L"ShockwaveFlashFullScreen";
 const wchar_t * kMozillaWindowClass = L"MozillaWindowClass";
@@ -232,6 +235,10 @@ PluginModuleChild::InitForChrome(const std::string& aPluginFilename,
 {
     NS_ASSERTION(aChannel, "need a channel");
 
+    // Point the exported NPN_* globals at the real implementations before any plugin can be
+    // loaded, so a plugin that resolves them as symbols reaches us rather than libWebKitLuna.
+    JihadInstallNPNInterposition();
+
     if (!InitGraphics())
         return false;
 
@@ -251,7 +258,11 @@ PluginModuleChild::InitForChrome(const std::string& aPluginFilename,
     nsPluginFile pluginFile(localFile);
 
     nsPluginInfo info = nsPluginInfo();
-    if (NS_FAILED(pluginFile.GetPluginInfo(info, &mLibrary))) {
+    nsresult jihadRv = pluginFile.GetPluginInfo(info, &mLibrary);
+    fprintf(stderr, "[jihad-npapi-child] GetPluginInfo rv=0x%x lib=%d\n",
+            (unsigned)jihadRv, (int)!!mLibrary);
+    fflush(stderr);
+    if (NS_FAILED(jihadRv)) {
         return false;
     }
 
@@ -1843,6 +1854,8 @@ bool
 PluginModuleChild::AnswerNP_Initialize(const PluginSettings& aSettings, NPError* rv)
 {
     *rv = DoNP_Initialize(aSettings);
+    fprintf(stderr, "[jihad-npapi-child] AnswerNP_Initialize rv=%d\n", (int)*rv);
+    fflush(stderr);
     return true;
 }
 
@@ -1882,6 +1895,8 @@ PluginModuleChild::DoNP_Initialize(const PluginSettings& aSettings)
 #  error Please implement me for your platform
 #endif
 
+    fprintf(stderr, "[jihad-npapi-child] DoNP_Initialize plugin returned %d\n", (int)result);
+    fflush(stderr);
     return result;
 }
 
@@ -2617,3 +2632,31 @@ PluginModuleChild::RecvNPP_SetValue_NPNVaudioDeviceChangeDetails(
 #endif
 }
 #endif // MOZ_ENABLE_NPAPI
+
+// ── NPN SYMBOL INTERPOSITION (Jihad, addons R7) ──────────────────────────────────────────
+//
+// The exported NPN_* globals themselves live in JihadNPNInterpose.cpp (they must, to escape
+// hidden visibility — see the long comment there). All that is needed here is to point them
+// at the same implementations the browser function table uses, which is done once the table
+// exists. Installed from a static initializer-free helper called by the child at startup.
+extern "C" {
+extern void  (*gJihadNPNInvalidateRect)(void*, void*);
+extern void* (*gJihadNPNCreateObject)(void*, void*);
+}
+
+namespace mozilla {
+namespace plugins {
+
+void JihadInstallNPNInterposition()
+{
+    const NPNetscapeFuncs& f = PluginModuleChild::sBrowserFuncs;
+    gJihadNPNInvalidateRect = (void(*)(void*, void*))f.invalidaterect;
+    gJihadNPNCreateObject   = (void*(*)(void*, void*))f.createobject;
+    fprintf(stderr, "[jihad-npapi-child] NPN interposition installed invalidaterect=%p "
+                    "createobject=%p\n",
+            (void*)f.invalidaterect, (void*)f.createobject);
+    fflush(stderr);
+}
+
+} // namespace plugins
+} // namespace mozilla
