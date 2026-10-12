@@ -752,8 +752,16 @@ pulse_stream_init(cubeb * context,
     WRAP(pa_stream_set_write_callback)(stm->output_stream, stream_write_callback, stm);
 
     battr = set_buffering_attribute(latency_frames, &stm->output_sample_spec);
+    /* Jihad/webOS: module-palm-policy powers the hardware codec route only for a stream created on
+       a named virtual sink (pmedia); a NULL/default sink lands on pcm_output and is muted to 0%.
+       When no explicit device was requested, honour JIHAD_PULSE_SINK so the device build can
+       target "pmedia". No effect on desktop (env unset -> NULL -> default sink, upstream behaviour). */
+    char const * jihad_out_sink = (char const *) output_device;
+    if (!jihad_out_sink) {
+      jihad_out_sink = getenv("JIHAD_PULSE_SINK");
+    }
     WRAP(pa_stream_connect_playback)(stm->output_stream,
-                                     output_device,
+                                     jihad_out_sink,
                                      &battr,
                                      PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING |
                                      PA_STREAM_START_CORKED | PA_STREAM_ADJUST_LATENCY,
