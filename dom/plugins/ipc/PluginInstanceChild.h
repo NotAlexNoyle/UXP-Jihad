@@ -141,6 +141,10 @@ protected:
     virtual bool
     RecvContentsScaleFactorChanged(const double& aContentsScaleFactor) override;
 
+    // Jihad: the host is driving the frame clock — draw one now. See PPluginInstance.ipdl.
+    virtual bool
+    RecvJihadRequestFrame() override;
+
     virtual bool
     AnswerNPP_Destroy(NPError* result) override;
 

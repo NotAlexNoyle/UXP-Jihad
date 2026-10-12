@@ -62,6 +62,49 @@ static uint64_t gJihadPalmDrawEvents = 0;
 // Defined in JihadNPNInterpose.cpp, which deliberately includes no NPAPI headers.
 extern "C" unsigned gJihadNPNInvalidateRectCalls;
 
+// ── WHICH CALL SITE ACTUALLY DRIVES PLUGIN DRAWS (Jihad, addons R7) ──────────────────────
+//
+// Three sessions have now attributed the plugin's draw rate to a specific clock by READING the
+// code, and every attribution was wrong. Patch 0029 finally put a counter on the request side
+// and the numbers did not agree with any of them: 3988 draws against 3072 host requests, with
+// the child's own timer provably stood down (one "frame clock -> HOST" transition, no fallback)
+// and Flash provably not self-invalidating (gJihadNPNInvalidateRectCalls stays 0). So roughly a
+// quarter of all draws come from a fourth place, and at an 8 ms tick that share DOMINATES.
+//
+// Every path to a draw funnels through AsyncShowPluginFrame, so tagging its call sites answers
+// the question directly rather than by elimination. Reported next to `palm draw`, which is the
+// count these have to add up to. Declared up here with the other file statics because the first
+// tagged site is in AnswerNPP_SetWindow, well above the frame-clock block further down.
+enum {
+    kJihadShowSetWindow = 0,   // AnswerNPP_SetWindow / AsyncSetWindow, accumulated rect
+    kJihadShowInvalidate,      // InvalidateRect reached from OUR host repaint tick
+    kJihadShowPluginSelf,      // InvalidateRect reached from the PLUGIN's own NPN_InvalidateRect
+    kJihadShowRetry,           // InvalidateRectDelayed's retry when ShowPluginFrame refused
+    kJihadShowBgUpdate,        // RecvUpdateBackground, background changed
+    kJihadShowBgUpdateTail,    // RecvUpdateBackground, unconditional tail
+    kJihadShowBgDestroy,       // background destroyer
+    kJihadShowSites
+};
+static uint32_t gJihadShowFrom[kJihadShowSites];
+static const char* const kJihadShowNames[kJihadShowSites] = {
+    "setwin", "hostinval", "plugininval", "retry", "bgupd", "bgtail", "bgdestroy"
+};
+
+// True only while JihadPalmRepaintTick's own InvalidateRect call is on the stack, so the two
+// producers can be told apart AT the shared funnel.
+//
+// WHY THIS EXISTS, and it invalidates a premise the port has carried since patch 0026:
+// gJihadNPNInvalidateRectCalls — the counter used to decide "the plugin never asks to be
+// repainted, so the host must drive it" — is STRUCTURALLY BLIND. It lives in
+// JihadNPNInterpose.cpp and only counts calls that bind the NPN_InvalidateRect SYMBOL. An
+// ordinary NPAPI plugin calls through the NPNetscapeFuncs table instead, which
+// PluginModuleChild fills with its own _invalidaterect (PluginModuleChild.cpp:986); that
+// forwards straight to InstCast(aNPP)->InvalidateRect (:1302-1310) and never touches the
+// interpose. So the counter can read 0 for the whole run while the plugin invalidates
+// constantly — which is exactly what was measured: 1344 host requests against 2662 invalidates
+// with the child's timer provably off (one "frame clock -> HOST", no fallback).
+static bool sJihadInHostRepaint = false;
+
 
 #ifdef MOZ_WIDGET_GTK
 
@@ -3571,6 +3614,7 @@ PluginInstanceChild::DoAsyncSetWindow(const gfxSurfaceType& aSurfaceType,
 #endif
 
     if (!mAccumulatedInvalidRect.IsEmpty()) {
+        gJihadShowFrom[kJihadShowSetWindow]++;
         AsyncShowPluginFrame();
     }
 }
@@ -4070,7 +4114,93 @@ PluginInstanceChild::JihadPalmRepaintTick()
     }
     NPRect windowRect = { 0, 0,
                           uint16_t(mWindow.height), uint16_t(mWindow.width) };
+    sJihadInHostRepaint = true;
     InvalidateRect(&windowRect);
+    sJihadInHostRepaint = false;
+}
+
+// ── HOST-DRIVEN FRAME CLOCK (Jihad, addons R7) ───────────────────────────────────────────
+//
+// When the daemon is pulling (it calls jihad_plugin_request_frame after each card frame it
+// publishes), the timer above must get out of the way, or the plugin has TWO drivers and the
+// extra draws are exactly the drift the pull exists to remove.
+//
+// The handoff is timestamp-based rather than a latch because there is no unregister: the daemon
+// can stop asking at any moment — the card is backgrounded (BrowserPageGoanna::freeze returns
+// early from maybePaint), the page navigates, the daemon is stopped or crashes — and a latched
+// plugin would then never paint again. So host-driven is a LEASE that must be renewed. If no
+// request arrives for kJihadHostDriveLeaseMs the timer resumes on its own.
+//
+// THE LEASE MUST EXCEED THE DAEMON'S WORST-CASE GAP BETWEEN REQUESTS, and the first version of
+// this got that wrong in a way that is worth keeping written down, because the symptom looked
+// like a mysterious third party rather than like a bug.
+//
+// The daemon does not ask again while a request is outstanding; it waits out
+// kJihadPluginReqTimeoutMs (250 ms) before re-asking. The lease here was 150 ms — SHORTER — so a
+// single late frame guaranteed the lease expired, the child resumed self-driving, and the two
+// clocks this patch exists to collapse were both running again. Measured on device before the
+// fix: the child logged HOST -> SELF -> HOST, and the invalidate counter split almost exactly in
+// half, 1856 requests from the host against 1846 from the child's own timer, summing to the 3702
+// total. The 23% of "unexplained" draws that sent an earlier session hunting through
+// RecvUpdateBackground were this, and the background paths were measured at exactly ZERO.
+//
+// So the invariant, not a tuned number: lease > request timeout + one grid period + margin.
+// 500 ms is 250 + 33 + slack. A card that really stopped publishing still resumes self-drawing
+// in half a second, which is well inside what a resume can absorb.
+static const uint32_t kJihadHostDriveLeaseMs = 500;
+static uint32_t sJihadLastHostRequestMs = 0;
+static bool sJihadEverHostDriven = false;
+
+static bool JihadHostIsDrivingFrames()
+{
+    bool driving = false;
+    if (sJihadEverHostDriven) {
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        // Unsigned subtraction, so the 32-bit PR_IntervalNow wrap is handled without a signed
+        // compare that would read as "lease expired" for one interval every wrap.
+        driving = (nowMs - sJihadLastHostRequestMs) < kJihadHostDriveLeaseMs;
+    }
+
+    // LOG EVERY TRANSITION. A watchdog that silently resumes self-driving would make a BROKEN
+    // pull look like "no change" in the frame numbers instead of "the feature is off" — the same
+    // trap family as an empty log passing every grep, and a wedged plugin reading as a pacing
+    // regression. Both of those cost real time in this tree already; this one is cheap to close.
+    static bool sWas = false;
+    if (driving != sWas) {
+        sWas = driving;
+        fprintf(stderr, "[jihad-npapi-child] frame clock -> %s\n",
+                driving ? "HOST (daemon pull)" : "SELF (timer; host lease expired)");
+        fflush(stderr);
+    }
+    return driving;
+}
+
+bool
+PluginInstanceChild::RecvJihadRequestFrame()
+{
+    sJihadEverHostDriven = true;
+    sJihadLastHostRequestMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+
+    // A plugin that drives itself gets Gecko's normal damage-driven painting, exactly as the
+    // timer path decides below; asking such a plugin for frames would double its draw rate.
+    if (gJihadNPNInvalidateRectCalls != 0) {
+        return true;
+    }
+
+    static uint64_t sHostFrames = 0;
+    static uint32_t sReportMs = 0;
+    if (!(++sHostFrames % 64)) {
+        uint32_t nowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        if (sReportMs) {
+            fprintf(stderr, "[jihad-npapi-child] host-driven: 64 requests in %ums\n",
+                    nowMs - sReportMs);
+            fflush(stderr);
+        }
+        sReportMs = nowMs;
+    }
+
+    JihadPalmRepaintTick();
+    return true;
 }
 
 namespace {
@@ -4081,8 +4211,12 @@ public:
     {
         int n = JihadPumpGlib(kJihadGlibPumpMaxIters);
 
+        // The pump itself keeps running at 16 ms whatever drives the frames — Flash's LS2
+        // socket, its timers and its audio sources all live on this GMainLoop, and starving
+        // them is what deadlocked startup before patch 0026. Only the REPAINT defers.
         static uint64_t sRepaintTicks = 0;
         if (sJihadPalmInstance && gJihadNPNInvalidateRectCalls == 0 &&
+            !JihadHostIsDrivingFrames() &&
             (++sRepaintTicks % JihadRepaintEveryTicks()) == 0) {
             sJihadPalmInstance->JihadPalmRepaintTick();
         }
@@ -4418,6 +4552,31 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
                     fprintf(stderr, "[jihad-npapi-child] palm draw: %u in %ums (%.1f fps)\n",
                             sDraws, nowMs - sLastReport,
                             sDraws * 1000.0 / double(nowMs - sLastReport));
+                    // WHICH SITE ASKED FOR THOSE DRAWS. These are requests to draw, not draws:
+                    // AsyncShowPluginFrame coalesces while an invalidate task is already pending,
+                    // so the sum is an UPPER bound on sDraws and the interesting number is the
+                    // SHARE each site holds, not the total. Printed on the same 2 s boundary so a
+                    // reader can line them up without correlating timestamps.
+                    {
+                        char buf[192];
+                        size_t n = 0;
+                        buf[0] = '\0';
+                        for (int i = 0; i < kJihadShowSites; ++i) {
+                            // Clamp rather than trust the running total: snprintf returns the
+                            // length it WANTED, so an overflow would make the next call pass a
+                            // negative size as size_t and write off the end.
+                            if (n < sizeof(buf) - 1) {
+                                int w = snprintf(buf + n, sizeof(buf) - n, " %s=%u",
+                                                 kJihadShowNames[i], gJihadShowFrom[i]);
+                                if (w > 0) {
+                                    n += size_t(w);
+                                    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+                                }
+                            }
+                            gJihadShowFrom[i] = 0;
+                        }
+                        fprintf(stderr, "[jihad-npapi-child]   show req:%s\n", buf);
+                    }
                     fflush(stderr);
                     sDraws = 0;
                     sLastReport = nowMs;
@@ -4919,6 +5078,7 @@ PluginInstanceChild::InvalidateRectDelayed(void)
     }
 
     if (!ShowPluginFrame()) {
+        gJihadShowFrom[kJihadShowRetry]++;
         AsyncShowPluginFrame();
     }
 }
@@ -4972,6 +5132,8 @@ PluginInstanceChild::InvalidateRect(NPRect* aInvalidRect)
         mAccumulatedInvalidRect.UnionRect(r, mAccumulatedInvalidRect);
         // If we are able to paint and invalidate sent, then reset
         // accumulated rectangle
+        gJihadShowFrom[sJihadInHostRepaint ? kJihadShowInvalidate
+                                          : kJihadShowPluginSelf]++;
         AsyncShowPluginFrame();
         return;
     }
@@ -5015,6 +5177,7 @@ PluginInstanceChild::RecvUpdateBackground(const SurfaceDescriptor& aBackground,
         IntSize bgSize = mBackground->GetSize();
         mAccumulatedInvalidRect.UnionRect(mAccumulatedInvalidRect,
                                           nsIntRect(0, 0, bgSize.width, bgSize.height));
+        gJihadShowFrom[kJihadShowBgUpdate]++;
         AsyncShowPluginFrame();
         return true;
     }
@@ -5024,6 +5187,7 @@ PluginInstanceChild::RecvUpdateBackground(const SurfaceDescriptor& aBackground,
 
     // This must be asynchronous, because we may be nested within RPC messages
     // which do not expect to receiving paint events.
+    gJihadShowFrom[kJihadShowBgUpdateTail]++;
     AsyncShowPluginFrame();
 
     return true;
@@ -5056,6 +5220,7 @@ PluginInstanceChild::RecvPPluginBackgroundDestroyerConstructor(
         // NB: we don't have to XSync here because only ShowPluginFrame()
         // uses mBackground, and it always XSyncs after finishing.
         mBackground = nullptr;
+        gJihadShowFrom[kJihadShowBgDestroy]++;
         AsyncShowPluginFrame();
     }
 
