@@ -150,6 +150,35 @@ bool EnsureNSSInitialized(EnsureNSSOperator op)
   static bool loading = false;
   static int32_t haveLoaded = 0;
 
+  // Jihad: in the embedding render daemon there is no early main-thread PSM init, so
+  // necko's SOCKET thread reaches here first on the first https load and the
+  // do_GetService(PSM) below would construct nsNSSComponent off the main thread — its
+  // ctor MOZ_RELEASE_ASSERT(NS_IsMainThread()) then aborts the process ("loads forever").
+  // Forward to the main thread synchronously (same as the content-process path above) so
+  // NSS constructs on the main thread; the socket thread then reuses the singleton.
+  //
+  // FAST PATH (critical): once NSS is loaded, an "ensure" op just needs to confirm that,
+  // which is a lock-free atomic read valid on ANY thread — so return immediately WITHOUT
+  // marshaling. Marshaling every ensure call floods the main thread with SyncRunnables on
+  // an https-heavy page (one per SSL socket op) and the load hangs/loops. Only the FIRST
+  // init (haveLoaded still 0) needs the main-thread round-trip.
+  if ((op == nssEnsure || op == nssEnsureOnChromeOnly || op == nssEnsureChromeOrContent) &&
+      PR_AtomicAdd(&haveLoaded, 0)) {
+    return true;
+  }
+  if (!NS_IsMainThread()) {
+    nsCOMPtr<nsIThread> mainThread;
+    if (NS_FAILED(NS_GetMainThread(getter_AddRefs(mainThread)))) {
+      return false;
+    }
+    bool result = false;
+    mozilla::SyncRunnable::DispatchToThread(mainThread,
+      new mozilla::SyncRunnable(NS_NewRunnableFunction([op, &result]() {
+        result = EnsureNSSInitialized(op);
+      })));
+    return result;
+  }
+
   switch (op)
   {
     // In following 4 cases we are protected by monitor of XPCOM component
@@ -1793,12 +1822,17 @@ nsNSSComponent::InitializeNSS()
   // pref has been set to "true", attempt to initialize with no DB.
   if (nocertdb || init_rv != SECSuccess) {
     init_rv = NSS_NoDB_Init(nullptr);
+    PRErrorCode prerr = PR_GetError();
+    fprintf(stderr, "[jihad-bs] NSS_NoDB_Init rv=%d PRerr=%d (%s) osErr=%d\n",
+            (int)init_rv, (int)prerr, PR_ErrorToName(prerr), (int)PR_GetOSError());
   }
 
   if (init_rv != SECSuccess) {
+    fprintf(stderr, "[jihad-bs] InitializeNSS FAILED (panicking)\n");
     MOZ_LOG(gPIPNSSLog, LogLevel::Error, ("could not initialize NSS - panicking\n"));
     return NS_ERROR_NOT_AVAILABLE;
   }
+  fprintf(stderr, "[jihad-bs] InitializeNSS OK\n");
 
   // ensure we have an initial value for the content signer root
   mContentSigningRootHash =
