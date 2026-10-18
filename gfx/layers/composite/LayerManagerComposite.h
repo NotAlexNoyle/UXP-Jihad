@@ -115,6 +115,20 @@ public:
     MOZ_CRASH("GFX: Use EndTransaction(aTimeStamp)");
     return false;
   }
+  // Jihad T-502: a transform applied to the whole tree at the root (the card's zoom and the
+  // visual viewport's residual offset), through ComputeEffectiveTransforms so every clip and
+  // scissor follows it.
+  void JihadSetWorldTransform(const gfx::Matrix4x4& aMatrix) { mJihadWorld = aMatrix; }
+  // Jihad T-502: the bounds of what the last UpdateAndRender found changed (empty when it drew
+  // nothing), so the daemon reads back only the rows that moved.
+  const gfx::IntRect& JihadLastInvalid() const { return mJihadLastInvalid; }   // what was composed
+  const gfx::IntRect& JihadLastChanged() const { return mJihadLastChanged; }   // what the tree changed
+  void JihadResetLastInvalid() { mJihadLastInvalid = mJihadLastChanged = gfx::IntRect(); }
+  // The rows the daemon is about to read: composed (cleared and drawn, scissored) together
+  // with what the tree changed, and nothing else. Empty: only what changed.
+  void JihadSetBand(const gfx::IntRect& aBand) { mJihadBand = aBand; }
+  bool JihadPartial() const { return mJihadPartialOn; }
+
   virtual void EndTransaction(DrawPaintedLayerCallback aCallback,
                               void* aCallbackData,
                               EndTransactionFlags aFlags = END_DEFAULT) override
@@ -353,6 +367,10 @@ private:
   bool mUnusedApzTransformWarning;
   bool mDisabledApzWarning;
   RefPtr<Compositor> mCompositor;
+  gfx::Matrix4x4 mJihadWorld;   // Jihad T-502
+  gfx::IntRect mJihadLastInvalid;   // Jihad T-502
+  gfx::IntRect mJihadLastChanged, mJihadBand;   // Jihad T-502
+  bool mJihadPartialOn = false;                  // this Render is a partial composite
   UniquePtr<LayerProperties> mClonedLayerTreeProperties;
 
   nsTArray<ImageCompositeNotification> mImageCompositeNotifications;

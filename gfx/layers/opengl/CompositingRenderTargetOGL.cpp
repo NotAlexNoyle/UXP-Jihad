@@ -19,7 +19,12 @@ CompositingRenderTargetOGL::~CompositingRenderTargetOGL()
 {
   if (mGL && mGL->MakeCurrent()) {
     mGL->fDeleteTextures(1, &mTextureHandle);
-    mGL->fDeleteFramebuffers(1, &mFBO);
+    // Jihad T-502: the window target made for each frame borrows the compositor's renderbuffer
+    // FBO; deleting it here (harmless for FBO 0) killed the target after the first frame and
+    // every later composite drew into nothing (black frames, rounds 6-16).
+    if (!mJihadBorrowedFBO) {
+      mGL->fDeleteFramebuffers(1, &mFBO);
+    }
   }
 }
 

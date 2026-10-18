@@ -482,7 +482,10 @@ private:
   DECL_GFX_PREF(Live, "layers.effect.contrast",                LayersEffectContrast, float, 0.0f);
   DECL_GFX_PREF(Live, "layers.effect.grayscale",               LayersEffectGrayscale, bool, false);
   DECL_GFX_PREF(Live, "layers.effect.invert",                  LayersEffectInvert, bool, false);
-  DECL_GFX_PREF(Once, "layers.enable-tiles",                   LayersTilesEnabled, bool, false);
+  // Jihad T-502: tiled painted layers by default (a once-only pref the bundle's goanna.js cannot
+  // reach in time): a scrolled page re-uploads only the tiles that changed, not the whole
+  // three-viewport content layer (9 MB, 60-100 ms a scroll step on the Adreno 220).
+  DECL_GFX_PREF(Once, "layers.enable-tiles",                   LayersTilesEnabled, bool, true);
   DECL_GFX_PREF(Live, "layers.flash-borders",                  FlashLayerBorders, bool, false);
   DECL_GFX_PREF(Once, "layers.force-shmem-tiles",              ForceShmemTiles, bool, false);
   DECL_GFX_PREF(Live, "layers.frame-counter",                  DrawFrameCounter, bool, false);

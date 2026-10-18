@@ -125,6 +125,11 @@ public:
       return true;
     }
 
+    // Jihad (T-502): LAYERS_OPENGL through GLContextProviderEGL, this build's default
+    // provider, when hardware compositing is enabled; the base class lists nothing and the
+    // compositor would be the BasicCompositor.
+    virtual void GetAcceleratedCompositorBackends(nsTArray<mozilla::layers::LayersBackend>& aBackends) override;
+
 #ifdef GL_PROVIDER_GLX
     already_AddRefed<mozilla::gfx::VsyncSource> CreateHardwareVsyncSource() override;
 #endif

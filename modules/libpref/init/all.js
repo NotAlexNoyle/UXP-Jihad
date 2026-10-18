@@ -4411,7 +4411,7 @@ pref("layers.draw-borders", false);
 pref("layers.draw-tile-borders", false);
 pref("layers.draw-bigimage-borders", false);
 pref("layers.frame-counter", false);
-pref("layers.enable-tiles", false);
+pref("layers.enable-tiles", true);   // Jihad T-502: tiled content layers (see gfxPrefs.h)
 pref("layers.single-tile.enabled", true);
 pref("layers.low-precision-buffer", false);
 pref("layers.progressive-paint", false);

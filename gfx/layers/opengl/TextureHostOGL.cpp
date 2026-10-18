@@ -97,10 +97,25 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
 {
   GLContext *gl = mCompositor->gl();
   MOZ_ASSERT(gl);
+  // Jihad T-502 device rounds: where a texture source's update spends its time
+  const TimeStamp jihadT0 = TimeStamp::Now();
+  TimeStamp jihadT1, jihadT2;
+  bool jihadCreated = false;
+  struct JihadSrcLog { const TimeStamp& t0; TimeStamp& t1; TimeStamp& t2; bool* created; ~JihadSrcLog() {
+    static uint32_t sN = 0;
+    const TimeStamp t3 = TimeStamp::Now();
+    const double all = (t3 - t0).ToMilliseconds();
+    if (sN++ < 30 || all >= 8.0) {
+      if (sN < 300) fprintf(stderr, "[jihad-gpu] texture source update: make current %.1f ms, %s %.1f ms, upload %.1f ms (all %.1f)\n",
+                            t1.IsNull() ? 0.0 : (t1 - t0).ToMilliseconds(), *created ? "texture created" : "texture kept",
+                            (t1.IsNull() || t2.IsNull()) ? 0.0 : (t2 - t1).ToMilliseconds(), t2.IsNull() ? 0.0 : (t3 - t2).ToMilliseconds(), all);
+    }
+  } } jihadSrcLog{jihadT0, jihadT1, jihadT2, &jihadCreated};
   if (!gl || !gl->MakeCurrent()) {
     NS_WARNING("trying to update TextureImageTextureSourceOGL without a GLContext");
     return false;
   }
+  jihadT1 = TimeStamp::Now();
   if (!aSurface) {
     gfxCriticalError() << "Invalid surface for OGL update";
     return false;
@@ -108,12 +123,23 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
   MOZ_ASSERT(aSurface);
 
   IntSize size = aSurface->GetSize();
+  // Jihad T-502 (JIHAD_GPU_FRESH_TEX): a fresh GL texture for every upload. On the Adreno 220
+  // an upload into a texture the last composite read costs a GPU sync (~18 ms for a 256 KB
+  // tile, 2026-10-17 run 68); a new name is written without waiting and the old one is freed
+  // by the driver once the GPU is done with it.
+  static const bool sFreshTexture = getenv("JIHAD_GPU_FRESH_TEX") != nullptr;
+  if (sFreshTexture && mTexImage && !aSrcOffset) {
+    mTexImage = nullptr;
+  }
   if (!mTexImage ||
       (mTexImage->GetSize() != size && !aSrcOffset) ||
       mTexImage->GetContentType() != gfx::ContentForFormat(aSurface->GetFormat())) {
     if (mFlags & TextureFlags::DISALLOW_BIGIMAGE) {
       GLint maxTextureSize;
+      const TimeStamp jihadG0 = TimeStamp::Now();
       gl->fGetIntegerv(LOCAL_GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+      { static uint32_t sN = 0; const double ms = (TimeStamp::Now() - jihadG0).ToMilliseconds();
+        if (ms >= 3.0 && sN++ < 40) fprintf(stderr, "[jihad-gpu] glGetIntegerv(MAX_TEXTURE_SIZE): %.1f ms\n", ms); }
       if (size.width > maxTextureSize || size.height > maxTextureSize) {
         NS_WARNING("Texture exceeds maximum texture size, refusing upload");
         return false;
@@ -148,7 +174,9 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
       // we care about below.
       mTexImage->Resize(size);
     }
+    jihadCreated = true;
   }
+  jihadT2 = TimeStamp::Now();
 
   mTexImage->UpdateFromDataSource(aSurface, aDestRegion, aSrcOffset);
 

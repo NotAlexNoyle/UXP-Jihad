@@ -428,7 +428,7 @@ LayerManagerComposite::UpdateAndRender()
 
   if (mClonedLayerTreeProperties) {
     // Effective transforms are needed by ComputeDifferences().
-    mRoot->ComputeEffectiveTransforms(gfx::Matrix4x4());
+    mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);   // Jihad T-502: the identity unless set
     didEffectiveTransforms = true;
 
     // We need to compute layer tree differences even if we're not going to
@@ -463,9 +463,22 @@ LayerManagerComposite::UpdateAndRender()
     mInvalidRegion.SetEmpty();
   }
 
+  // Jihad T-502: what the tree changed is reported as such; the rows the daemon will read are
+  // composed as well (a partial, scissored composite covers exactly the rows read back).
+  mJihadLastChanged = invalid.GetBounds();
+  mJihadPartialOn = false;
+  if (!mJihadBand.IsEmpty() && !mTarget) {
+    invalid.Or(invalid, mJihadBand);
+    mJihadPartialOn = true;
+  } else if (!mTarget && !mJihadLastChanged.IsEmpty() && mClonedLayerTreeProperties &&
+             !invalid.Contains(mRenderBounds)) {
+    mJihadPartialOn = true;   // only what changed, when that is less than the frame
+  }
   if (invalid.IsEmpty() && !mWindowOverlayChanged) {
     // Composition requested, but nothing has changed. Don't do any work.
     mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());
+    mJihadLastInvalid = mJihadLastChanged = gfx::IntRect();   // Jihad T-502: nothing to read back
+    mJihadPartialOn = false;
     return;
   }
 
@@ -476,9 +489,10 @@ LayerManagerComposite::UpdateAndRender()
   if (!didEffectiveTransforms) {
     // The results of our drawing always go directly into a pixel buffer,
     // so we don't need to pass any global transform here.
-    mRoot->ComputeEffectiveTransforms(gfx::Matrix4x4());
+    mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);   // Jihad T-502: the identity unless set
   }
 
+  mJihadLastInvalid = invalid.GetBounds();   // Jihad T-502
   Render(invalid, opaque);
   mGeometryChanged = false;
   mWindowOverlayChanged = false;
@@ -901,7 +915,16 @@ LayerManagerComposite::Render(const nsIntRegion& aInvalidRegion, const nsIntRegi
   CompositorBench(mCompositor, bounds);
 
   MOZ_ASSERT(mRoot->GetOpacity() == 1);
-  if (mRoot->GetClipRect()) {
+  if (mJihadPartialOn) {
+    // Jihad T-502: a partial composite, clipped (and cleared) to what is being read back
+    IntRect rect = aInvalidRegion.GetBounds().Intersect(bounds);
+    if (mRoot->GetClipRect()) {
+      const ParentLayerIntRect& rc = *mRoot->GetClipRect();
+      rect = rect.Intersect(IntRect(rc.x, rc.y, rc.width, rc.height));
+    }
+    clipRect = ParentLayerIntRect(rect.x, rect.y, rect.width, rect.height);
+    mCompositor->BeginFrame(aInvalidRegion, &rect, bounds, aOpaqueRegion, nullptr, &actualBounds);
+  } else if (mRoot->GetClipRect()) {
     clipRect = *mRoot->GetClipRect();
     IntRect rect(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
     mCompositor->BeginFrame(aInvalidRegion, &rect, bounds, aOpaqueRegion, nullptr, &actualBounds);

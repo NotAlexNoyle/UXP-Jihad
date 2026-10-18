@@ -21,6 +21,16 @@
 #include "nsIWidgetListener.h"
 #include "imgIContainer.h"
 #include "nsView.h"
+#include "nsViewManager.h"        // T-502: the root view for PresShell::Paint
+#include "mozilla/TimeStamp.h"
+#include "mozilla/layers/CompositorBridgeParent.h"   // T-502
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/layers/CompositorSession.h"
+#include "mozilla/Monitor.h"
+#include "nsPIDOMWindow.h"   // T-502 device rounds
+#include "nsIDocument.h"   // T-502 device rounds
+#include "mozilla/layers/CompositorOGL.h"   // T-502: JihadFrameRequest
+#include "base/task.h"
 // Jihad offscreen render-document support:
 #include "gfxContext.h"
 #include "nsIDocShell.h"
@@ -112,6 +122,7 @@ PuppetWidget::PuppetWidget(TabChild* aTabChild)
 
 PuppetWidget::~PuppetWidget()
 {
+  JihadComposeAbandonAll();   // T-502
   MOZ_COUNT_DTOR(PuppetWidget);
 
   Destroy();
@@ -152,6 +163,7 @@ PuppetWidget::InfallibleCreate(nsIWidget* aParent,
   if (parent) {
     parent->SetChild(this);
     mLayerManager = parent->GetLayerManager();
+    mJihadSharedLayerManager = true;
   }
   else {
     Resize(mBounds.x, mBounds.y, mBounds.width, mBounds.height, false);
@@ -214,7 +226,11 @@ PuppetWidget::Destroy()
   }
   mMemoryPressureObserver = nullptr;
   mChild = nullptr;
-  if (mLayerManager) {
+  // Jihad T-502: a child widget shares the parent's layer manager (Create above). Destroying
+  // it here left the parent with a ClientLayerManager whose widget was null, and the next
+  // compose crashed in BeginTransactionWithTarget (the view re-creates its child widget on a
+  // size change). The parent destroys it; the child only drops its reference.
+  if (mLayerManager && !mJihadSharedLayerManager) {
     mLayerManager->Destroy();
   }
   mLayerManager = nullptr;
@@ -634,9 +650,27 @@ PuppetWidget::GetLayerManager(PLayerTransactionChild* aShadowManager,
 {
   if (!mLayerManager) {
     if (JihadOffscreen()) {
-      // Jihad: no compositor/IPC — paint on this thread with a BasicLayerManager
-      // into mDrawTarget (see PuppetWidget::Paint LAYERS_BASIC branch).
-      mLayerManager = CreateBasicLayerManager();
+      if (JihadGpuCompositor() && !mJihadCompositorTried && !mTabChild &&
+          gfxPlatform::UsesOffMainThreadCompositing()) {
+        // Jihad T-502: an in-process compositor behind a ClientLayerManager. Tried once: on
+        // failure CreateCompositor leaves mLayerManager null and the software path below
+        // takes over, so a device whose EGL refuses still paints.
+        mJihadCompositorTried = true;
+        CreateCompositor(mBounds.width, mBounds.height);
+        fprintf(stderr, "[jihad-gpu] compositor %s for %dx%d (compositor backend %d)\n",
+                mLayerManager ? "created" : "NOT created: software layers",
+                mBounds.width, mBounds.height,
+                mLayerManager ? (int)mLayerManager->GetCompositorBackendType() : -1);
+      }
+      if (!mLayerManager) {
+        if (JihadGpuCompositor() && !mJihadCompositorTried) {
+          fprintf(stderr, "[jihad-gpu] compositor not attempted: OMTC %s, TabChild %p\n",
+                  gfxPlatform::UsesOffMainThreadCompositing() ? "on" : "off", (void*)mTabChild);
+        }
+        // Jihad: no compositor/IPC — paint on this thread with a BasicLayerManager
+        // into mDrawTarget (see PuppetWidget::Paint LAYERS_BASIC branch).
+        mLayerManager = CreateBasicLayerManager();
+      }
     } else {
       mLayerManager = new ClientLayerManager(this);
     }
@@ -782,6 +816,285 @@ PuppetWidget::JihadRenderDocument(nsIDocShell* aDocShell, double aZoom,
 // C entry points for the frozen-API render daemon. Exported from libxul so the
 // daemon (which cannot see internal classes like PuppetWidget) can create an
 // offscreen widget, hand it to nsIBaseWindow::InitWindow as the parent nsIWidget,
+/* static */ bool
+PuppetWidget::JihadGpuCompositor()
+{
+  static const bool sOn = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  return sOn;
+}
+
+} // namespace widget
+} // namespace mozilla
+// T-502: one frame pulled from the compositor thread. Heap-allocated and owned by whichever side
+// finishes last, so a waiter that gives up (abandoned) leaves nothing dangling for the task.
+// Global, as PuppetWidget.h forward-declares it.
+struct JihadReadJob {
+  mozilla::layers::CompositorBridgeParent* bridge;
+  uint8_t* dest; int stride, w, h; float scale, offX, offY;
+  int rowLo, rowHi;      // the rows the daemon asked for, top-down ((0,0) = none)
+  int invLo, invHi;      // the rows the composite changed
+  uint32_t token;
+  mozilla::TimeStamp posted;   // device rounds: the compositor loop's queue delay
+  mozilla::layers::JihadFrameRequest req;   // what the compositor and the read thread work on
+  mozilla::Monitor mon;
+  bool done, ok, abandoned;
+  JihadReadJob(mozilla::layers::CompositorBridgeParent* b, uint8_t* d, int st, int wi, int he, float sc, float ox, float oy, int lo, int hi, uint32_t t)
+    : bridge(b), dest(d), stride(st), w(wi), h(he), scale(sc), offX(ox), offY(oy), rowLo(lo), rowHi(hi), invLo(0), invHi(0), token(t),
+      mon("jihad-compose"), done(false), ok(false), abandoned(false) {}
+};
+namespace mozilla {
+namespace widget {
+namespace {
+// the read thread (or the compositor thread, when the read could not be handed off) finished
+void JihadJobFinish(JihadReadJob* job, bool ok)
+{
+  bool abandoned;
+  {
+    mozilla::MonitorAutoLock lock(job->mon);
+    job->ok = ok; job->invLo = job->req.invLo; job->invHi = job->req.invHi; job->done = true; abandoned = job->abandoned;
+    job->mon.Notify();
+  }
+  if (abandoned) {
+    delete job;
+  }
+}
+void JihadJobDone(mozilla::layers::JihadFrameRequest* req)
+{
+  JihadJobFinish(static_cast<JihadReadJob*>(req->cookie), req->ok);
+}
+void JihadReadOnCompositorThread(JihadReadJob* job)
+{
+  const mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
+  job->req.dest = job->dest; job->req.stride = job->stride; job->req.w = job->w; job->req.h = job->h;
+  job->req.lo = job->rowLo; job->req.hi = job->rowHi;
+  job->req.done = &JihadJobDone; job->req.cookie = job;
+  const bool started = job->bridge->JihadComposeAndRead(&job->req, job->scale, job->offX, job->offY);
+  static uint32_t sN = 0;
+  if (sN++ < 30 || (sN % 50) == 0) {
+    fprintf(stderr, "[jihad-gpu] job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n", job->token,
+            (t0 - job->posted).ToMilliseconds(), (mozilla::TimeStamp::Now() - t0).ToMilliseconds());
+  }
+  if (!started) {
+    JihadJobFinish(job, false);
+  }
+}
+} // namespace
+mozilla::layers::CompositorBridgeParent*
+PuppetWidget::JihadBridge()
+{
+  return mCompositorSession ? mCompositorSession->GetInProcessBridge() : nullptr;
+}
+
+uint32_t
+PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride,
+                                int aWidth, int aHeight, int aRowLo, int aRowHi)
+{
+  if (!aDocShell || !aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
+    return 0;
+  }
+  nsCOMPtr<nsIPresShell> presShell = aDocShell->GetPresShell();
+  if (!presShell) {
+    return 0;
+  }
+  presShell->FlushPendingNotifications(Flush_Layout);
+  nsViewManager* vm = presShell->GetViewManager();
+  nsView* root = vm ? vm->GetRootView() : nullptr;
+  nsIWidget* viewWidget = root ? root->GetWidget() : nullptr;
+  if (!viewWidget) {
+    return 0;
+  }
+  LayerManager* lm = viewWidget->GetLayerManager();
+  ClientLayerManager* clm = lm ? lm->AsClientLayerManager() : nullptr;
+  mozilla::layers::CompositorBridgeParent* bridge = JihadBridge();
+  if (!clm || !bridge) {
+    return 0;
+  }
+  MessageLoop* loop = mozilla::layers::CompositorThreadHolder::Loop();
+  if (!loop) {
+    return 0;
+  }
+  mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
+  nsRegion dirty(root->GetDimensions());
+  presShell->Paint(root, dirty, nsIPresShell::PAINT_LAYERS);
+  mozilla::TimeStamp t1 = mozilla::TimeStamp::Now();
+  static uint32_t sFrames = 0;
+  if (sFrames < 20 || (sFrames % 50) == 0) {
+    fprintf(stderr, "[jihad-gpu] frame %u: layers %.1f ms, posted (rows %d..%d asked)\n",
+            sFrames, (t1 - t0).ToMilliseconds(), aRowLo, aRowHi);
+  }
+  if (sFrames == 5 || (sFrames % 200) == 0) {
+    // T-502 device rounds: every flag that throttles the page's JavaScript (timers to a second,
+    // requestAnimationFrame to a frame a second)
+    nsIDocument* doc = presShell->GetDocument();
+    bool dsActive = false;
+    aDocShell->GetIsActive(&dsActive);
+    nsIFrame* rootFrame = presShell->GetRootFrame();
+    nsIFrame* displayRoot = rootFrame ? nsLayoutUtils::GetDisplayRootFrame(rootFrame) : nullptr;
+    nsPIDOMWindowOuter* win = aDocShell->GetWindow();
+    fprintf(stderr, "[jihad-gpu] activity: docshell %s, pres shell %s, document %s, frame requests %s, painted-pres-shell %d, window %s\n",
+            dsActive ? "active" : "INACTIVE", presShell->IsActive() ? "active" : "INACTIVE",
+            doc && doc->Hidden() ? "HIDDEN" : "visible",
+            doc && doc->ShouldThrottleFrameRequests() ? "THROTTLED" : "full rate",
+            (int)(displayRoot && displayRoot->DidPaintPresShell(presShell)),
+            win && win->IsBackground() ? "BACKGROUND" : "foreground");
+  }
+  ++sFrames;
+  uint32_t token = mJihadNextToken++;
+  if (mJihadNextToken == 0) {
+    mJihadNextToken = 1;
+  }
+  JihadReadJob* job = new JihadReadJob(bridge, static_cast<uint8_t*>(aDest), aStride, aWidth, aHeight,
+                                       mJihadScale, mJihadOffX, mJihadOffY, aRowLo, aRowHi, token);
+  job->posted = mozilla::TimeStamp::Now();
+  mJihadJobs.push_back(job);
+  loop->PostTask(NewRunnableFunction(&JihadReadOnCompositorThread, job));
+  return token;
+}
+
+int
+PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aInvLo, int* aInvHi)
+{
+  JihadReadJob* job = nullptr;
+  size_t at = 0;
+  for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+    if (mJihadJobs[i]->token == aToken) { job = mJihadJobs[i]; at = i; break; }
+  }
+  if (!job) {
+    return -1;
+  }
+  bool finished = false, ok = false;
+  {
+    mozilla::MonitorAutoLock lock(job->mon);
+    if (aWait) {
+      const mozilla::TimeStamp deadline = mozilla::TimeStamp::Now() + mozilla::TimeDuration::FromSeconds(3);
+      while (!job->done) {
+        mozilla::TimeDuration left = deadline - mozilla::TimeStamp::Now();
+        if (left <= mozilla::TimeDuration()) {
+          break;
+        }
+        lock.Wait(PR_MillisecondsToInterval((uint32_t)left.ToMilliseconds()));
+      }
+    }
+    if (job->done) {
+      finished = true; ok = job->ok;
+      if (aInvLo) *aInvLo = job->invLo;
+      if (aInvHi) *aInvHi = job->invHi;
+    } else if (!aWait && job->req.composed) {
+      return 2;   // composed: the read thread has it; the next frame may be started
+    } else if (aWait) {
+      job->abandoned = true;
+      fprintf(stderr, "[jihad-gpu] compose: no answer from the compositor thread in 3 s\n");
+    }
+  }
+  if (finished) {
+    mJihadJobs.erase(mJihadJobs.begin() + at);
+    delete job;
+    return ok ? 1 : -1;
+  }
+  if (aWait) {
+    mJihadJobs.erase(mJihadJobs.begin() + at);   // abandoned: the task frees it
+    return -1;
+  }
+  return 0;
+}
+
+void
+PuppetWidget::JihadComposeForget(uint32_t aToken)
+{
+  for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+    JihadReadJob* job = mJihadJobs[i];
+    if (job->token != aToken) {
+      continue;
+    }
+    bool done;
+    {
+      mozilla::MonitorAutoLock lock(job->mon);
+      done = job->done;
+      if (!done) job->abandoned = true;
+    }
+    mJihadJobs.erase(mJihadJobs.begin() + i);
+    if (done) delete job;
+    return;
+  }
+}
+
+void
+PuppetWidget::JihadComposeAbandonAll()
+{
+  for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+    JihadReadJob* job = mJihadJobs[i];
+    bool done;
+    {
+      mozilla::MonitorAutoLock lock(job->mon);
+      done = job->done;
+      if (!done) job->abandoned = true;
+    }
+    if (done) delete job;
+  }
+  mJihadJobs.clear();
+}
+
+bool
+PuppetWidget::JihadComposeTo(nsIDocShell* aDocShell, void* aDest, int aStride,
+                             int aWidth, int aHeight)
+{
+  static const bool sSnapshot = getenv("JIHAD_GPU_SNAPSHOT") != nullptr;
+  if (sSnapshot) {
+    // the round-5 snapshot road, kept for comparison
+    if (!aDocShell || !aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
+      return false;
+    }
+    nsCOMPtr<nsIPresShell> presShell = aDocShell->GetPresShell();
+    if (!presShell) {
+      return false;
+    }
+    presShell->FlushPendingNotifications(Flush_Layout);
+    nsViewManager* vm = presShell->GetViewManager();
+    nsView* root = vm ? vm->GetRootView() : nullptr;
+    nsIWidget* viewWidget = root ? root->GetWidget() : nullptr;
+    if (!viewWidget) {
+      return false;
+    }
+    LayerManager* lm = viewWidget->GetLayerManager();
+    ClientLayerManager* clm = lm ? lm->AsClientLayerManager() : nullptr;
+    if (!clm) {
+      return false;
+    }
+    mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
+    nsRegion dirty(root->GetDimensions());
+    presShell->Paint(root, dirty, nsIPresShell::PAINT_LAYERS);
+    mozilla::TimeStamp t1 = mozilla::TimeStamp::Now();
+    RefPtr<DrawTarget> dt = Factory::CreateDrawTargetForData(
+        BackendType::CAIRO, static_cast<unsigned char*>(aDest),
+        IntSize(aWidth, aHeight), aStride, SurfaceFormat::B8G8R8A8);
+    if (!dt || !dt->IsValid()) {
+      return false;
+    }
+    dt->FillRect(mozilla::gfx::Rect(0, 0, aWidth, aHeight),
+                 mozilla::gfx::ColorPattern(mozilla::gfx::Color(1.f, 1.f, 1.f, 1.f)));
+    RefPtr<gfxContext> ctx = gfxContext::CreateOrNull(dt);
+    if (!ctx) {
+      return false;
+    }
+    bool okSnap = false;
+    if (clm->BeginTransactionWithTarget(ctx)) {
+      okSnap = clm->EndEmptyTransaction();
+    }
+    static uint32_t sSnapFrames = 0;
+    if (sSnapFrames++ < 20) {
+      fprintf(stderr, "[jihad-gpu] snapshot road frame %u: layers %.1f ms, snapshot %.1f ms, ok=%d\n",
+              sSnapFrames, (t1 - t0).ToMilliseconds(), (mozilla::TimeStamp::Now() - t1).ToMilliseconds(), (int)okSnap);
+    }
+    return okSnap;
+  }
+  uint32_t token = JihadComposeStart(aDocShell, aDest, aStride, aWidth, aHeight, 0, aHeight);
+  if (!token) {
+    return false;
+  }
+  int lo = 0, hi = 0;
+  return JihadComposePoll(token, true, &lo, &hi) > 0;
+}
+
 // drive a paint, and read the rendered ARGB32 pixels into its shared buffer.
 extern "C" {
 
@@ -967,6 +1280,67 @@ jihad_offscreen_render_region(nsIWidget* /*aWidget*/, nsIDocShell* aDocShell, do
     }
   }
   return true;
+}
+
+// T-502: paint the document as layers and fetch the frame the in-process compositor composes,
+// into aDest (B8G8R8A8, aStride bytes per row). False when the widget has no compositor (the
+// CPU exports above are then the path), or nothing is laid out yet.
+MOZ_EXPORT bool
+jihad_offscreen_compose(nsIWidget* aWidget, nsIDocShell* aDocShell, void* aDest, int aStride,
+                        int aWidth, int aHeight)
+{
+  if (!aWidget) {
+    return false;
+  }
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposeTo(aDocShell, aDest, aStride,
+                                                             aWidth, aHeight);
+}
+
+// T-502: the frame in two halves (see PuppetWidget::JihadComposeStart).
+MOZ_EXPORT uint32_t
+jihad_offscreen_compose_start(nsIWidget* aWidget, nsIDocShell* aDocShell, void* aDest, int aStride,
+                              int aWidth, int aHeight, int aRowLo, int aRowHi)
+{
+  if (!aWidget) {
+    return 0;
+  }
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposeStart(aDocShell, aDest, aStride, aWidth, aHeight, aRowLo, aRowHi);
+}
+MOZ_EXPORT int
+jihad_offscreen_compose_poll(nsIWidget* aWidget, uint32_t aToken, int* aInvLo, int* aInvHi)
+{
+  if (!aWidget) {
+    return -1;
+  }
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposePoll(aToken, false, aInvLo, aInvHi);
+}
+MOZ_EXPORT void
+jihad_offscreen_compose_forget(nsIWidget* aWidget, uint32_t aToken)
+{
+  if (aWidget) {
+    static_cast<PuppetWidget*>(aWidget)->JihadComposeForget(aToken);
+  }
+}
+// T-502: the card's zoom and the visual viewport's residual offset (CSS px), applied by the
+// compositor to the whole layer tree.
+MOZ_EXPORT void
+jihad_offscreen_set_view(nsIWidget* aWidget, double aScale, double aOffsetX, double aOffsetY)
+{
+  if (aWidget) {
+    static_cast<PuppetWidget*>(aWidget)->JihadSetView(aScale, aOffsetX, aOffsetY);
+  }
+}
+
+// T-502: how many composites the compositor has asked for (layer updates, animations); the
+// daemon pulls a frame whenever this moves. 0 without a compositor.
+MOZ_EXPORT uint32_t
+jihad_offscreen_compositor_seq(nsIWidget* aWidget)
+{
+  if (!aWidget) {
+    return 0;
+  }
+  mozilla::layers::CompositorBridgeParent* bridge = static_cast<PuppetWidget*>(aWidget)->JihadBridge();
+  return bridge ? bridge->JihadRequests() : 0;
 }
 
 // Composite every OPEN XUL popup over an already-painted buffer.
@@ -1746,8 +2120,12 @@ PuppetWidget::Paint()
 #endif
 
     if (mozilla::layers::LayersBackend::LAYERS_CLIENT == mLayerManager->GetBackendType()) {
-      // Do nothing, the compositor will handle drawing
-      if (mTabChild) {
+      if (JihadOffscreen()) {
+        // Jihad T-502: no TabChild drives painting here; paint the layer tree (a transaction
+        // forwarded to the in-process compositor). JihadComposeTo fetches the frame.
+        GetCurrentWidgetListener()->PaintWindow(this, region);
+      } else if (mTabChild) {
+        // Do nothing, the compositor will handle drawing
         mTabChild->NotifyPainted();
       }
     } else if (mozilla::layers::LayersBackend::LAYERS_BASIC == mLayerManager->GetBackendType()) {

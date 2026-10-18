@@ -13,7 +13,9 @@
 #include "OGLShaderProgram.h"           // for ShaderProgramOGL, etc
 #include "Units.h"                      // for ScreenPoint
 #include "mozilla/Assertions.h"         // for MOZ_ASSERT, etc
-#include "mozilla/Attributes.h"         // for override, final
+#include "mozilla/Attributes.h"
+#include "mozilla/Monitor.h"          // Jihad T-502
+#include "mozilla/Atomics.h"         // for override, final
 #include "mozilla/RefPtr.h"             // for already_AddRefed, RefPtr
 #include "mozilla/gfx/2D.h"             // for DrawTarget
 #include "mozilla/gfx/BaseSize.h"       // for BaseSize
@@ -35,6 +37,7 @@
 
 class nsIWidget;
 
+namespace base { class Thread; }   // Jihad T-502
 namespace mozilla {
 
 namespace layers {
@@ -148,6 +151,20 @@ protected:
 
 // If you want to make this class not final, first remove calls to virtual
 // methods (Destroy) that are made in the destructor.
+// Jihad T-502: one frame's readback, owned by the caller until done() has run.
+struct JihadFrameRequest {
+  uint8_t* dest = nullptr;
+  int stride = 0, w = 0, h = 0;
+  int lo = 0, hi = 0;                  // the rows to read, top-down ((0,0) = every row)
+  int target = 0;                      // which window target holds the frame (the compositor fills it)
+  int invLo = 0, invHi = 0;            // the rows the composite changed (the compositor fills them)
+  void* fence = nullptr;               // the EGL fence after the compose, or null (glFinish was used)
+  mozilla::Atomic<bool> composed{false};   // the compose is issued; the read is pending
+  bool ok = false;
+  void (*done)(JihadFrameRequest*) = nullptr;
+  void* cookie = nullptr;
+};
+
 class CompositorOGL final : public Compositor
 {
   typedef mozilla::gl::GLContext GLContext;
@@ -167,6 +184,23 @@ protected:
 
 public:
   virtual CompositorOGL* AsCompositorOGL() override { return this; }
+
+  // Jihad T-502: the window render target is a renderbuffer-backed FBO on the pbuffer context
+  // (a glReadPixels from it is twice as fast as from the pbuffer, and thirty times faster than
+  // from a texture-backed one on the Adreno 220); JihadReadFrame reads the frame's top-left
+  // aWidth x aHeight into aDest as B8G8R8A8 (RGBA read, swizzled in place).
+  GLuint JihadWindowFBO() const { return mJihadWindowFBO; }
+  bool JihadIsWindowTarget() const;
+  // rows [aRowLo, aRowHi) of the frame, top-down; (0, 0) = every row
+  bool JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeight, int aRowLo = 0, int aRowHi = 0);
+  // The asynchronous frame: SelectTarget before the compose picks the free window target,
+  // ReadAsync after it fences the compose and hands the target to the read thread, which reads
+  // rows [lo, hi) into dest and calls done (on the read thread). When no read thread could be
+  // made the read happens here, synchronously, before ReadAsync returns.
+  void JihadSelectTarget();
+  bool JihadReadAsync(JihadFrameRequest* aReq);
+  void JihadReadOnReadThread(JihadFrameRequest* aReq);   // the read thread
+  void JihadReadThreadInit();                            // the read thread, once
 
   virtual already_AddRefed<DataTextureSource>
   CreateDataTextureSource(TextureFlags aFlags = TextureFlags::NO_FLAGS) override;
@@ -311,6 +345,31 @@ private:
 
   /** Widget associated with this compositor */
   LayoutDeviceIntSize mWidgetSize;
+  GLuint mJihadWindowFBO = 0;      // Jihad T-502: the target the frame draws into (one of the two below, or the texture's)
+  GLuint mJihadWindowTex = 0;      // the texture window target the swizzle pass samples (JIHAD_GPU_PASS)
+  gfx::IntSize mJihadPbSize;
+  // The default path: two renderbuffer window targets, used in turn, read back by a thread of
+  // their own through a context that shares them, so the compositor thread is never held by a
+  // glReadPixels (20-45 ms on the Adreno 220) and a frame's read overlaps the next compose.
+  GLuint mJihadTargetRB[2] = {0, 0}, mJihadTargetFBO[2] = {0, 0};
+  int mJihadCur = 0;                                 // the target the next frame draws into
+  mozilla::Atomic<int32_t> mJihadTargetBusy[2];      // handed to the read thread, not yet read
+  mozilla::Monitor mJihadReadMon{"jihad-read"};
+  base::Thread* mJihadReadThread = nullptr;
+  bool mJihadReadInitDone = false, mJihadReadInitOk = false, mJihadReadInitAnswered = false;
+  RefPtr<GLContext> mJihadReadCtx;                   // made on the read thread, current there only
+  GLuint mJihadReadTargetFBO[2] = {0, 0};            // the read context's FBOs on the shared renderbuffers
+  bool JihadEnsureReadThread();
+  void JihadStopReadThread();
+  // The swizzle pass: a frame-sized renderbuffer FBO the window texture is drawn into through a
+  // shader that swaps red and blue, forces alpha and flips the rows, so glReadPixels lands the
+  // adapter's BGRA top-down frame straight in the shared buffer (no CPU pass).
+  GLuint mJihadReadFBO = 0, mJihadReadRB = 0;
+  gfx::IntSize mJihadReadSize;
+  GLuint mJihadSwizzleProg = 0;
+  GLint mJihadSwizzlePos = -1, mJihadSwizzleTex = -1, mJihadSwizzleScale = -1;
+  bool mJihadSwizzleFailed = false;
+  bool JihadEnsureSwizzlePass(int aW, int aH);
   RefPtr<GLContext> mGLContext;
   UniquePtr<GLBlitTextureImageHelper> mBlitTextureImageHelper;
   gfx::Matrix4x4 mProjMatrix;
