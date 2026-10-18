@@ -824,6 +824,19 @@ gfxPlatformHeadless::CreateHardwareVsyncSource()
 
 #endif
 
+void
+gfxPlatformHeadless::GetAcceleratedCompositorBackends(nsTArray<mozilla::layers::LayersBackend>& aBackends)
+{
+  // Jihad (T-502, the GPU compositor spike): the OpenGL compositor, on an EGL context from
+  // GLContextProviderEGL (the headless build's default provider; MOZ_LAYERS_PREFER_OFFSCREEN
+  // makes it a pbuffer), whenever hardware compositing is enabled (JIHAD_GPU_COMPOSITOR or
+  // layers.acceleration.force-enabled). gfxPlatform::GetCompositorBackends appends
+  // LAYERS_BASIC after this, so a failed OpenGL compositor still falls back.
+  if (gfxConfig::IsEnabled(Feature::HW_COMPOSITING)) {
+    aBackends.AppendElement(mozilla::layers::LayersBackend::LAYERS_OPENGL);
+  }
+}
+
 // Not GLX-specific: must be defined regardless of GL_PROVIDER_GLX so the
 // vtable slot resolves in a headless (no X/GLX) build.
 bool

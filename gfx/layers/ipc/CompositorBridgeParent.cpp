@@ -38,6 +38,7 @@
 #include "mozilla/layers/BasicCompositor.h"  // for BasicCompositor
 #include "mozilla/layers/Compositor.h"  // for Compositor
 #include "mozilla/layers/CompositorOGL.h"  // for CompositorOGL
+#include "GLTextureImage.h"                 // Jihad T-502: JihadFlushRetiredTextures
 #include "mozilla/layers/CompositorThread.h"
 #include "mozilla/layers/CompositorTypes.h"
 #include "mozilla/layers/CrossProcessCompositorBridgeParent.h"
@@ -365,6 +366,15 @@ void
 CompositorVsyncScheduler::ScheduleComposition()
 {
   MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+  // Jihad T-502 (JIHAD_GPU_COMPOSITOR): pull mode. No vsync-driven composite; the request is
+  // counted and the daemon, which owns the frame rate, pulls a frame through
+  // CompositorBridgeParent::JihadComposeAndRead when the count moves. An animation keeps
+  // asking after every composite, so it keeps the daemon pulling.
+  static const bool sJihadPull = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  if (sJihadPull) {
+    mJihadRequests++;
+    return;
+  }
   if (mAsapScheduling) {
     // Used only for performance testing purposes
     PostCompositeTask(TimeStamp::Now());
@@ -1208,6 +1218,13 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   if (!aTarget) {
     TimeStamp end = TimeStamp::Now();
     DidComposite(start, end);
+  } else {
+    // Jihad T-502: the whole compose-to-target on the compositor thread (JIHAD_GPU_COMPOSITOR).
+    static const bool sJihadGpuLog = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+    if (sJihadGpuLog) {
+      fprintf(stderr, "[jihad-gpu] compose-to-target: %.1f ms on the compositor thread (incl. copy-to-target)\n",
+              (TimeStamp::Now() - start).ToMilliseconds());
+    }
   }
 
   // We're not really taking advantage of the stored composite-again-time here.
@@ -1272,6 +1289,87 @@ CompositorBridgeParent::ForceComposeToTarget(DrawTarget* aTarget, const gfx::Int
   AutoRestore<bool> override(mOverrideComposeReadiness);
   mOverrideComposeReadiness = true;
   mCompositorScheduler->ForceComposeToTarget(aTarget, aRect);
+}
+
+uint32_t
+CompositorBridgeParent::JihadRequests() const
+{
+  return mCompositorScheduler ? mCompositorScheduler->JihadRequests() : 0;
+}
+
+bool
+CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY)
+{
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+  if (!aReq || !mCompositor || !mLayerManager) {
+    return false;
+  }
+  CompositorOGL* ogl = mCompositor->AsCompositorOGL();
+  if (!ogl) {
+    return false;
+  }
+  const int aWidth = aReq->w, aHeight = aReq->h;
+  // the card's zoom about the frame's top-left, after the residual visual offset (CSS px)
+  gfx::Matrix4x4 world = gfx::Matrix4x4::Scaling(aScale > 0.0f ? aScale : 1.0f,
+                                                 aScale > 0.0f ? aScale : 1.0f, 1.0f);
+  world.PreTranslate(-aOffsetX, -aOffsetY, 0.0f);
+  mLayerManager->JihadSetWorldTransform(world);
+  // The window path draws mRenderBounds, which only a layer transaction's target config or a
+  // compose-to-target rect sets; the offscreen widget's transactions carry none, so without
+  // this BeginFrame saw a zero-area frame and drew nothing (black frames, rounds 6-13).
+  // The bounds are the FRAME's size, not the widget's: with a layout viewport wider than the
+  // card (980x1202 for a 768x942 card) the world transform scales the page into the frame's
+  // corner, and a view the widget's size put the card's rows 260..1202 into the read (the
+  // flipped view reads from the bottom) and rendered a third more than the frame.
+  const gfx::IntRect whole(0, 0, aWidth, aHeight);
+  mLayerManager->UpdateRenderBounds(whole);
+  // What UpdateAndRender finds changed (the tree diff and the layers' own damage) is what the
+  // daemon reads back. The world transform and the frame's size are not tree properties, so a
+  // change of either invalidates everything (and UpdateAndRender would otherwise skip the
+  // render as "unchanged"). The compositor clears and redraws the whole frame every time, so
+  // the other window target (two composites old) is complete too.
+  const bool viewChanged = !mJihadWorldKnown || !(world == mJihadLastWorld) ||
+                           mJihadLastSize != gfx::IntSize(aWidth, aHeight);
+  if (viewChanged) {
+    mLayerManager->AddInvalidRegion(whole);
+    mJihadLastWorld = world;
+    mJihadLastSize = gfx::IntSize(aWidth, aHeight);
+    mJihadWorldKnown = true;
+  }
+  // the texture names retired since the last frame go now, before this frame's GPU work
+  gl::JihadFlushRetiredTextures(ogl->gl());
+  mLayerManager->JihadResetLastInvalid();
+  // the rows the daemon asked for are composed with what changed, and only those (partial)
+  mLayerManager->JihadSetBand(aReq->hi > aReq->lo ? gfx::IntRect(0, aReq->lo, aWidth, aReq->hi - aReq->lo) : gfx::IntRect());
+  ogl->JihadSelectTarget();
+  TimeStamp t0 = TimeStamp::Now();
+  ForceComposeToTarget(nullptr, nullptr);
+  TimeStamp t1 = TimeStamp::Now();
+  const gfx::IntRect changed = mLayerManager->JihadLastChanged();   // what the tree changed
+  const gfx::IntRect drawn = mLayerManager->JihadLastInvalid();     // what was composed (asked for + changed)
+  int invLo = 0, invHi = 0;
+  if (!changed.IsEmpty()) {
+    invLo = std::max(0, changed.y);
+    invHi = std::min(aHeight, changed.YMost());
+    if (invHi < invLo) invHi = invLo;
+  }
+  int lo = 0, hi = 0;
+  if (!drawn.IsEmpty()) {
+    lo = std::max(0, drawn.y);
+    hi = std::min(aHeight, drawn.YMost());
+    if (hi < lo) hi = lo;
+  }
+  aReq->lo = lo; aReq->hi = hi;
+  aReq->invLo = invLo; aReq->invHi = invHi;
+  const bool started = ogl->JihadReadAsync(aReq);
+  static uint32_t sFrames = 0;
+  if (sFrames < 20 || (sFrames % 50) == 0) {
+    fprintf(stderr, "[jihad-gpu] compositor thread: compose %.1f ms, handoff %.1f ms (frame %u, rows %d..%d of %d, changed %d..%d, started=%d)\n",
+            (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds(), sFrames,
+            hi > lo ? lo : 0, hi > lo ? hi : 0, aHeight, invLo, invHi, (int)started);
+  }
+  ++sFrames;
+  return started;
 }
 
 PAPZCTreeManagerParent*

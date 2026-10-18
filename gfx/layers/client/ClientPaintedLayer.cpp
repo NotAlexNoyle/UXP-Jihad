@@ -146,6 +146,12 @@ already_AddRefed<PaintedLayer>
 ClientLayerManager::CreatePaintedLayerWithHint(PaintedLayerCreationHint aHint)
 {
   NS_ASSERTION(InConstruction(), "Only allowed in construction phase");
+  {
+    // Jihad T-502 device rounds: whether painted layers are tiled (layers.enable-tiles is a
+    // once-only gfx pref: goanna.js, not prefs.js)
+    static bool sLogged = false;
+    if (!sLogged) { sLogged = true; fprintf(stderr, "[jihad-gpu] painted layers: %s\n", gfxPrefs::LayersTilesEnabled() ? "tiled" : "single-buffer (not tiled)"); }
+  }
   if (gfxPrefs::LayersTilesEnabled()) {
     RefPtr<ClientTiledPaintedLayer> layer = new ClientTiledPaintedLayer(this, aHint);
     CREATE_SHADOW(Painted);

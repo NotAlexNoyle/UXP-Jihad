@@ -4,11 +4,20 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "CompositorOGL.h"
+#include "mozilla/TimeStamp.h"   // Jihad T-502 timing
 #include <stddef.h>                     // for size_t
 #include <stdint.h>                     // for uint32_t, uint8_t
 #include <stdlib.h>                     // for free, malloc
 #include "GLContextProvider.h"          // for GLContextProvider
 #include "GLContext.h"                  // for GLContext
+#include "GLContextEGL.h"               // Jihad T-502: the pbuffer context
+#include "base/task.h"                  // Jihad T-502: the read thread
+#include "base/thread.h"
+#include <time.h>                       // Jihad T-502: CLOCK_THREAD_CPUTIME_ID
+#include <algorithm>
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+#include <arm_neon.h>                  // Jihad T-502: the readback swizzle
+#endif
 #include "GLUploadHelpers.h"
 #include "Layers.h"                     // for WriteSnapshotToDumpFile
 #include "LayerScope.h"                 // for LayerScope
@@ -122,6 +131,22 @@ CompositorOGL::CreateContext()
   }
 #endif
 
+  // Jihad T-502: on the Adreno 220 a glReadPixels from a texture-backed FBO (what the offscreen
+  // GLScreenBuffer is) costs 370-640 ms a frame; from the pbuffer surface 12-43 ms
+  // (tools/device/gpu-bench.c, 2026-10-17). So with JIHAD_GPU_COMPOSITOR the compositor draws
+  // into a plain pbuffer context with NO screen buffer: framebuffer 0 is the pbuffer itself. A
+  // pbuffer cannot be resized, so it is made large enough for the layout viewport T-499 may ask
+  // for and each frame uses its bottom-left part.
+  if (!context && getenv("JIHAD_GPU_COMPOSITOR")) {
+    nsCString failureId;
+    gfx::IntSize pb(std::max(mSurfaceSize.width, 1100), std::max(mSurfaceSize.height, 1400));
+    context = gl::GLContextEGL::CreateEGLPBufferOffscreenContext(
+        CreateContextFlags::REQUIRE_COMPAT_PROFILE, pb, SurfaceCaps::ForRGBA(), &failureId);
+    mJihadPbSize = pb;
+    fprintf(stderr, "[jihad-gpu] pbuffer context %dx%d: %s %s\n", pb.width, pb.height,
+            context ? "created" : "FAILED", failureId.get());
+  }
+
   // Allow to create offscreen GL context for main Layer Manager
   if (!context && gfxEnv::LayersPreferOffscreen()) {
     SurfaceCaps caps = SurfaceCaps::ForRGB();
@@ -149,6 +174,7 @@ CompositorOGL::CreateContext()
 void
 CompositorOGL::Destroy()
 {
+  JihadStopReadThread();   // Jihad T-502: before the GL objects it reads go
   Compositor::Destroy();
 
   if (mTexturePool) {
@@ -230,6 +256,76 @@ CompositorOGL::Initialize(nsCString* const out_failureReason)
     return false;
   }
 
+  // Jihad T-502: a renderbuffer-backed FBO as the window target of the pbuffer context.
+  if (mJihadPbSize.width > 0 && mGLContext->IsOffscreen() && !mGLContext->Screen()) {
+    // The window target(s). By default two RENDERBUFFERS used in turn, read back by the read
+    // thread (JihadReadAsync); JIHAD_GPU_PASS=1 keeps the single texture target the swizzle
+    // pass samples (measured 2026-10-17, run 37: the pass buys nothing, glReadPixels itself is
+    // the 20-40 ms, the same from a frame-sized renderbuffer).
+    static const bool sPass = getenv("JIHAD_GPU_PASS") != nullptr;
+    mGLContext->MakeCurrent();
+    const int n = sPass ? 1 : 2;
+    bool ok = true;
+    for (int t = 0; t < n && ok; ++t) {
+      GLuint rb = 0, tex = 0, fbo = 0;
+      if (sPass) {
+        mGLContext->fGenTextures(1, &tex);
+        mGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, tex);
+        mGLContext->fTexImage2D(LOCAL_GL_TEXTURE_2D, 0, LOCAL_GL_RGBA, mJihadPbSize.width, mJihadPbSize.height,
+                                0, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, nullptr);
+        mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MIN_FILTER, LOCAL_GL_NEAREST);
+        mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MAG_FILTER, LOCAL_GL_NEAREST);
+        mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_S, LOCAL_GL_CLAMP_TO_EDGE);
+        mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_T, LOCAL_GL_CLAMP_TO_EDGE);
+        mGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, 0);
+      } else {
+        mGLContext->fGenRenderbuffers(1, &rb);
+        mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, rb);
+        mGLContext->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */,
+                                         mJihadPbSize.width, mJihadPbSize.height);
+      }
+      mGLContext->fGenFramebuffers(1, &fbo);
+      mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, fbo);
+      if (sPass) {
+        mGLContext->fFramebufferTexture2D(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_TEXTURE_2D, tex, 0);
+      } else {
+        mGLContext->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, rb);
+      }
+      GLenum status = mGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+      if (status != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[jihad-gpu] window target %d: incomplete (0x%x), drawing into the pbuffer\n", t, status);
+        mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, 0);
+        mGLContext->fDeleteFramebuffers(1, &fbo);
+        if (rb) mGLContext->fDeleteRenderbuffers(1, &rb);
+        if (tex) mGLContext->fDeleteTextures(1, &tex);
+        ok = false;
+        break;
+      }
+      // the whole target white once: its first contents are whatever the driver had
+      mGLContext->fDisable(LOCAL_GL_SCISSOR_TEST);
+      mGLContext->fViewport(0, 0, mJihadPbSize.width, mJihadPbSize.height);
+      mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+      mGLContext->fClear(LOCAL_GL_COLOR_BUFFER_BIT);
+      mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, 0);
+      if (sPass) {
+        mJihadWindowTex = tex;
+      } else {
+        mJihadTargetRB[t] = rb; mJihadTargetFBO[t] = fbo;
+      }
+      if (t == 0) mJihadWindowFBO = fbo;
+    }
+    if (!ok) {
+      for (int t = 0; t < 2; ++t) {
+        if (mJihadTargetFBO[t]) mGLContext->fDeleteFramebuffers(1, &mJihadTargetFBO[t]);
+        if (mJihadTargetRB[t]) mGLContext->fDeleteRenderbuffers(1, &mJihadTargetRB[t]);
+        mJihadTargetFBO[t] = mJihadTargetRB[t] = 0;
+      }
+      mJihadWindowFBO = mJihadWindowTex = 0;
+    } else {
+      fprintf(stderr, "[jihad-gpu] %s window target%s %dx%d: FBO %u%s\n", sPass ? "texture" : "renderbuffer", n > 1 ? "s" : "",
+              mJihadPbSize.width, mJihadPbSize.height, mJihadWindowFBO, n > 1 ? " and one more, read by a thread of their own" : "");
+    }
+  }
   MakeCurrent();
 
   mHasBGRA =
@@ -472,7 +568,13 @@ CompositorOGL::PrepareViewport(CompositingRenderTargetOGL* aRenderTarget)
     // Matrix to transform (0, 0, aWidth, aHeight) to viewport space (-1.0, 1.0,
     // 2, 2) and flip the contents.
     Matrix viewMatrix;
-    if (mGLContext->IsOffscreen() && !gIsGtest) {
+    // Jihad T-502: with the renderbuffer FBO standing for the window, keep the WINDOW convention
+    // (the flipped view) even though the context is offscreen. The intermediate-surface draw
+    // (EffectTypes::RENDER_TARGET) flips its texture unconditionally to cancel this view flip;
+    // without the view flip every frame drawn through an intermediate surface (a scroll frame
+    // with a displayport, a clipped container under the world transform) came out upside down.
+    // JihadReadFrame reverses the rows on the way out.
+    if (mGLContext->IsOffscreen() && !gIsGtest && !mJihadWindowFBO) {
       // In case of rendering via GL Offscreen context, disable Y-Flipping
       viewMatrix.PreTranslate(-1.0, -1.0);
       viewMatrix.PreScale(2.0f / float(size.width), 2.0f / float(size.height));
@@ -485,7 +587,7 @@ CompositorOGL::PrepareViewport(CompositingRenderTargetOGL* aRenderTarget)
     MOZ_ASSERT(mCurrentRenderTarget, "No destination");
     // If we're drawing directly to the window then we want to offset
     // drawing by the render offset.
-    if (!mTarget && mCurrentRenderTarget->IsWindow()) {
+    if (!mTarget && JihadIsWindowTarget()) {
       viewMatrix.PreTranslate(mRenderOffset.x, mRenderOffset.y);
     }
 
@@ -652,9 +754,15 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
       mWidgetSize.height != height)
   {
     MakeCurrent(ForceMakeCurrent);
-
     mWidgetSize.width = width;
     mWidgetSize.height = height;
+    // Jihad T-502: on an offscreen (pbuffer/FBO) context the screen buffer keeps the size it
+    // was created with; a taller frame (the portrait card) was clipped. Resize it with the
+    // frame.
+    if (mGLContext->IsOffscreen() && mGLContext->Screen() &&
+        mGLContext->OffscreenSize() != gfx::IntSize(width, height)) {
+      mGLContext->ResizeScreenBuffer(gfx::IntSize(width, height));
+    }
   } else {
     MakeCurrent();
   }
@@ -669,7 +777,8 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
 
   RefPtr<CompositingRenderTargetOGL> rt =
     CompositingRenderTargetOGL::RenderTargetForWindow(this,
-                                                      IntSize(width, height));
+                                                      IntSize(width, height),
+                                                      mJihadWindowFBO);
   SetRenderTarget(rt);
 
 #ifdef DEBUG
@@ -680,7 +789,21 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
     aClipRectOut->SetRect(0, 0, width, height);
   }
 
+  if (mJihadWindowFBO) {
+    // Jihad T-502: the window frame starts white and opaque like the software path's buffer,
+    // so a frame with no layers is the blank frame the daemon knows (and not published black).
+    // A partial composite (a clip rect given) clears only inside it.
+    mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    if (aClipRectIn) {
+      mGLContext->fEnable(LOCAL_GL_SCISSOR_TEST);
+      mGLContext->fScissor(aClipRectIn->x, FlipY(aClipRectIn->y + aClipRectIn->height),
+                           aClipRectIn->width, aClipRectIn->height);
+    } else {
+      mGLContext->fDisable(LOCAL_GL_SCISSOR_TEST);
+    }
+  } else {
   mGLContext->fClearColor(mClearColor.r, mClearColor.g, mClearColor.b, mClearColor.a);
+  }
   mGLContext->fClear(LOCAL_GL_COLOR_BUFFER_BIT | LOCAL_GL_DEPTH_BUFFER_BIT);
 }
 
@@ -1037,7 +1160,7 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   // transforms and offsets have been applied) so if our
   // drawing is going to be shifted by mRenderOffset then we need
   // to shift the clip rect by the same amount.
-  if (!mTarget && mCurrentRenderTarget->IsWindow()) {
+  if (!mTarget && JihadIsWindowTarget()) {
     clipRect.MoveBy(mRenderOffset.x, mRenderOffset.y);
   }
 
@@ -1641,6 +1764,438 @@ CompositorOGL::SetDestinationSurfaceSize(const IntSize& aSize)
   mSurfaceSize.height = aSize.height;
 }
 
+bool
+CompositorOGL::JihadIsWindowTarget() const
+{
+  return mCurrentRenderTarget &&
+         (mCurrentRenderTarget->IsWindow() ||
+          (mJihadWindowFBO && mCurrentRenderTarget->GetFBO() == mJihadWindowFBO));
+}
+
+// Jihad T-502: RGBA rows as glReadPixels wrote them (GL row 0 = the BOTTOM of the flipped
+// window view) -> BGRA rows with row 0 at the top, in place, one load and one store per pixel.
+// aForceAlpha writes 0xFF into the alpha byte (the adapter blits the words raw).
+static void
+JihadSwizzleAndFlipRows(uint8_t* aData, int aStride, int aW, int aH, bool aForceAlpha)
+{
+  for (int y = 0; y < aH / 2; y++) {
+    uint8_t* a = aData + (size_t)y * aStride;
+    uint8_t* b = aData + (size_t)(aH - 1 - y) * aStride;
+    int x = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+    for (; x + 16 <= aW; x += 16, a += 64, b += 64) {
+      uint8x16x4_t va = vld4q_u8(a), vb = vld4q_u8(b);
+      uint8x16_t r = va.val[0]; va.val[0] = va.val[2]; va.val[2] = r;
+      r = vb.val[0]; vb.val[0] = vb.val[2]; vb.val[2] = r;
+      if (aForceAlpha) { va.val[3] = vdupq_n_u8(0xff); vb.val[3] = vdupq_n_u8(0xff); }
+      vst4q_u8(a, vb); vst4q_u8(b, va);
+    }
+#endif
+    for (; x < aW; x++, a += 4, b += 4) {
+      const uint8_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = aForceAlpha ? 0xff : a[3];
+      a[0] = b[2]; a[1] = b[1]; a[2] = b[0]; a[3] = aForceAlpha ? 0xff : b[3];
+      b[0] = a2; b[1] = a1; b[2] = a0; b[3] = a3;
+    }
+  }
+  if (aH & 1) {
+    uint8_t* p = aData + (size_t)(aH / 2) * aStride;
+    for (int x = 0; x < aW; x++, p += 4) {
+      const uint8_t r = p[0]; p[0] = p[2]; p[2] = r; if (aForceAlpha) p[3] = 0xff;
+    }
+  }
+}
+
+static GLuint
+JihadCompileShader(GLContext* aGL, GLenum aType, const char* aSrc)
+{
+  GLuint sh = aGL->fCreateShader(aType);
+  aGL->fShaderSource(sh, 1, &aSrc, nullptr);
+  aGL->fCompileShader(sh);
+  GLint ok = 0;
+  aGL->fGetShaderiv(sh, LOCAL_GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512] = {0};
+    aGL->fGetShaderInfoLog(sh, sizeof(log) - 1, nullptr, log);
+    fprintf(stderr, "[jihad-gpu] swizzle pass: shader failed: %s\n", log);
+    aGL->fDeleteShader(sh);
+    return 0;
+  }
+  return sh;
+}
+
+bool
+CompositorOGL::JihadEnsureSwizzlePass(int aW, int aH)
+{
+  if (mJihadSwizzleFailed || !mJihadWindowTex) {
+    return false;
+  }
+  GLContext* gl = mGLContext;
+  if (!mJihadSwizzleProg) {
+    // The window texture's image region (x 0..w, GL rows 0..h, the top row at y = h-1) drawn
+    // flipped onto a w x h target: the target's bottom row samples the image's top row, so the
+    // bottom-up read comes out top-down. Red and blue swapped and alpha forced in the shader.
+    static const char* kVert =
+      "attribute vec2 aPos; uniform vec2 uScale; varying vec2 vTex;\n"
+      "void main() { vTex = vec2((aPos.x + 1.0) * 0.5 * uScale.x, (1.0 - aPos.y) * 0.5 * uScale.y);"
+      " gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+    static const char* kFrag =
+      "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+      "uniform sampler2D uTex; varying vec2 vTex;\n"
+      "void main() { vec4 c = texture2D(uTex, vTex); gl_FragColor = vec4(c.b, c.g, c.r, 1.0); }\n";
+    GLuint vs = JihadCompileShader(gl, LOCAL_GL_VERTEX_SHADER, kVert);
+    GLuint fs = vs ? JihadCompileShader(gl, LOCAL_GL_FRAGMENT_SHADER, kFrag) : 0;
+    if (!vs || !fs) {
+      if (vs) gl->fDeleteShader(vs);
+      mJihadSwizzleFailed = true;
+      return false;
+    }
+    GLuint prog = gl->fCreateProgram();
+    gl->fAttachShader(prog, vs);
+    gl->fAttachShader(prog, fs);
+    gl->fLinkProgram(prog);
+    gl->fDeleteShader(vs);
+    gl->fDeleteShader(fs);
+    GLint ok = 0;
+    gl->fGetProgramiv(prog, LOCAL_GL_LINK_STATUS, &ok);
+    if (!ok) {
+      fprintf(stderr, "[jihad-gpu] swizzle pass: link failed\n");
+      gl->fDeleteProgram(prog);
+      mJihadSwizzleFailed = true;
+      return false;
+    }
+    mJihadSwizzleProg = prog;
+    mJihadSwizzlePos = gl->fGetAttribLocation(prog, "aPos");
+    mJihadSwizzleTex = gl->fGetUniformLocation(prog, "uTex");
+    mJihadSwizzleScale = gl->fGetUniformLocation(prog, "uScale");
+  }
+  if (mJihadReadSize != gfx::IntSize(aW, aH)) {
+    if (mJihadReadFBO) {
+      gl->fDeleteFramebuffers(1, &mJihadReadFBO);
+      gl->fDeleteRenderbuffers(1, &mJihadReadRB);
+      mJihadReadFBO = mJihadReadRB = 0;
+    }
+    gl->fGenRenderbuffers(1, &mJihadReadRB);
+    gl->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, mJihadReadRB);
+    gl->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */, aW, aH);
+    gl->fGenFramebuffers(1, &mJihadReadFBO);
+    gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadReadFBO);
+    gl->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, mJihadReadRB);
+    GLenum status = gl->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+    if (status != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+      fprintf(stderr, "[jihad-gpu] swizzle pass: read target %dx%d incomplete (0x%x)\n", aW, aH, status);
+      gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, 0);
+      gl->fDeleteFramebuffers(1, &mJihadReadFBO);
+      gl->fDeleteRenderbuffers(1, &mJihadReadRB);
+      mJihadReadFBO = mJihadReadRB = 0;
+      mJihadSwizzleFailed = true;
+      return false;
+    }
+    mJihadReadSize = gfx::IntSize(aW, aH);
+    fprintf(stderr, "[jihad-gpu] swizzle pass: program %u, read target %dx%d (FBO %u)\n", mJihadSwizzleProg, aW, aH, mJihadReadFBO);
+  }
+  return true;
+}
+
+// ---- Jihad T-502: the read thread --------------------------------------------------------------
+namespace {
+void JihadReadThreadInitTrampoline(CompositorOGL* aC) { aC->JihadReadThreadInit(); }
+void JihadReadThreadRunTrampoline(CompositorOGL* aC, JihadFrameRequest* aReq) { aC->JihadReadOnReadThread(aReq); }
+} // namespace
+
+bool
+CompositorOGL::JihadEnsureReadThread()
+{
+  if (mJihadReadInitDone) {
+    return mJihadReadInitOk;
+  }
+  mJihadReadInitDone = true;
+  // Off unless asked for (JIHAD_GPU_READ_THREAD=1): measured 2026-10-17 (runs 59-86) it gained
+  // nothing on the animation page and lost a third on the scroll page, because on this driver
+  // any GL call on the compositor context waits behind the read anyway.
+  if (!mJihadTargetFBO[1] || !getenv("JIHAD_GPU_READ_THREAD")) {
+    return false;
+  }
+  mJihadReadThread = new base::Thread("JihadRead");
+  if (!mJihadReadThread->Start()) {
+    fprintf(stderr, "[jihad-gpu] read thread: could not start\n");
+    delete mJihadReadThread;
+    mJihadReadThread = nullptr;
+    return false;
+  }
+  // the context and its FBOs are made on the thread that uses them; wait for the verdict once
+  bool answered = false;
+  {
+    MonitorAutoLock lock(mJihadReadMon);
+    mJihadReadInitAnswered = false;
+    mJihadReadThread->message_loop()->PostTask(NewRunnableFunction(&JihadReadThreadInitTrampoline, this));
+    const TimeStamp deadline = TimeStamp::Now() + TimeDuration::FromSeconds(5);
+    while (!mJihadReadInitAnswered && TimeStamp::Now() < deadline) {
+      lock.Wait(PR_MillisecondsToInterval(100));
+    }
+    answered = mJihadReadInitAnswered;
+  }
+  if (!answered || !mJihadReadInitOk) {
+    fprintf(stderr, "[jihad-gpu] read thread: %s, reading on the compositor thread\n", answered ? "no shared context" : "no answer in 5 s");
+    JihadStopReadThread();
+    mJihadReadInitOk = false;
+  }
+  return mJihadReadInitOk;
+}
+
+void
+CompositorOGL::JihadReadThreadInit()
+{
+  bool ok = false;
+  nsCString fail;
+  RefPtr<GLContextEGL> ctx;
+  if (mGLContext && mGLContext->GetContextType() == GLContextType::EGL) {
+    ctx = GLContextEGL::JihadCreateSharedContext(GLContextEGL::Cast(mGLContext), &fail);
+  }
+  if (ctx && ctx->MakeCurrent()) {
+    ok = true;
+    for (int t = 0; t < 2 && ok; ++t) {
+      GLuint fbo = 0;
+      ctx->fGenFramebuffers(1, &fbo);
+      ctx->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, fbo);
+      ctx->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, mJihadTargetRB[t]);
+      GLenum status = ctx->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+      if (status != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[jihad-gpu] read thread: target %d incomplete on the shared context (0x%x)\n", t, status);
+        ctx->fDeleteFramebuffers(1, &fbo);
+        ok = false;
+        break;
+      }
+      mJihadReadTargetFBO[t] = fbo;
+    }
+    ctx->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, 0);
+  } else {
+    fprintf(stderr, "[jihad-gpu] read thread: shared context failed (%s)\n", fail.get());
+  }
+  const bool fence = sEGLLibrary.IsExtensionSupported(GLLibraryEGL::KHR_fence_sync);
+  fprintf(stderr, "[jihad-gpu] read thread: %s%s\n", ok ? "up, shared context on both window targets" : "DOWN",
+          ok ? (fence ? ", EGL fences" : ", no EGL fence: glFinish on the compositor thread") : "");
+  MonitorAutoLock lock(mJihadReadMon);
+  if (ok) mJihadReadCtx = ctx;
+  mJihadReadInitOk = ok;
+  mJihadReadInitAnswered = true;
+  lock.NotifyAll();
+}
+
+void
+CompositorOGL::JihadStopReadThread()
+{
+  if (!mJihadReadThread) {
+    return;
+  }
+  mJihadReadThread->Stop();   // runs what is queued (the reads touch our members), then joins
+  delete mJihadReadThread;
+  mJihadReadThread = nullptr;
+  mJihadReadCtx = nullptr;    // its thread is gone; the objects die with the share group
+  mJihadReadTargetFBO[0] = mJihadReadTargetFBO[1] = 0;
+  mJihadReadInitOk = false;
+}
+
+void
+CompositorOGL::JihadSelectTarget()
+{
+  if (!mJihadTargetFBO[1]) {
+    return;   // a single target (the pass, or the pbuffer itself)
+  }
+  const int idx = mJihadCur;
+  {
+    // the read thread may still be reading this target (two frames ago): wait, bounded
+    MonitorAutoLock lock(mJihadReadMon);
+    const TimeStamp t0 = TimeStamp::Now();
+    static uint32_t sWaits = 0;
+    if (mJihadTargetBusy[idx] && sWaits++ < 40) fprintf(stderr, "[jihad-gpu] compositor thread: target %d still being read, waiting\n", idx);
+    while (mJihadTargetBusy[idx]) {
+      lock.Wait(PR_MillisecondsToInterval(20));
+      if (TimeStamp::Now() - t0 > TimeDuration::FromSeconds(2)) {
+        fprintf(stderr, "[jihad-gpu] target %d still being read after 2 s: taking it\n", idx);
+        mJihadTargetBusy[idx] = 0;
+        break;
+      }
+    }
+  }
+  mJihadWindowFBO = mJihadTargetFBO[idx];
+}
+
+bool
+CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
+{
+  if (!aReq || !aReq->done) {
+    return false;
+  }
+  aReq->composed = true;
+  if (!JihadEnsureReadThread()) {
+    aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo, aReq->hi);
+    aReq->done(aReq);
+    return true;
+  }
+  aReq->target = mJihadCur;
+  aReq->fence = nullptr;
+  // JIHAD_GPU_NO_FENCE: wait the compose out here (glFinish) instead of an EGL fence the read
+  // thread waits on; the device rounds compare the two (a fence wait that spins costs a core).
+  static const bool sNoFence = getenv("JIHAD_GPU_NO_FENCE") != nullptr;
+  if (!sNoFence && sEGLLibrary.IsExtensionSupported(GLLibraryEGL::KHR_fence_sync)) {
+    aReq->fence = sEGLLibrary.fCreateSync(EGL_DISPLAY(), LOCAL_EGL_SYNC_FENCE, nullptr);
+  }
+  const TimeStamp tf0 = TimeStamp::Now();
+  if (aReq->fence) {
+    mGLContext->fFlush();
+  } else {
+    mGLContext->fFinish();
+  }
+  {
+    static int sN = 0;
+    if (sN++ < 12 || (sN % 100) == 0) {
+      fprintf(stderr, "[jihad-gpu] compositor thread: %s %.1f ms\n", aReq->fence ? "fence+flush" : "glFinish",
+              (TimeStamp::Now() - tf0).ToMilliseconds());
+    }
+  }
+  {
+    MonitorAutoLock lock(mJihadReadMon);
+    mJihadTargetBusy[aReq->target] = 1;
+  }
+  mJihadCur ^= 1;
+  mJihadReadThread->message_loop()->PostTask(NewRunnableFunction(&JihadReadThreadRunTrampoline, this, aReq));
+  return true;
+}
+
+void
+CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
+{
+  bool ok = false;
+  const TimeStamp t0 = TimeStamp::Now();
+  TimeStamp t1 = t0, t2 = t0;
+  if (mJihadReadCtx && mJihadReadCtx->MakeCurrent()) {
+    GLContext* gl = mJihadReadCtx;
+    struct timespec cpu0, cpu1;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+    static uint32_t sReads = 0;
+    const uint32_t readNo = ++sReads;
+    if (readNo <= 40) fprintf(stderr, "[jihad-gpu] read thread: read %u of target %d, rows %d..%d, %s\n", readNo, aReq->target, aReq->lo, aReq->hi, aReq->fence ? "waiting on the fence" : "no fence");
+    if (aReq->fence) {
+      // bounded: a fence that never signals (2026-10-17, run 55: the first partial composite)
+      // must not hang the pipeline; after the timeout the read goes ahead (the compositor
+      // context was flushed, and the driver orders one process's command streams)
+      const EGLint r = sEGLLibrary.fClientWaitSync(EGL_DISPLAY(), (EGLSync)aReq->fence, 0, 1000000000ull /* 1 s */);
+      if (r != LOCAL_EGL_CONDITION_SATISFIED) fprintf(stderr, "[jihad-gpu] read thread: fence wait returned 0x%x after 1 s (read %u, target %d)\n", (unsigned)r, readNo, aReq->target);
+      sEGLLibrary.fDestroySync(EGL_DISPLAY(), (EGLSync)aReq->fence);
+      aReq->fence = nullptr;
+    }
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+    const double waitCpuMs = (cpu1.tv_sec - cpu0.tv_sec) * 1000.0 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1e6;
+    t1 = TimeStamp::Now();
+    const int w = aReq->w, h = aReq->h;
+    int lo = aReq->lo, hi = aReq->hi;
+    if (hi <= lo) { lo = 0; hi = h; }
+    if (lo < 0) lo = 0;
+    if (hi > h) hi = h;
+    if (hi > lo && aReq->dest && aReq->stride == w * 4) {
+      const int rows = hi - lo;
+      uint8_t* band = aReq->dest + (size_t)lo * aReq->stride;
+      gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadReadTargetFBO[aReq->target]);
+      {
+        // the flipped window view: frame row r is GL row h-1-r (see JihadReadFrame)
+        ScopedPackState safePackState(gl);
+        gl->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+        gl->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+      }
+      t2 = TimeStamp::Now();
+      JihadSwizzleAndFlipRows(band, aReq->stride, w, rows, true);
+      static int sTimed = 0;
+      if (sTimed++ < 12 || (sTimed % 100) == 0) {
+        fprintf(stderr, "[jihad-gpu] read thread: fence wait %.1f ms (%.1f ms of CPU), glReadPixels %d rows %.1f ms, swizzle+flip %.1f ms\n",
+                (t1 - t0).ToMilliseconds(), waitCpuMs, rows, (t2 - t1).ToMilliseconds(), (TimeStamp::Now() - t2).ToMilliseconds());
+      }
+    }
+    ok = true;
+  }
+  {
+    MonitorAutoLock lock(mJihadReadMon);
+    mJihadTargetBusy[aReq->target] = 0;
+    lock.NotifyAll();
+  }
+  aReq->ok = ok;
+  aReq->done(aReq);
+}
+
+bool
+CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi)
+{
+  if (!mGLContext || !aDest || aWidth <= 0 || aHeight <= 0 || aStride != aWidth * 4) {
+    return false;
+  }
+  const int w = std::min<int>(aWidth, mWidgetSize.width), h = std::min<int>(aHeight, mWidgetSize.height);
+  if (w <= 0 || h <= 0) {
+    return false;
+  }
+  // the rows to read, top-down: (0, 0) = every row
+  int lo = aRowLo, hi = aRowHi;
+  if (hi <= lo) { lo = 0; hi = h; }
+  if (lo < 0) lo = 0;
+  if (hi > h) hi = h;
+  if (hi <= lo) {
+    return true;
+  }
+  const int rows = hi - lo;
+  uint8_t* band = aDest + (size_t)lo * aStride;
+  mGLContext->MakeCurrent();
+  static int sTimed = 0;
+  TimeStamp t0 = TimeStamp::Now();
+  if (JihadEnsureSwizzlePass(w, h)) {
+    GLContext* gl = mGLContext;
+    const bool blend = gl->fIsEnabled(LOCAL_GL_BLEND), scissor = gl->fIsEnabled(LOCAL_GL_SCISSOR_TEST);
+    if (blend) gl->fDisable(LOCAL_GL_BLEND);
+    if (scissor) gl->fDisable(LOCAL_GL_SCISSOR_TEST);
+    gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadReadFBO);
+    gl->fViewport(0, 0, w, h);
+    gl->fUseProgram(mJihadSwizzleProg);
+    gl->fActiveTexture(LOCAL_GL_TEXTURE0);
+    gl->fBindTexture(LOCAL_GL_TEXTURE_2D, mJihadWindowTex);
+    gl->fUniform1i(mJihadSwizzleTex, 0);
+    gl->fUniform2f(mJihadSwizzleScale, float(w) / float(mJihadPbSize.width), float(h) / float(mJihadPbSize.height));
+    static const GLfloat kQuad[8] = { -1.f, -1.f,  1.f, -1.f,  -1.f, 1.f,  1.f, 1.f };
+    gl->fBindBuffer(LOCAL_GL_ARRAY_BUFFER, 0);
+    gl->fEnableVertexAttribArray(mJihadSwizzlePos);
+    gl->fVertexAttribPointer(mJihadSwizzlePos, 2, LOCAL_GL_FLOAT, LOCAL_GL_FALSE, 0, kQuad);
+    gl->fDrawArrays(LOCAL_GL_TRIANGLE_STRIP, 0, 4);
+    gl->fDisableVertexAttribArray(mJihadSwizzlePos);
+    gl->fBindTexture(LOCAL_GL_TEXTURE_2D, 0);
+    TimeStamp t1 = TimeStamp::Now();
+    {
+      // the read target holds the frame top-down (the pass flipped it): its GL row r is frame row r
+      ScopedPackState safePackState(gl);
+      gl->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+      gl->fReadPixels(0, lo, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+    }
+    if (blend) gl->fEnable(LOCAL_GL_BLEND);
+    if (scissor) gl->fEnable(LOCAL_GL_SCISSOR_TEST);
+    gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+    if (sTimed++ < 12 || (sTimed % 100) == 0) {
+      fprintf(stderr, "[jihad-gpu] swizzle pass %.1f ms (issued), glReadPixels %d rows %.1f ms\n",
+              (t1 - t0).ToMilliseconds(), rows, (TimeStamp::Now() - t1).ToMilliseconds());
+    }
+    return true;
+  }
+  mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  {
+    // The window view is flipped: frame row r is GL row h-1-r, so the band's GL rows are
+    // [h-hi, h-lo), read bottom-up into the band's rows and then reversed in place.
+    ScopedPackState safePackState(mGLContext);
+    mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+    mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+  }
+  TimeStamp t1 = TimeStamp::Now();
+  JihadSwizzleAndFlipRows(band, aStride, w, rows, true);
+  if (sTimed++ < 12 || (sTimed % 100) == 0) {
+    fprintf(stderr, "[jihad-gpu] glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
+            rows, (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
+  }
+  return true;
+}
+
 void
 CompositorOGL::CopyToTarget(DrawTarget* aTarget, const nsIntPoint& aTopLeft, const gfx::Matrix& aTransform)
 {
@@ -1667,13 +2222,60 @@ CompositorOGL::CopyToTarget(DrawTarget* aTarget, const nsIntPoint& aTopLeft, con
     mGLContext->fReadBuffer(LOCAL_GL_BACK);
   }
 
+  // Jihad T-502: read the frame straight into the target's pixels. The generic road below reads
+  // RGBA into a temporary surface, converts it to BGRA through Factory::CopyDataSourceSurface and
+  // draws it flipped through cairo; and on an offscreen context (no view flip: the image's row 0
+  // is at GL y = 0) that flip turned the frame upside down. Here: one glReadPixels of the rows
+  // the target wants, then an in-place RGBA->BGRA swizzle, row 0 to row 0. (NEON where the build has it.)
+  static const bool sJihadDirect = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  if (sJihadDirect && mGLContext->IsOffscreen()) {
+    uint8_t* data = nullptr; IntSize dsize; int32_t dstride = 0; SurfaceFormat dfmt;
+    if (aTarget->LockBits(&data, &dsize, &dstride, &dfmt)) {
+      const int w = std::min<int>(width, dsize.width), h = std::min<int>(height, dsize.height);
+      TimeStamp t0 = TimeStamp::Now();
+      bool okRead = (dstride == w * 4);
+      if (okRead) {
+        ScopedPackState safePackState(mGLContext);
+        mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+        mGLContext->fReadPixels(0, 0, w, h, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, data);
+      }
+      TimeStamp t1 = TimeStamp::Now();
+      if (okRead) {
+        // the view is flipped (window convention, see PrepareViewport) whenever the frame has
+        // a window FBO; a plain offscreen draw is not
+        if (mJihadWindowFBO) {
+          JihadSwizzleAndFlipRows(data, dstride, w, h, false);
+        } else {
+          for (int y = 0; y < h; y++) {
+            uint8_t* p = data + (size_t)y * dstride;
+            for (int x = 0; x < w; x++, p += 4) {
+              const uint8_t r = p[0]; p[0] = p[2]; p[2] = r;   // memory R,G,B,A -> B,G,R,A
+            }
+          }
+        }
+      }
+      aTarget->ReleaseBits(data);
+      TimeStamp t2 = TimeStamp::Now();
+      fprintf(stderr, "[jihad-gpu] direct read %dx%d (frame %dx%d): glReadPixels %.1f ms, swizzle %.1f ms%s\n",
+              w, h, width, height, (t1 - t0).ToMilliseconds(), (t2 - t1).ToMilliseconds(),
+              okRead ? "" : " (stride mismatch: not read)");
+      if (okRead) {
+        return;
+      }
+    }
+  }
+
   RefPtr<DataSourceSurface> source =
         Factory::CreateDataSourceSurface(rect.Size(), gfx::SurfaceFormat::B8G8R8A8);
   if (NS_WARN_IF(!source)) {
     return;
   }
 
+  // Jihad T-502: the two halves of the readback, timed (JIHAD_GPU_COMPOSITOR).
+  static const bool sJihadGpuLog = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  TimeStamp jihadT0 = TimeStamp::Now();
   ReadPixelsIntoDataSurface(mGLContext, source);
+  TimeStamp jihadT1 = TimeStamp::Now();
 
   // Map from GL space to Cairo space and reverse the world transform.
   Matrix glToCairoTransform = aTransform;
@@ -1688,6 +2290,11 @@ CompositorOGL::CopyToTarget(DrawTarget* aTarget, const nsIntPoint& aTopLeft, con
   Rect floatRect = Rect(rect.x, rect.y, rect.width, rect.height);
   aTarget->DrawSurface(source, floatRect, floatRect, DrawSurfaceOptions(), DrawOptions(1.0f, CompositionOp::OP_SOURCE));
   aTarget->SetTransform(oldMatrix);
+  if (sJihadGpuLog) {
+    TimeStamp jihadT2 = TimeStamp::Now();
+    fprintf(stderr, "[jihad-gpu] copy-to-target %dx%d: glReadPixels(+convert) %.1f ms, flipped draw %.1f ms\n",
+            width, height, (jihadT1 - jihadT0).ToMilliseconds(), (jihadT2 - jihadT1).ToMilliseconds());
+  }
   aTarget->Flush();
 }
 

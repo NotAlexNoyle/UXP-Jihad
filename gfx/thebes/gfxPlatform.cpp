@@ -2106,6 +2106,14 @@ gfxPlatform::InitCompositorAccelerationPrefs()
     feature.UserForceEnable("Force-enabled by prefs");
   }
 
+  // Jihad Browser (T-502, the GPU compositor spike): JIHAD_GPU_COMPOSITOR in the daemon's
+  // environment force-enables hardware compositing the way the pref does, without touching
+  // the prefs the three variants ship. AccelerateLayersByDefault() is false in this build
+  // (no MOZ_GL_PROVIDER) and the headless GfxInfo knows nothing of the Adreno 220.
+  if (getenv("JIHAD_GPU_COMPOSITOR")) {
+    feature.UserForceEnable("Force-enabled by JIHAD_GPU_COMPOSITOR");
+  }
+
   // Safe mode trumps everything.
   if (InSafeMode()) {
     feature.ForceDisable(FeatureStatus::Blocked, "Acceleration blocked by safe-mode",
@@ -2176,6 +2184,12 @@ gfxPlatform::UsesOffMainThreadCompositing()
     // grepref set during XRE_InitEmbedding2 init ordering.
     if (getenv("JIHAD_DISABLE_OMTC")) {
       result = false;
+    }
+    // Jihad T-502: the GPU compositor spike needs OMTC on, and the device bundle's goanna.js
+    // carries layers.offmainthreadcomposition.force-disabled=true for the software path; the
+    // spike's env wins over both.
+    if (getenv("JIHAD_GPU_COMPOSITOR")) {
+      result = true;
     }
     firstTime = false;
   }
@@ -2405,8 +2419,11 @@ gfxPlatform::InitOpenGLConfig()
   #endif
 
   // When layers acceleration is force-enabled, enable it even for blacklisted
-  // devices.
-  if (gfxPrefs::LayersAccelerationForceEnabledDoNotUseDirectly()) {
+  // devices. Jihad (T-502): JIHAD_GPU_COMPOSITOR counts as the force pref here too; the
+  // headless GfxInfo answers FEATURE_STATUS_UNKNOWN, which the check below would read as
+  // blocked.
+  if (gfxPrefs::LayersAccelerationForceEnabledDoNotUseDirectly() ||
+      getenv("JIHAD_GPU_COMPOSITOR")) {
     openGLFeature.UserForceEnable("Force-enabled by pref");
     return;
   }

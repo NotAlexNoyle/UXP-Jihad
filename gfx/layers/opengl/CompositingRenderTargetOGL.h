@@ -97,10 +97,12 @@ public:
    */
   static already_AddRefed<CompositingRenderTargetOGL>
   RenderTargetForWindow(CompositorOGL* aCompositor,
-                        const gfx::IntSize& aSize)
+                        const gfx::IntSize& aSize,
+                        GLuint aFBO = 0)   // Jihad T-502: the renderbuffer FBO that stands for the window
   {
     RefPtr<CompositingRenderTargetOGL> result
-      = new CompositingRenderTargetOGL(aCompositor, gfx::IntPoint(), 0, 0);
+      = new CompositingRenderTargetOGL(aCompositor, gfx::IntPoint(), 0, aFBO);
+    result->mJihadBorrowedFBO = (aFBO != 0);   // the compositor's, not this target's to delete
     result->mInitParams = InitParams(aSize, aSize, 0, INIT_MODE_NONE);
     result->mInitParams.mStatus = InitParams::INITIALIZED;
     return result.forget();
@@ -129,7 +131,9 @@ public:
    */
   void BindRenderTarget();
 
-  bool IsWindow() { return GetFBO() == 0; }
+  // Jihad T-502: the compositor's renderbuffer FBO stands for the window, with the window's
+  // conventions (render offset, no y-flip of intermediate surfaces drawn back into it).
+  bool IsWindow() { return GetFBO() == 0 || mJihadBorrowedFBO; }
 
   GLuint GetFBO() const
   {
@@ -187,6 +191,7 @@ private:
   RefPtr<GLContext> mGL;
   GLuint mTextureHandle;
   GLuint mFBO;
+  bool mJihadBorrowedFBO = false;   // Jihad T-502: a window FBO the compositor owns
 };
 
 } // namespace layers

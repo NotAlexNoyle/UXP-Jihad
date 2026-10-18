@@ -20,6 +20,7 @@
 #include "mozilla/Attributes.h"         // for override
 #include "mozilla/Maybe.h"
 #include "mozilla/Monitor.h"            // for Monitor
+#include "mozilla/Atomics.h"            // Jihad T-502
 #include "mozilla/RefPtr.h"             // for RefPtr
 #include "mozilla/TimeStamp.h"          // for TimeStamp
 #include "mozilla/dom/ipc/IdType.h"
@@ -61,6 +62,7 @@ class APZCTreeManager;
 class APZCTreeManagerParent;
 class AsyncCompositionManager;
 class Compositor;
+struct JihadFrameRequest;   // Jihad T-502, CompositorOGL.h
 class CompositorBridgeParent;
 class LayerManagerComposite;
 class LayerTransactionParent;
@@ -108,6 +110,8 @@ public:
   bool NeedsComposite();
   void Composite(TimeStamp aVsyncTimestamp);
   void ForceComposeToTarget(gfx::DrawTarget* aTarget, const gfx::IntRect* aRect);
+  // Jihad T-502 (pull mode): composites asked for and not run; the daemon pulls a frame when it moves.
+  uint32_t JihadRequests() const { return mJihadRequests; }
 
   const TimeStamp& GetLastComposeTime()
   {
@@ -122,6 +126,7 @@ public:
 #endif
 
 private:
+  mozilla::Atomic<uint32_t> mJihadRequests{0};   // Jihad T-502
   virtual ~CompositorVsyncScheduler();
 
   void NotifyCompositeTaskExecuted();
@@ -515,6 +520,21 @@ public:
   widget::CompositorWidget* GetWidget() { return mWidget; }
 
   void ForceComposeToTarget(gfx::DrawTarget* aTarget, const gfx::IntRect* aRect = nullptr);
+
+  // Jihad T-502: the scheduler's request count (any thread), and the frame pulled on the
+  // compositor thread: compose to the window (the pbuffer / renderbuffer) and read it into
+  // aDest (B8G8R8A8, aStride bytes a row, the top-left aWidth x aHeight of the frame).
+  uint32_t JihadRequests() const;
+  // Reads back rows [aRowLo, aRowHi) (0,0 = none asked for) joined with the rows the composite
+  // changed, which it reports in aInvLo/aInvHi (0,0 = nothing changed).
+  // Composes into the free window target and hands the read of rows [aReq->lo, aReq->hi)
+  // (0,0 = none asked for), joined with the rows the composite changed (left in lo/hi, the
+  // change alone in invLo/invHi), to the read thread; aReq->done runs when the frame is in
+  // aReq->dest. False: nothing was started.
+  bool JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY);
+  gfx::Matrix4x4 mJihadLastWorld;   // Jihad T-502: the view the last composite was made with
+  gfx::IntSize mJihadLastSize;
+  bool mJihadWorldKnown = false;
 
   PAPZCTreeManagerParent* AllocPAPZCTreeManagerParent(const uint64_t& aLayersId) override;
   bool DeallocPAPZCTreeManagerParent(PAPZCTreeManagerParent* aActor) override;

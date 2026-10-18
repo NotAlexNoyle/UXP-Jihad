@@ -17,6 +17,8 @@
 #include "mozilla/RefPtr.h"
 #include "nsBaseScreen.h"
 #include "nsBaseWidget.h"
+#include <vector>
+struct JihadReadJob;   // T-502, PuppetWidget.cpp
 #include "nsCOMArray.h"
 #include "nsIKeyEventInPluginCallback.h"
 #include "nsIScreenManager.h"
@@ -28,6 +30,7 @@
 class nsIDocShell;   // Jihad offscreen render (JihadRenderDocument)
 
 namespace mozilla {
+namespace layers { class CompositorBridgeParent; }   // Jihad T-502
 
 namespace dom {
 class TabChild;
@@ -268,6 +271,33 @@ public:
     return true;
   }
 
+  // --- Jihad T-502: the GPU compositor spike ---
+  // With JIHAD_GPU_COMPOSITOR in the environment the offscreen widget creates an IN-PROCESS
+  // compositor (nsBaseWidget::CreateCompositor: CompositorOGL on an EGL pbuffer when
+  // MOZ_LAYERS_PREFER_OFFSCREEN is set) behind a ClientLayerManager, instead of painting on
+  // the CPU through a BasicLayerManager. A frame is then painted as layers (PresShell::Paint on
+  // the root view) and fetched over the upstream snapshot road: BeginTransactionWithTarget +
+  // EndEmptyTransaction -> SendMakeSnapshot (sync) -> ForceComposeToTarget -> glReadPixels into
+  // a shared surface the client draws into our target. Nothing below the export is ours.
+  static bool JihadGpuCompositor();
+  bool JihadComposeTo(nsIDocShell* aDocShell, void* aDest, int aStride,
+                      int aWidth, int aHeight);
+  // The same frame in two halves, so the daemon's main thread does not sit out the compositor
+  // thread's read: Start paints the layers and posts the compose + read of rows [aRowLo, aRowHi)
+  // (0,0 = none asked for) joined with what the composite changed, and returns a token (0 =
+  // failed). Poll returns 1 when the frame is in aDest (aInvLo/aInvHi = the rows the composite
+  // changed), 0 while it is pending, -1 failed or unknown; with aWait it waits up to 3 s.
+  // Forget drops a token whose buffer went away.
+  uint32_t JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride,
+                             int aWidth, int aHeight, int aRowLo, int aRowHi);
+  int JihadComposePoll(uint32_t aToken, bool aWait, int* aInvLo, int* aInvHi);
+  void JihadComposeForget(uint32_t aToken);
+  void JihadComposeAbandonAll();
+  mozilla::layers::CompositorBridgeParent* JihadBridge();
+  void JihadSetView(double aScale, double aOffsetX, double aOffsetY) {
+    mJihadScale = (aScale > 0.0) ? (float)aScale : 1.0f; mJihadOffX = (float)aOffsetX; mJihadOffY = (float)aOffsetY;
+  }
+
   virtual TabChild* GetOwningTabChild() override { return mTabChild; }
 
   void UpdateBackingScaleCache(float aDpi, int32_t aRounding, double aScale)
@@ -411,6 +441,12 @@ private:
   RefPtr<PuppetWidget> mChild;
   LayoutDeviceIntRegion mDirtyRegion;
   bool mJihadDirty = false;   // sticky Invalidate() flag, drained by JihadTakeDirty()
+  bool mJihadCompositorTried = false;   // T-502: CreateCompositor attempted once per widget
+  bool mJihadSharedLayerManager = false; // T-502: mLayerManager is the parent's (a child widget)
+  float mJihadScale = 1.0f;              // T-502: the card's zoom, applied by the compositor
+  std::vector<::JihadReadJob*> mJihadJobs;   // T-502: frames in flight on the compositor thread
+  uint32_t mJihadNextToken = 1;
+  float mJihadOffX = 0.0f, mJihadOffY = 0.0f;   // T-502: the residual visual offset, CSS px
   // Bounding box of the same invalidations, drained by JihadTakeDirtyRect(). Kept beside the
   // flag rather than replacing it: the flag answers "is anything dirty" for callers that do a
   // full repaint, and must keep working unchanged if the rect is ignored.
