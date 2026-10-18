@@ -187,6 +187,10 @@ protected:
 // old one is retired here, to be deleted by the compositor once the GPU is idle (deleting a
 // name in use waits too).
 void JihadRetireTexture(GLContext* aGL, GLuint aTexture);
+// Jihad T-504: the GPU path's pool of tile textures (GLTextureImage.cpp explains why)
+bool JihadPoolTexture(GLContext* aGL, GLuint aTexture, const gfx::IntSize& aSize);
+GLuint JihadTakePooledTexture(GLContext* aGL, const gfx::IntSize& aSize);
+void JihadDropPooledTextures(GLContext* aGL, bool aDelete);
 void JihadFlushRetiredTextures(GLContext* aGL);
 
 class BasicTextureImage

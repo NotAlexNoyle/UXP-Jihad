@@ -204,12 +204,14 @@ CompositorOGL::CleanupResources()
 
   if (!ctx->MakeCurrent()) {
     // Leak resources!
+    gl::JihadDropPooledTextures(mGLContext, false);   // Jihad T-504: names of a context going away
     mQuadVBO = 0;
     mTriangleVBO = 0;
     mGLContext = nullptr;
     mPrograms.clear();
     return;
   }
+  gl::JihadDropPooledTextures(mGLContext, true);   // Jihad T-504
 
   for (std::map<ShaderConfigOGL, ShaderProgramOGL *>::iterator iter = mPrograms.begin();
        iter != mPrograms.end();
