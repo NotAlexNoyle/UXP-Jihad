@@ -4,6 +4,10 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "GLTextureImage.h"
+#include <utility>   // Jihad: std::swap
+#include <vector>
+#include "mozilla/TimeStamp.h"
+#include "mozilla/StaticMutex.h"
 #include "GLContext.h"
 #include "gfxContext.h"
 #include "gfxPlatform.h"
@@ -117,7 +121,71 @@ BasicTextureImage::~BasicTextureImage()
     // was the only one that had access to it.
     if (ctx && ctx->MakeCurrent()) {
         ctx->fDeleteTextures(1, &mTexture);
+        if (mTexture2) {
+            ctx->fDeleteTextures(1, &mTexture2);
+        }
     }
+}
+
+// ---- Jihad T-502: fresh texture names per upload, retired names deleted when the GPU is idle --
+namespace {
+mozilla::StaticMutex sJihadRetireLock;
+std::vector<std::pair<GLContext*, GLuint>> sJihadRetired;
+}
+
+void JihadRetireTexture(GLContext* aGL, GLuint aTexture)
+{
+    mozilla::StaticMutexAutoLock lock(sJihadRetireLock);
+    sJihadRetired.push_back(std::make_pair(aGL, aTexture));
+}
+
+void JihadFlushRetiredTextures(GLContext* aGL)
+{
+    std::vector<GLuint> mine;
+    {
+        mozilla::StaticMutexAutoLock lock(sJihadRetireLock);
+        for (size_t i = 0; i < sJihadRetired.size();) {
+            if (sJihadRetired[i].first == aGL) {
+                mine.push_back(sJihadRetired[i].second);
+                sJihadRetired.erase(sJihadRetired.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+    }
+    if (mine.empty() || !aGL || !aGL->MakeCurrent()) {
+        return;
+    }
+    const mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
+    aGL->fDeleteTextures((GLsizei)mine.size(), mine.data());
+    static uint32_t sN = 0;
+    const double ms = (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
+    if (sN++ < 10 || ms >= 3.0) {
+        if (sN < 200) fprintf(stderr, "[jihad-gpu] retired textures: %u deleted in %.1f ms\n", (unsigned)mine.size(), ms);
+    }
+}
+
+void
+BasicTextureImage::JihadSwapTextures()
+{
+    // Off unless asked for (JIHAD_GPU_FRESH_TEX=1): measured 2026-10-17 (run 86) the first upload
+    // into a fresh name waits just as the re-upload did (21 ms a tile), so the driver waits for
+    // the pending GPU work, not for the name; the fresh names only added allocation churn.
+    static const bool sFresh = getenv("JIHAD_GPU_COMPOSITOR") && getenv("JIHAD_GPU_FRESH_TEX");
+    if (!sFresh) {
+        return;
+    }
+    if (mTextureState == Created) {
+        return;   // never drawn with: the current name is as fresh as a new one
+    }
+    JihadRetireTexture(mGLContext, mTexture);
+    mGLContext->fGenTextures(1, &mTexture);
+    ScopedBindTexture bind(mGLContext, mTexture);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MIN_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MAG_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_S, mWrapMode);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_T, mWrapMode);
+    mTextureState = Created;
 }
 
 void
@@ -131,6 +199,7 @@ BasicTextureImage::BindTexture(GLenum aTextureUnit)
 bool
 BasicTextureImage::DirectUpdate(gfx::DataSourceSurface* aSurf, const nsIntRegion& aRegion, const gfx::IntPoint& aFrom /* = gfx::IntPoint(0, 0) */)
 {
+    JihadSwapTextures();   // Jihad T-502: the name the last composite is not reading
     nsIntRegion region;
     if (mTextureState == Valid) {
         region = aRegion;
@@ -166,10 +235,16 @@ BasicTextureImage::Resize(const gfx::IntSize& aSize)
     // we avoid mixing formats.
     GLenum format;
     GLenum type;
+    GLenum internalFormat = LOCAL_GL_RGBA;
     if (mGLContext->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
-        MOZ_ASSERT(!mGLContext->IsGLES());
         format = LOCAL_GL_BGRA;
-        type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+        if (mGLContext->IsGLES()) {
+            // Jihad: BGRA8888 on GLES takes UNSIGNED_BYTE and the same internal format
+            type = LOCAL_GL_UNSIGNED_BYTE;
+            internalFormat = LOCAL_GL_BGRA;
+        } else {
+            type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+        }
     } else {
         format = LOCAL_GL_RGBA;
         type = LOCAL_GL_UNSIGNED_BYTE;
@@ -177,7 +252,7 @@ BasicTextureImage::Resize(const gfx::IntSize& aSize)
 
     mGLContext->fTexImage2D(LOCAL_GL_TEXTURE_2D,
                             0,
-                            LOCAL_GL_RGBA,
+                            internalFormat,
                             aSize.width,
                             aSize.height,
                             0,
@@ -215,7 +290,9 @@ BasicTextureImage::BasicTextureImage(GLuint aTexture,
   , mTexture(aTexture)
   , mTextureState(Created)
   , mGLContext(aContext)
-{}
+{
+    mTexFilter = (aFlags & TextureImage::UseNearestFilter) ? LOCAL_GL_NEAREST : LOCAL_GL_LINEAR;
+}
 
 static bool
 WantsSmallTiles(GLContext* gl)

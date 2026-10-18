@@ -181,6 +181,14 @@ protected:
  * convert the update surface's pixels into an image on which we can
  * glTexSubImage2D().
  */
+// Jihad T-502: on the Adreno 220 a glTexImage2D into a name the GPU has drawn with waits for
+// the pending GPU work (18-78 ms a tile, 2026-10-17 run 83); a never-drawn name takes the
+// upload at once. So under JIHAD_GPU_COMPOSITOR every upload goes into a fresh name and the
+// old one is retired here, to be deleted by the compositor once the GPU is idle (deleting a
+// name in use waits too).
+void JihadRetireTexture(GLContext* aGL, GLuint aTexture);
+void JihadFlushRetiredTextures(GLContext* aGL);
+
 class BasicTextureImage
     : public TextureImage
 {
@@ -206,6 +214,15 @@ public:
 protected:
     GLuint mTexture;
     TextureState mTextureState;
+    // Jihad T-502: a second GL name, used in turn with the first, under JIHAD_GPU_COMPOSITOR.
+    // On the Adreno 220 binding a texture the last composite still reads waits that
+    // composite out (~11 ms for a 256x256 tile, 2026-10-17 run 77); the name the composite is
+    // not reading takes the upload without waiting. Every upload on that path is a whole one
+    // (GLUploadHelpers: no sub-texture uploads on this GPU), so alternating names is sound.
+    GLuint mTexture2 = 0;        // unused since the fresh-name scheme (kept for the destructor)
+    TextureState mTextureState2 = Created;
+    GLint mTexFilter = 0x2601;   // GL_LINEAR
+    void JihadSwapTextures();    // now: retire the name and take a fresh one
     RefPtr<GLContext> mGLContext;
 };
 

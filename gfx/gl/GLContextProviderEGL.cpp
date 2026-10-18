@@ -902,6 +902,34 @@ GLContextEGL::CreateEGLPBufferOffscreenContext(CreateContextFlags flags,
     return gl.forget();
 }
 
+/* static */ already_AddRefed<GLContextEGL>
+GLContextEGL::JihadCreateSharedContext(GLContextEGL* aShare, nsACString* const out_failureId)
+{
+    if (!sEGLLibrary.EnsureInitialized(false, out_failureId)) {
+        return nullptr;
+    }
+    SurfaceCaps configCaps;
+    EGLConfig config = ChooseConfig(&sEGLLibrary, CreateContextFlags::REQUIRE_COMPAT_PROFILE,
+                                    SurfaceCaps::ForRGBA(), &configCaps);
+    if (config == EGL_NO_CONFIG) {
+        *out_failureId = NS_LITERAL_CSTRING("FEATURE_FAILURE_EGL_NO_CONFIG");
+        return nullptr;
+    }
+    mozilla::gfx::IntSize pbSize(1, 1);
+    EGLSurface surface = GLContextEGL::CreatePBufferSurfaceTryingPowerOfTwo(config, LOCAL_EGL_NONE, pbSize);
+    if (!surface) {
+        *out_failureId = NS_LITERAL_CSTRING("FEATURE_FAILURE_EGL_POT");
+        return nullptr;
+    }
+    RefPtr<GLContextEGL> gl = GLContextEGL::CreateGLContext(CreateContextFlags::REQUIRE_COMPAT_PROFILE, configCaps,
+                                                            aShare, true, config, surface, out_failureId);
+    if (!gl) {
+        sEGLLibrary.fDestroySurface(sEGLLibrary.Display(), surface);
+        return nullptr;
+    }
+    return gl.forget();
+}
+
 /*static*/ already_AddRefed<GLContext>
 GLContextProviderEGL::CreateHeadless(CreateContextFlags flags,
                                      nsACString* const out_failureId)

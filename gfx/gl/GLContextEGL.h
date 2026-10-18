@@ -38,6 +38,18 @@ public:
     ~GLContextEGL();
 
     virtual GLContextType GetContextType() const override { return GLContextType::EGL; }
+    // Jihad T-502: upload 32-bit surfaces as BGRA where the driver takes them (the content is
+    // BGRA already). On the Adreno 220 an RGBA upload of a 768x942 layer costs 35 ms and a
+    // BGRA_EXT one 8 (tools/device/gpu-bench.c, 2026-10-17); as RGBA the CPU swizzled every
+    // tile first and the driver swizzled it back.
+    virtual GLenum GetPreferredARGB32Format() const override {
+        return IsExtensionSupported(EXT_texture_format_BGRA8888) ? LOCAL_GL_BGRA : LOCAL_GL_RGBA;
+    }
+
+    // Jihad T-502: a 1x1 pbuffer context sharing aShare's objects (the compositor's
+    // renderbuffers), made on and for the readback thread.
+    static already_AddRefed<GLContextEGL>
+    JihadCreateSharedContext(GLContextEGL* aShare, nsACString* const out_failureId);
 
     static GLContextEGL* Cast(GLContext* gl) {
         MOZ_ASSERT(gl->GetContextType() == GLContextType::EGL);

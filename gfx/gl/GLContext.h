@@ -172,6 +172,7 @@ enum class GLRenderer {
     Adreno205,
     AdrenoTM200,
     AdrenoTM205,
+    AdrenoTM220,   // Jihad: the TouchPad's GPU (Adreno (TM) 220)
     AdrenoTM305,
     AdrenoTM320,
     AdrenoTM330,
