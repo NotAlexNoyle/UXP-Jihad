@@ -289,10 +289,14 @@ public:
   // changed), 0 while it is pending, -1 failed or unknown; with aWait it waits up to 3 s.
   // Forget drops a token whose buffer went away.
   uint32_t JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride,
-                             int aWidth, int aHeight, int aRowLo, int aRowHi);
-  int JihadComposePoll(uint32_t aToken, bool aWait, int* aInvLo, int* aInvHi);
+                             int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo = 0, int aRow2Hi = 0, int aShift = 0,
+                             const void* aSrc = nullptr, int aSrcY = 0, int aFlags = 0);   // aFlags: 1 engine shift, 2 verify
+  // aOut (10 ints, may be null): the rows the tree changed, the rows fixed layers cover, the two
+  // bands read, the frame's position and its valid flag; aScrollOnly: the composite's only change was the card's scroll
+  int JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly = nullptr);
   void JihadComposeForget(uint32_t aToken);
   void JihadComposeAbandonAll();
+  void JihadSetScroll(double aX, double aY, bool aValid) { mJihadScrollX = (float)aX; mJihadScrollY = (float)aY; mJihadScrollValid = aValid; }
   mozilla::layers::CompositorBridgeParent* JihadBridge();
   void JihadSetView(double aScale, double aOffsetX, double aOffsetY) {
     mJihadScale = (aScale > 0.0) ? (float)aScale : 1.0f; mJihadOffX = (float)aOffsetX; mJihadOffY = (float)aOffsetY;
@@ -446,6 +450,8 @@ private:
   float mJihadScale = 1.0f;              // T-502: the card's zoom, applied by the compositor
   std::vector<::JihadReadJob*> mJihadJobs;   // T-502: frames in flight on the compositor thread
   uint32_t mJihadNextToken = 1;
+  float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // T-502: the card's scroll for the compositor
+  bool mJihadScrollValid = false;
   float mJihadOffX = 0.0f, mJihadOffY = 0.0f;   // T-502: the residual visual offset, CSS px
   // Bounding box of the same invalidations, drained by JihadTakeDirtyRect(). Kept beside the
   // flag rather than replacing it: the flag answers "is anything dirty" for callers that do a

@@ -1233,6 +1233,13 @@ private:
     }
 
 public:
+    // Jihad T-502 diagnostic: the driver's own scissor box and viewport against this context's
+    // cache of them (fScissor/fViewport skip a call that matches the cache)
+    void JihadRawAndCached(GLint* aRawScissor, GLint* aCachedScissor, GLint* aRawViewport, GLint* aCachedViewport) {
+        raw_fGetIntegerv(LOCAL_GL_SCISSOR_BOX, aRawScissor);
+        raw_fGetIntegerv(LOCAL_GL_VIEWPORT, aRawViewport);
+        for (int i = 0; i < 4; i++) { aCachedScissor[i] = mScissorRect[i]; aCachedViewport[i] = mViewportRect[i]; }
+    }
 
     void fGetIntegerv(GLenum pname, GLint* params);
 

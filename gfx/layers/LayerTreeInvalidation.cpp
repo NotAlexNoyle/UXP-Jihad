@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
  * You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <cmath>   // Jihad T-502: roundf, fabsf
 #include "LayerTreeInvalidation.h"
 
 #include <stdint.h>                     // for uint32_t
@@ -30,6 +31,22 @@ using namespace mozilla::gfx;
 
 namespace mozilla {
 namespace layers {
+
+// Jihad T-502 round 115 (see LayerTreeInvalidation.h)
+static struct { bool on; float scale; bool have; float dx, dy; } sJihadScrollDiff = { false, 1.0f, false, 0.0f, 0.0f };
+void JihadDiffScrollBegin(bool aOn, float aScale)
+{
+  sJihadScrollDiff.on = aOn; sJihadScrollDiff.scale = aScale > 0.0f ? aScale : 1.0f;
+  // turning it off keeps what the diff just measured for the caller to take (round 119: the
+  // round-115 shift was cleared here before the bridge could read it)
+  if (aOn) { sJihadScrollDiff.have = false; sJihadScrollDiff.dx = sJihadScrollDiff.dy = 0.0f; }
+}
+bool JihadDiffScrollShift(float* aDx, float* aDy)
+{
+  if (!sJihadScrollDiff.have) return false;
+  *aDx = sJihadScrollDiff.dx; *aDy = sJihadScrollDiff.dy;
+  return true;
+}
 
 struct LayerPropertiesBase;
 UniquePtr<LayerPropertiesBase> CloneLayerTreePropertiesInternal(Layer* aRoot, bool aIsMask = false);
@@ -181,6 +198,50 @@ public:
     bool transformChanged = !mTransform.FuzzyEqual(GetTransformForInvalidation(mLayer)) ||
                              mLayer->GetPostXScale() != mPostXScale ||
                              mLayer->GetPostYScale() != mPostYScale;
+    if (sJihadScrollDiff.on && transformChanged && !mLayer->GetIsFixedPosition() && !mLayer->GetIsStickyPosition() &&
+        mLayer->GetPostXScale() == mPostXScale && mLayer->GetPostYScale() == mPostYScale) {
+      // Jihad T-502 round 115: a scroll moves the root-content layer by a pure translation; the
+      // rows it carries are shifted by the daemon, so only what else changed is reported
+      const Matrix4x4 now = GetTransformForInvalidation(mLayer);
+      const Matrix4x4& was = mTransform;
+      const bool pure = FuzzyEqual(now._11, was._11) && FuzzyEqual(now._12, was._12) && FuzzyEqual(now._13, was._13) &&
+                        FuzzyEqual(now._14, was._14) && FuzzyEqual(now._21, was._21) && FuzzyEqual(now._22, was._22) &&
+                        FuzzyEqual(now._23, was._23) && FuzzyEqual(now._24, was._24) && FuzzyEqual(now._31, was._31) &&
+                        FuzzyEqual(now._32, was._32) && FuzzyEqual(now._33, was._33) && FuzzyEqual(now._34, was._34) &&
+                        FuzzyEqual(now._43, was._43) && FuzzyEqual(now._44, was._44);
+      const float tx = now._41 - was._41, ty = now._42 - was._42;
+      if (pure && FuzzyEqual(tx, 0.0f)) {
+        const bool rootMetrics = mLayer->GetScrollMetadataCount() > 0 &&
+                                 mLayer->GetScrollMetadata(0).GetMetrics().IsRootContent();
+        const float rows = -ty * sJihadScrollDiff.scale;
+        const bool integral = fabsf(rows - roundf(rows)) < 0.01f;
+        if (rootMetrics && !sJihadScrollDiff.have && integral) {
+          sJihadScrollDiff.have = true; sJihadScrollDiff.dx = tx; sJihadScrollDiff.dy = ty;
+        }
+        if (sJihadScrollDiff.have && FuzzyEqual(ty, sJihadScrollDiff.dy)) {
+          mTransform = now;
+          transformChanged = false;
+        }
+      }
+    }
+    {
+      // Jihad T-502 diagnostic (JIHAD_GPU_DIFFLOG): a transform that changed, and by what
+      static const bool sDiffLog = getenv("JIHAD_GPU_DIFFLOG") != nullptr;
+      static uint32_t sN = 0;
+      if (sDiffLog && transformChanged && sN++ < 400) {
+        const Matrix4x4 now = GetTransformForInvalidation(mLayer);
+        const bool sameLinear = FuzzyEqual(now._11, mTransform._11) && FuzzyEqual(now._12, mTransform._12) &&
+                                FuzzyEqual(now._21, mTransform._21) && FuzzyEqual(now._22, mTransform._22);
+        const IntRect vb = mLayer->GetLocalVisibleRegion().ToUnknownRegion().GetBounds();
+        Layer* par = mLayer->GetParent();
+        fprintf(stderr, "[jihad-gpu] diff: layer %p (parent %p type %d metadata %u, type %d, fixed %d sticky %d, metadata %u, flags 0x%x, visible %d,%d %dx%d, clip %d) transform moved by %.1f,%.1f%s; old ty %.1f new ty %.1f\n",
+                mLayer, par, par ? (int)par->GetType() : -1, par ? (unsigned)par->GetScrollMetadataCount() : 0u,
+                (int)mLayer->GetType(), (int)mLayer->GetIsFixedPosition(), (int)mLayer->GetIsStickyPosition(),
+                (unsigned)mLayer->GetScrollMetadataCount(), (unsigned)mLayer->GetContentFlags(), vb.x, vb.y, vb.width, vb.height,
+                (int)!!mLayer->GetLocalClipRect(), now._41 - mTransform._41, now._42 - mTransform._42,
+                sameLinear ? "" : " (and scaled)", mTransform._42, now._42);
+      }
+    }
     const Maybe<ParentLayerIntRect>& otherClip = mLayer->GetLocalClipRect();
     nsIntRegion result;
 
@@ -234,6 +295,22 @@ public:
       }
     }
 
+    {
+      // Jihad T-502 diagnostic (JIHAD_GPU_DIFFLOG): a layer contributing a large change, and why
+      static const bool sDiffLog = getenv("JIHAD_GPU_DIFFLOG") != nullptr;
+      static uint32_t sBig = 0;
+      const IntRect rb = result.GetBounds();
+      if (sDiffLog && rb.height > 300 && sBig++ < 3000) {
+        const IntRect inv = mLayer->GetInvalidRegion().GetRegion().GetBounds();
+        const IntRect vOld = mVisibleRegion.GetBounds();
+        const IntRect vNew = mLayer->GetLocalVisibleRegion().ToUnknownRegion().GetBounds();
+        const Matrix4x4 now = GetTransformForInvalidation(mLayer);
+        fprintf(stderr, "[jihad-gpu] diff big: layer %p type %d metadata %u: result y %d..%d; transform changed %d (ty %.1f -> %.1f), invalid (layer) y %d..%d, visible old y %d..%d new y %d..%d, clip changed %d\n",
+                mLayer, (int)mLayer->GetType(), (unsigned)mLayer->GetScrollMetadataCount(), rb.y, rb.YMost(), (int)transformChanged,
+                mTransform._42, now._42, inv.y, inv.YMost(), vOld.y, vOld.YMost(), vNew.y, vNew.YMost(),
+                (int)(mUseClipRect && otherClip && !mClipRect.IsEqualInterior(*otherClip)));
+      }
+    }
     mLayer->ClearInvalidRect();
     return result;
   }

@@ -6148,7 +6148,15 @@ FrameLayerBuilder::DrawPaintedLayer(PaintedLayer* aLayer,
   }
 
   if (!aRegionToInvalidate.IsEmpty()) {
-    aLayer->AddInvalidRect(aRegionToInvalidate.GetBounds());
+    // Jihad T-502 round 124: on the offscreen GPU compositor the region itself, not its bounds:
+    // a scroll's repaint is a strip at each end of the displayport, both off the frame, and the
+    // bounds of the two spanned the whole frame (the compositor read every row back)
+    static const bool sJihadGpu = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+    if (sJihadGpu) {
+      aLayer->AddInvalidRegion(aRegionToInvalidate);
+    } else {
+      aLayer->AddInvalidRect(aRegionToInvalidate.GetBounds());
+    }
   }
 }
 

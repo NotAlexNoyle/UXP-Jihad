@@ -30,6 +30,13 @@ typedef void (*NotifySubDocInvalidationFunc)(ContainerLayer* aLayer,
  * A set of cached layer properties (including those of child layers),
  * used for comparing differences in layer trees.
  */
+// Jihad T-502 round 115: the next ComputeDifferences treats a pure vertical translation of the
+// root-content scroll layer (and of any non-fixed layer moved by the same amount) as a scroll, not
+// a change, when it moves the frame by whole rows at aScale (the world scale). The shift it saw,
+// in layer pixels, is reported by JihadDiffScrollShift; false when none.
+void JihadDiffScrollBegin(bool aOn, float aScale);
+bool JihadDiffScrollShift(float* aDx, float* aDy);
+
 struct LayerProperties
 {
 protected:

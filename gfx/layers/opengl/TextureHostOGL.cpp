@@ -30,6 +30,8 @@ using namespace mozilla::gfx;
 namespace mozilla {
 namespace layers {
 
+extern double gJihadPhase[12];   // LayerManagerComposite.cpp (T-502 round 139, JIHAD_GPU_PHASES=1)
+
 class Compositor;
 
 already_AddRefed<TextureHost>
@@ -105,6 +107,8 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
     static uint32_t sN = 0;
     const TimeStamp t3 = TimeStamp::Now();
     const double all = (t3 - t0).ToMilliseconds();
+    static const bool sPhases = getenv("JIHAD_GPU_PHASES") != nullptr;
+    if (sPhases) gJihadPhase[11] += all;
     if (sN++ < 30 || all >= 8.0) {
       if (sN < 300) fprintf(stderr, "[jihad-gpu] texture source update: make current %.1f ms, %s %.1f ms, upload %.1f ms (all %.1f)\n",
                             t1.IsNull() ? 0.0 : (t1 - t0).ToMilliseconds(), *created ? "texture created" : "texture kept",

@@ -126,7 +126,20 @@ public:
   void JihadResetLastInvalid() { mJihadLastInvalid = mJihadLastChanged = gfx::IntRect(); }
   // The rows the daemon is about to read: composed (cleared and drawn, scissored) together
   // with what the tree changed, and nothing else. Empty: only what changed.
-  void JihadSetBand(const gfx::IntRect& aBand) { mJihadBand = aBand; }
+  // T-503: a verify composite keeps the diff baseline and the pending invalid region (the next
+  // real frame must see the changes the verify composite also drew)
+  void JihadHoldBaseline(bool aHold) { mJihadHoldBaseline = aHold; }
+  void JihadSetBand(const gfx::IntRect& aBand, const gfx::IntRect& aBand2 = gfx::IntRect(), const gfx::IntRect& aBand3 = gfx::IntRect()) { mJihadBand = aBand; mJihadBand2 = aBand2; mJihadBand3 = aBand3; }
+  // the card's scroll alone moved (an async transform on the root scroll frame's content, which
+  // the layer diff reports as the content's whole bounds): the diff is dropped, the bands asked
+  // for are composed and read
+  void JihadIgnoreDiff(bool aOn) { mJihadIgnoreDiff = aOn; }
+  // round 115: the next diff treats the root-content layer's scroll as a shift (LayerTreeInvalidation.h)
+  void JihadCompensateScroll(bool aOn) { mJihadCompensateScroll = aOn; }
+  // round 119: the tree diff now, without a render (the stored tree refreshed as a composite
+  // would), in frame pixels; the caller has begun a transaction and applied the async transforms
+  nsIntRegion JihadDiffOnly();
+  void JihadEndTransactionNoComposite() { mInTransaction = false; }
   bool JihadPartial() const { return mJihadPartialOn; }
 
   virtual void EndTransaction(DrawPaintedLayerCallback aCallback,
@@ -369,7 +382,10 @@ private:
   RefPtr<Compositor> mCompositor;
   gfx::Matrix4x4 mJihadWorld;   // Jihad T-502
   gfx::IntRect mJihadLastInvalid;   // Jihad T-502
-  gfx::IntRect mJihadLastChanged, mJihadBand;   // Jihad T-502
+  bool mJihadHoldBaseline = false;
+  gfx::IntRect mJihadLastChanged, mJihadBand, mJihadBand2, mJihadBand3;   // Jihad T-502 (band 3: round 138's columns)
+  bool mJihadIgnoreDiff = false;
+  bool mJihadCompensateScroll = false;
   bool mJihadPartialOn = false;                  // this Render is a partial composite
   UniquePtr<LayerProperties> mClonedLayerTreeProperties;
 

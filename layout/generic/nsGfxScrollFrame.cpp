@@ -3762,7 +3762,14 @@ ScrollFrameHelper::ComputeScrollMetadata(Layer* aLayer,
   }
 
   bool isRootContent = mIsRoot && mOuter->PresContext()->IsRootContentDocument();
-  bool thisScrollFrameUsesAsyncScrolling = nsLayoutUtils::UsesAsyncScrolling(mOuter);
+  // Jihad T-502: the offscreen card's compositor scrolls the root content document the way
+  // APZ would (AsyncCompositionManager, without APZ). The root scroll frame with a scrollable
+  // layer (it has the daemon's displayport) therefore counts as async-scrolling here, so its
+  // content layers carry the scroll metadata and the scrollport as a scroll clip the compositor
+  // keeps still; the plain layer clip of the branch below moved with the async transform.
+  static const bool sJihadGpu = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  bool thisScrollFrameUsesAsyncScrolling = nsLayoutUtils::UsesAsyncScrolling(mOuter) ||
+      (sJihadGpu && mIsRoot && isRootContent && mWillBuildScrollableLayer);
   if (!thisScrollFrameUsesAsyncScrolling) {
     if (parentLayerClip) {
       // If APZ is not enabled, we still need the displayport to be clipped

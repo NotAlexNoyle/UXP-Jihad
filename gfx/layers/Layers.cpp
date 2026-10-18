@@ -1397,7 +1397,18 @@ ContainerLayer::DefaultComputeEffectiveTransforms(const Matrix4x4& aTransformToS
         checkClipRect = true;
         checkMaskLayers = true;
       } else {
-        if (gfx::ThebesMatrix(contTransform).HasNonIntegerTranslation()) {
+        // Jihad T-502: HasNonIntegerTranslation() is also true for any SCALE, so under the
+        // offscreen card's world zoom every container with a clipped child (the root, with the
+        // scroll frame's clip) rendered through an intermediate surface the size of its visible
+        // region: one more full-frame pass a composite, nothing of the displayport beyond the
+        // viewport, and fixed-layer compensation measured in the surface's space. On the
+        // compositor's tree an axis-aligned scale+translate clips fine by scissor
+        // (CalculateScissorRect transforms the clip by the parent's effective transform; the
+        // edge may be a pixel off), so no surface for that case. JIHAD_GPU_SURFACES=1 restores it.
+        static const bool sJihadNoSurface = getenv("JIHAD_GPU_COMPOSITOR") && !getenv("JIHAD_GPU_SURFACES");
+        const bool jihadScissorable = sJihadNoSurface && Manager() && Manager()->AsLayerManagerComposite() &&
+                                      contTransform.PreservesAxisAlignedRectangles();
+        if (gfx::ThebesMatrix(contTransform).HasNonIntegerTranslation() && !jihadScissorable) {
           checkClipRect = true;
         }
         /* In 2D case, only translation and/or positive scaling can be done w/o using IntermediateSurface.

@@ -8154,6 +8154,10 @@ nsLayoutUtils::ScrollbarAreaToExcludeFromCompositionBoundsFor(nsIFrame* aScrollF
   return scrollableFrame->GetActualScrollbarSizes();
 }
 
+// Jihad T-503: what the card shows of the root scroll frame (CSS px over the card's zoom, in app
+// units), set by jihad_layout_set_displayport; the GPU path's root composition covers it
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(JihadShownSizeProperty, nsSize)
+
 /* static */ nsSize
 nsLayoutUtils::CalculateCompositionSizeForFrame(nsIFrame* aFrame, bool aSubtractScrollbars)
 {
@@ -8169,7 +8173,19 @@ nsLayoutUtils::CalculateCompositionSizeForFrame(nsIFrame* aFrame, bool aSubtract
 
   bool isRootContentDocRootScrollFrame = presContext->IsRootContentDocument()
                                       && aFrame == presShell->GetRootScrollFrame();
-  if (isRootContentDocRootScrollFrame) {
+  // Jihad T-502 round 132: on the offscreen GPU compositor the root's composition is its scroll
+  // port: the compositor scales the page into the card, and the window-sized composition (764x942
+  // CSS px) clipped a page laid out wider (1116x1374, en.wikipedia.org) to its top-left part
+  static const bool sJihadGpu = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  // T-503: and at least what the card shows: a page laid out wider than its window (804 CSS px
+  // in a 764x942 scroll port, news.ycombinator.com at a fit zoom of 0.955: the card shows
+  // 804x986) was clipped to the scroll port, its bottom 42 rows and right 38 columns blank
+  if (isRootContentDocRootScrollFrame && sJihadGpu) {
+    if (const nsSize* shown = aFrame->GetProperty(JihadShownSizeProperty())) {
+      size = nsSize(std::max(size.width, shown->width), std::max(size.height, shown->height));
+    }
+  }
+  if (isRootContentDocRootScrollFrame && !sJihadGpu) {
     ParentLayerRect compBounds;
     if (UpdateCompositionBoundsForRCDRSF(compBounds, presContext, false)) {
       int32_t auPerDevPixel = presContext->AppUnitsPerDevPixel();
@@ -9351,4 +9367,68 @@ nsLayoutUtils::GetNonAnonymousStyleContext(nsIFrame* aFrame)
              "Root element is the only case for this fallback "
              "path to be triggered");
   return pc->StyleSet()->ResolveStyleFor(node->AsElement(), nullptr);
+}
+
+// Jihad T-502: the displayport for the offscreen card, set from the daemon (which cannot
+// include layout headers) on the root scroll frame's content. Margins in screen px. The
+// scroll frame then builds a scrollable layer with scroll metadata (root content), which the
+// compositor applies the card's scroll to, and paints that much past the viewport. 0 on
+// success; 1 no pres shell, 2 no root scroll frame, 3 no content, 4 a higher-priority
+// displayport is set.
+#include "nsIDocShell.h"
+#include "nsIScrollableFrame.h"
+extern "C" MOZ_EXPORT int
+jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, float aSide, float aTop, float aBottom)
+{
+  // T-502 round 131: the card shows aVisW x aVisH CSS px (its size over its zoom), which can be
+  // larger than the scroll port (a fit-zoomed page: 1116x1369 CSS px shown, a 768x942 scroll
+  // port); the displayport must cover what is shown plus the slack asked for, so the right and
+  // bottom margins add the difference (round 126's margins relative to the scroll port left the
+  // right third and the bottom of a fit-zoomed page unpainted)
+  if (!aDocShell) {
+    return 1;
+  }
+  nsCOMPtr<nsIPresShell> ps = aDocShell->GetPresShell();
+  if (!ps) {
+    return 1;
+  }
+  nsIFrame* rsf = ps->GetRootScrollFrame();
+  if (!rsf) {
+    return 2;
+  }
+  nsIContent* content = rsf->GetContent();
+  if (!content) {
+    return 3;
+  }
+  nsIScrollableFrame* sf = do_QueryFrame(rsf);
+  if (!sf) {
+    return 3;
+  }
+  const nsRect port = sf->GetScrollPortRect();
+  // T-503: what the card shows, for the root composition (CalculateCompositionSizeForFrame)
+  {
+    const nsSize shown(nsPresContext::CSSPixelsToAppUnits(aVisW), nsPresContext::CSSPixelsToAppUnits(aVisH));
+    const nsSize* before = rsf->GetProperty(JihadShownSizeProperty());
+    if (!before || *before != shown) {
+      rsf->SetProperty(JihadShownSizeProperty(), new nsSize(shown));
+      rsf->SchedulePaint();
+    }
+  }
+  // the base is the scroll port, set every time: layout seeds it once from the composition size
+  // (the engine window, 768x942 CSS px) and a fit-zoomed page's scroll port is larger (round 131)
+  nsLayoutUtils::SetDisplayPortBase(content, nsRect(nsPoint(0, 0), port.Size()));
+  const float portW = nsPresContext::AppUnitsToFloatCSSPixels(port.width);
+  const float portH = nsPresContext::AppUnitsToFloatCSSPixels(port.height);
+  const float right = std::max(0.0f, aVisW - portW) + aSide;
+  const float bottom = std::max(0.0f, aVisH - portH) + aBottom;
+  const ScreenMargin margins(aTop, right, bottom, aSide);
+  static int sLogged = 0;
+  if (sLogged++ < 6) {
+    fprintf(stderr, "[jihad-gpu] displayport: scroll port %.0fx%.0f CSS px, shown %.0fx%.0f, margins top %.0f right %.0f bottom %.0f left %.0f\n",
+            portW, portH, aVisW, aVisH, aTop, right, bottom, aSide);
+  }
+  if (!nsLayoutUtils::SetDisplayPortMargins(content, ps, margins, 0)) {
+    return 4;
+  }
+  return 0;
 }
