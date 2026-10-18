@@ -512,6 +512,15 @@ AsyncCompositionManager::AlignFixedAndStickyLayers(Layer* aTransformedSubtreeRoo
   // We want to translate the layer by the difference between
   // |transformedAnchor| and |anchor|.
   LayerPoint translation = transformedAnchor - anchor;
+  {
+    // Jihad T-502 diagnostic (every 50th fixed/sticky layer aligned)
+    static uint32_t sN = 0;
+    if ((sN++ % 50) == 0) {
+      fprintf(stderr, "[jihad-gpu] align fixed: layer %p (parent %p, fixed %d sticky %d) under subtree root %p (root's parent %p), scroll id %llu: anchor %.1f,%.1f, translation %.1f,%.1f\n",
+              layer, layer->GetParent(), (int)layer->GetIsFixedPosition(), (int)layer->GetIsStickyPosition(), aTransformedSubtreeRoot,
+              aTransformedSubtreeRoot->GetParent(), (unsigned long long)aTransformScrollId, anchor.x, anchor.y, translation.x, translation.y);
+    }
+  }
 
   // A fixed layer will "consume" (be unadjusted by) the entire translation
   // calculated above. A sticky layer may consume all, part, or none of it,
@@ -537,6 +546,24 @@ AsyncCompositionManager::AlignFixedAndStickyLayers(Layer* aTransformedSubtreeRoo
     unconsumedTranslation = translation - originalTranslation;
   }
 
+  // Jihad T-502 round 127: a sticky layer held in place this composite counts as fixed for the
+  // readback. T-503: also one the engine has already laid out stuck (an anchor move just put the
+  // async offset at zero, so it is not adjusted now): the next pan steps will hold it. Probed
+  // with a step's translation both ways against its sticky ranges.
+  if (layer->GetIsStickyPosition()) {
+    bool held = fabsf(translation.x) > 0.5f || fabsf(translation.y) > 0.5f;
+    if (!held) {
+      const LayerRect& outer = layer->GetStickyScrollRangeOuter();
+      const LayerRect& inner = layer->GetStickyScrollRangeInner();
+      const LayerPoint base = translation - unconsumedTranslation;   // the translation before the sticky clamp
+      for (const float probe : { 64.0f, -64.0f }) {
+        const float ty = base.y + probe;
+        const float hy = IntervalOverlap(ty, outer.y, outer.YMost()) - IntervalOverlap(ty, inner.y, inner.YMost());
+        if (fabsf(hy) > 0.5f) held = true;
+      }
+    }
+    if (held) mJihadStuck.push_back(layer);
+  }
   // Finally, apply the translation to the layer transform. Note that in cases
   // where the async transform on |aTransformedSubtreeRoot| affects this layer's
   // clip rect, we need to apply the same translation to said clip rect, so
@@ -833,6 +860,7 @@ bool
 AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
                                                           bool* aOutFoundRoot)
 {
+  mJihadStuck.clear();   // Jihad T-502 round 127: this composite's stuck sticky layers
   bool appliedTransform = false;
   std::stack<Maybe<ParentLayerIntRect>> stackDeferredClips;
 
@@ -909,23 +937,56 @@ AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
           }
         }
 
+        // Jihad T-502 diagnostic: what the tree offers the card's scroll (every 50th layer with
+        // metadata, and every 500th composite's root when nothing has any)
+        {
+          static uint32_t sSeen = 0, sRootSeen = 0;
+          if (layer->GetScrollMetadataCount() > 0 && (sSeen++ % 50) == 0) {
+            const FrameMetrics& m0 = layer->GetScrollMetadata(0).GetMetrics();
+            fprintf(stderr, "[jihad-gpu] async scroll: layer %p has %u metadata (first: root content %d, id %llu, offset %.1f,%.1f), card scroll valid %d want %.1f,%.1f, controller %d\n",
+                    layer, (unsigned)layer->GetScrollMetadataCount(), (int)m0.IsRootContent(), (unsigned long long)m0.GetScrollId(),
+                    m0.GetScrollOffset().x, m0.GetScrollOffset().y, (int)mJihadScrollValid, mJihadScrollX, mJihadScrollY, (int)(layer->GetAsyncPanZoomController(0) != nullptr));
+          } else if (layer->GetScrollMetadataCount() == 0 && !layer->GetParent() && (sRootSeen++ % 500) == 0) {
+            fprintf(stderr, "[jihad-gpu] async scroll: the root layer %p has no metadata (card scroll valid %d want %.1f,%.1f)\n", layer, (int)mJihadScrollValid, mJihadScrollX, mJihadScrollY);
+          }
+        }
         for (uint32_t i = 0; i < layer->GetScrollMetadataCount(); i++) {
           AsyncPanZoomController* controller = layer->GetAsyncPanZoomController(i);
+          // Jihad T-502: without APZ, the card's scroll on the root scroll frame's content
+          AsyncTransform jihadAsync;
+          bool jihadScroll = false;
           if (!controller) {
-            continue;
+            const FrameMetrics& jm = layer->GetScrollMetadata(i).GetMetrics();
+            if (mJihadScrollValid && jm.IsRootContent()) {
+              const CSSPoint want(mJihadScrollX, mJihadScrollY);
+              const ParentLayerPoint translation = (want - jm.GetScrollOffset()) * jm.GetZoom();
+              jihadAsync = AsyncTransform(LayerToParentLayerScale(1.0f), -translation);
+              jihadScroll = true;
+              static uint32_t sN = 0;
+              if (sN++ < 10 || (sN % 25) == 0) {
+                fprintf(stderr, "[jihad-gpu] async scroll: want %.1f,%.1f, painted at %.1f,%.1f, zoom %.4f x %.4f -> translation %.1f,%.1f on layer %p (parent %p, id %llu)\n",
+                        want.x, want.y, jm.GetScrollOffset().x, jm.GetScrollOffset().y, jm.GetZoom().xScale, jm.GetZoom().yScale, -translation.x, -translation.y,
+                        layer, layer->GetParent(), (unsigned long long)jm.GetScrollId());
+              }
+            }
+            if (!jihadScroll) {
+              continue;
+            }
           }
 
           hasAsyncTransform = true;
 
-          AsyncTransform asyncTransformWithoutOverscroll =
-              controller->GetCurrentAsyncTransform(AsyncPanZoomController::RESPECT_FORCE_DISABLE);
-          AsyncTransformComponentMatrix overscrollTransform =
-              controller->GetOverscrollTransform(AsyncPanZoomController::RESPECT_FORCE_DISABLE);
+          AsyncTransform asyncTransformWithoutOverscroll = controller
+              ? controller->GetCurrentAsyncTransform(AsyncPanZoomController::RESPECT_FORCE_DISABLE)
+              : jihadAsync;
+          AsyncTransformComponentMatrix overscrollTransform = controller
+              ? controller->GetOverscrollTransform(AsyncPanZoomController::RESPECT_FORCE_DISABLE)
+              : AsyncTransformComponentMatrix();
           AsyncTransformComponentMatrix asyncTransform =
               AsyncTransformComponentMatrix(asyncTransformWithoutOverscroll)
             * overscrollTransform;
 
-          if (!layer->IsScrollInfoLayer()) {
+          if (controller && !layer->IsScrollInfoLayer()) {
             controller->MarkAsyncTransformAppliedToContent();
           }
 

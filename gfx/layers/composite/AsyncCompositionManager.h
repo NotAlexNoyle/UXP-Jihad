@@ -6,6 +6,7 @@
 #ifndef GFX_ASYNCCOMPOSITIONMANAGER_H
 #define GFX_ASYNCCOMPOSITIONMANAGER_H
 
+#include <vector>   // Jihad T-502
 #include "Units.h"                      // for ScreenPoint, etc
 #include "mozilla/layers/LayerManagerComposite.h"  // for LayerManagerComposite
 #include "mozilla/Attributes.h"         // for final, etc
@@ -115,6 +116,17 @@ public:
   // Returns true if the next composition will be the first for a
   // particular document.
   bool IsFirstPaint() { return mIsFirstPaint; }
+  // Jihad T-502: the card's scroll position (CSS px, absolute), applied to the root scroll
+  // frame's content as an async transform while the engine's own scroll (the metrics' offset)
+  // stays where the last paint put it; fixed and sticky layers are aligned as under APZ.
+  void JihadSetScroll(float aX, float aY, bool aValid) { mJihadScrollX = aX; mJihadScrollY = aY; mJihadScrollValid = aValid; }
+  // round 127: the sticky layers the last composite held in place (a nonzero alignment, or no
+  // async offset to tell by); a sticky layer scrolling with the content is not fixed rows
+  bool JihadIsStuck(Layer* aLayer) const {
+    for (Layer* l : mJihadStuck) if (l == aLayer) return true;
+    return false;
+  }
+  void JihadClearStuck() { mJihadStuck.clear(); }
 
   // GetFrameUniformity will return the frame uniformity for each layer attached to an APZ
   // from the recorded data in RecordShadowTransform
@@ -225,6 +237,9 @@ private:
   // front-end (e.g. Java on Android) about this so that it take the new page
   // size and zoom into account when providing us with the next view transform.
   bool mIsFirstPaint;
+  float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // Jihad T-502
+  bool mJihadScrollValid = false;
+  std::vector<Layer*> mJihadStuck;   // round 127 (raw: valid until the next composite)
 
   // This flag is set during a layers update, so that the first composition
   // after a layers update has it set. It is cleared after that first composition.

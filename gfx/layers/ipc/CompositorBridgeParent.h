@@ -532,7 +532,22 @@ public:
   // change alone in invLo/invHi), to the read thread; aReq->done runs when the frame is in
   // aReq->dest. False: nothing was started.
   bool JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY);
+  nsIntRegion JihadDiffNow();   // round 119: the tree diff without a render (frame pixels)
   gfx::Matrix4x4 mJihadLastWorld;   // Jihad T-502: the view the last composite was made with
+  float mJihadLastScrollX = 0.0f, mJihadLastScrollY = 0.0f;
+  bool mJihadLastScrollValid = false;
+  uint32_t mJihadSeqAtLast = 0;     // the scheduler's request count when the last composite began
+  int mJihadLastFixedLo = 0, mJihadLastFixedHi = 0;   // the fixed rows as last computed on a whole composite
+  // round 138: the fixed and stuck layers' rects on the frame, as last computed (at most four)
+  gfx::IntRect mJihadLastFixedRects[4];
+  int mJihadLastFixedN = 0;
+  // round 141: per rect, the pixels an opaque layer covers (empty when not opaque), and the keeps
+  // of the composite before the last (a keep must have held still)
+  gfx::IntRect mJihadLastKeep[4], mJihadPrevKeep[4];
+  int mJihadPrevKeepN = 0;
+  int JihadFixedRectsNow(int aWidth, int aHeight, gfx::IntRect* aOut, gfx::IntRect* aKeep);
+  void JihadUpdateLastFixed(int aWidth, int aHeight);
+  bool mJihadSeqKnown = false;
   gfx::IntSize mJihadLastSize;
   bool mJihadWorldKnown = false;
 

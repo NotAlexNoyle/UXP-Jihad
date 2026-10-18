@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "LayerManagerComposite.h"
+#include "LayerTreeInvalidation.h"   // Jihad T-502: JihadDiffScrollBegin
 #include <stddef.h>                     // for size_t
 #include <stdint.h>                     // for uint16_t, uint32_t
 #include "CanvasLayerComposite.h"       // for CanvasLayerComposite
@@ -416,6 +417,52 @@ LayerManagerComposite::EndTransaction(const TimeStamp& aTimeStamp,
 #endif
 }
 
+nsIntRegion
+LayerManagerComposite::JihadDiffOnly()
+{
+  nsIntRegion changed;
+  if (!mRoot) {
+    return changed;
+  }
+  nsIntRegion opaque;
+  LayerIntRegion visible;
+  PostProcessLayers(mRoot, opaque, visible, Nothing());
+  mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);
+  if (mClonedLayerTreeProperties) {
+    JihadDiffScrollBegin(mJihadCompensateScroll, mJihadWorld._22);
+    bool geometryChanged = false;
+    changed = mClonedLayerTreeProperties->ComputeDifferences(mRoot, nullptr, &geometryChanged);
+    JihadDiffScrollBegin(false, 1.0f);
+    if (geometryChanged) mGeometryChanged = true;
+    if (!mJihadWorld.IsIdentity() && !changed.IsEmpty()) {
+      nsIntRegion scaled;
+      for (auto iter = changed.RectIter(); !iter.Done(); iter.Next()) {
+        const gfx::IntRect& r = iter.Get();
+        gfx::Rect fr = mJihadWorld.TransformBounds(gfx::Rect(r.x, r.y, r.width, r.height));
+        fr.RoundOut();
+        scaled.OrWith(gfx::IntRect(int32_t(fr.x), int32_t(fr.y), int32_t(fr.width), int32_t(fr.height)));
+      }
+      changed = Move(scaled);
+    }
+  } else {
+    changed = mRenderBounds;
+  }
+  mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());
+  return changed;
+}
+
+// Jihad T-502 round 139 (JIHAD_GPU_PHASES=1): where a composite's CPU time goes, in ms:
+// 0 post-process, 1 transforms + diff, 2 begin frame, 3 prepare, 4 render layers, 5 end frame,
+// 6 shadow properties, 7 async transforms (CompositorBridgeParent), 8 draw calls' time, 9 draw
+// calls, 10 draws culled (CompositorOGL), 11 texture uploads' time (TextureHostOGL)
+double gJihadPhase[12];
+static bool
+JihadPhases()
+{
+  static const bool sOn = getenv("JIHAD_GPU_PHASES") != nullptr;
+  return sOn;
+}
+
 void
 LayerManagerComposite::UpdateAndRender()
 {
@@ -424,9 +471,15 @@ LayerManagerComposite::UpdateAndRender()
 
   nsIntRegion opaque;
   LayerIntRegion visible;
+  const TimeStamp jihadP0 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
   PostProcessLayers(mRoot, opaque, visible, Nothing());
+  if (JihadPhases()) gJihadPhase[0] += (TimeStamp::Now() - jihadP0).ToMilliseconds();
+  const TimeStamp jihadP1 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
 
-  if (mClonedLayerTreeProperties) {
+  if (mClonedLayerTreeProperties && mJihadHoldBaseline) {
+    mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);   // T-503: no diff
+    didEffectiveTransforms = true;
+  } else if (mClonedLayerTreeProperties) {
     // Effective transforms are needed by ComputeDifferences().
     mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);   // Jihad T-502: the identity unless set
     didEffectiveTransforms = true;
@@ -435,7 +488,21 @@ LayerManagerComposite::UpdateAndRender()
     // immediately use the resulting damage area, since ComputeDifferences
     // is also responsible for invalidates intermediate surfaces in
     // ContainerLayers.
+    JihadDiffScrollBegin(mJihadCompensateScroll && !mTarget, mJihadWorld._22);   // Jihad T-502 round 115
     nsIntRegion changed = mClonedLayerTreeProperties->ComputeDifferences(mRoot, nullptr, &mGeometryChanged);
+    JihadDiffScrollBegin(false, 1.0f);
+    // Jihad T-502 round 115: the diff is in the root layer's space; the frame is the world
+    // transform of it (the card's zoom), and the scissor and the rows read are frame pixels
+    if (!mTarget && !mJihadWorld.IsIdentity() && !changed.IsEmpty()) {
+      nsIntRegion scaled;
+      for (auto iter = changed.RectIter(); !iter.Done(); iter.Next()) {
+        const gfx::IntRect& r = iter.Get();
+        gfx::Rect fr = mJihadWorld.TransformBounds(gfx::Rect(r.x, r.y, r.width, r.height));
+        fr.RoundOut();
+        scaled.OrWith(gfx::IntRect(int32_t(fr.x), int32_t(fr.y), int32_t(fr.width), int32_t(fr.height)));
+      }
+      changed = Move(scaled);
+    }
 
     if (mTarget) {
       // Since we're composing to an external target, we're not going to use
@@ -459,16 +526,28 @@ LayerManagerComposite::UpdateAndRender()
 
     // Add any additional invalid rects from the window manager or previous
     // damage computed during ComposeToTarget().
-    invalid.Or(invalid, mInvalidRegion);
-    mInvalidRegion.SetEmpty();
+    if (!mJihadHoldBaseline) {   // T-503: a verify composite leaves it for the next frame
+      invalid.Or(invalid, mInvalidRegion);
+      mInvalidRegion.SetEmpty();
+    }
   }
 
   // Jihad T-502: what the tree changed is reported as such; the rows the daemon will read are
   // composed as well (a partial, scissored composite covers exactly the rows read back).
-  mJihadLastChanged = invalid.GetBounds();
+  if (mJihadIgnoreDiff && !mTarget) {
+    invalid.SetEmpty();
+    mJihadLastChanged = gfx::IntRect();
+  } else {
+    // round 124: clipped to the frame before the bounds (two strips off the frame are not a change)
+    nsIntRegion onFrame;
+    onFrame.And(invalid, mRenderBounds);
+    mJihadLastChanged = onFrame.GetBounds();
+  }
   mJihadPartialOn = false;
-  if (!mJihadBand.IsEmpty() && !mTarget) {
-    invalid.Or(invalid, mJihadBand);
+  if ((!mJihadBand.IsEmpty() || !mJihadBand2.IsEmpty() || !mJihadBand3.IsEmpty()) && !mTarget) {
+    if (!mJihadBand.IsEmpty()) invalid.Or(invalid, mJihadBand);
+    if (!mJihadBand2.IsEmpty()) invalid.Or(invalid, mJihadBand2);
+    if (!mJihadBand3.IsEmpty()) invalid.Or(invalid, mJihadBand3);
     mJihadPartialOn = true;
   } else if (!mTarget && !mJihadLastChanged.IsEmpty() && mClonedLayerTreeProperties &&
              !invalid.Contains(mRenderBounds)) {
@@ -476,7 +555,7 @@ LayerManagerComposite::UpdateAndRender()
   }
   if (invalid.IsEmpty() && !mWindowOverlayChanged) {
     // Composition requested, but nothing has changed. Don't do any work.
-    mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());
+    if (!mJihadHoldBaseline) mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());
     mJihadLastInvalid = mJihadLastChanged = gfx::IntRect();   // Jihad T-502: nothing to read back
     mJihadPartialOn = false;
     return;
@@ -493,12 +572,13 @@ LayerManagerComposite::UpdateAndRender()
   }
 
   mJihadLastInvalid = invalid.GetBounds();   // Jihad T-502
+  if (JihadPhases()) gJihadPhase[1] += (TimeStamp::Now() - jihadP1).ToMilliseconds();
   Render(invalid, opaque);
   mGeometryChanged = false;
   mWindowOverlayChanged = false;
 
   // Update cached layer tree information.
-  mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());
+  if (!mJihadHoldBaseline) mClonedLayerTreeProperties = LayerProperties::CloneFrom(GetRoot());   // T-503
 }
 
 already_AddRefed<DrawTarget>
@@ -915,6 +995,7 @@ LayerManagerComposite::Render(const nsIntRegion& aInvalidRegion, const nsIntRegi
   CompositorBench(mCompositor, bounds);
 
   MOZ_ASSERT(mRoot->GetOpacity() == 1);
+  const TimeStamp jihadB0 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
   if (mJihadPartialOn) {
     // Jihad T-502: a partial composite, clipped (and cleared) to what is being read back
     IntRect rect = aInvalidRegion.GetBounds().Intersect(bounds);
@@ -951,8 +1032,15 @@ LayerManagerComposite::Render(const nsIntRegion& aInvalidRegion, const nsIntRegi
   }
 
   // Render our layers.
+  const TimeStamp jihadR0 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
+  if (JihadPhases()) gJihadPhase[2] += (jihadR0 - jihadB0).ToMilliseconds();
   RootLayer()->Prepare(ViewAs<RenderTargetPixel>(clipRect, PixelCastJustification::RenderTargetIsParentLayerForRoot));
+  const TimeStamp jihadR1 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
   RootLayer()->RenderLayer(clipRect.ToUnknownRect());
+  if (JihadPhases()) {
+    gJihadPhase[3] += (jihadR1 - jihadR0).ToMilliseconds();
+    gJihadPhase[4] += (TimeStamp::Now() - jihadR1).ToMilliseconds();
+  }
 
   if (!mRegionToClear.IsEmpty()) {
     for (auto iter = mRegionToClear.RectIter(); !iter.Done(); iter.Next()) {
@@ -978,7 +1066,9 @@ LayerManagerComposite::Render(const nsIntRegion& aInvalidRegion, const nsIntRegi
     PROFILER_LABEL("LayerManagerComposite", "EndFrame",
       js::ProfileEntry::Category::GRAPHICS);
 
+    const TimeStamp jihadE0 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
     mCompositor->EndFrame();
+    if (JihadPhases()) gJihadPhase[5] += (TimeStamp::Now() - jihadE0).ToMilliseconds();
 
     // Call after EndFrame()
     mCompositor->SetDispAcquireFence(mRoot);

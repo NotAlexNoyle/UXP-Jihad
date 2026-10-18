@@ -88,6 +88,19 @@ public:
 
     void SetEGLSurfaceOverride(EGLSurface surf);
 
+    // Jihad T-502 round 104: make a pbuffer of exactly this size current in place of the
+    // context's own (the Adreno 220 driver bins an FBO render by the window surface's height:
+    // a 942-row frame in a 1400-row pbuffer lost its bottom 458 rows in some composites).
+    // Returns false (and keeps the current surface) when the pbuffer cannot be made.
+    bool JihadUsePBufferOfSize(int aWidth, int aHeight);
+    EGLSurface mJihadPbOverride = nullptr;
+    // Round 106: a band-sized pbuffer made current for the band composites of a scroll-only
+    // frame, then the frame's pbuffer again. false when the band pbuffer cannot be made.
+    bool JihadUseBandPBuffer(int aWidth, int aHeight);
+    void JihadUseFramePBuffer();
+    EGLSurface mJihadBandPb = nullptr;
+    int mJihadBandPbW = 0, mJihadBandPbH = 0;
+
     virtual bool MakeCurrentImpl(bool aForce) override;
 
     virtual bool IsCurrent() override;

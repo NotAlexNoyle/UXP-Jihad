@@ -337,6 +337,63 @@ GLContextEGL::SetEGLSurfaceOverride(const EGLSurface surf) {
 }
 
 bool
+GLContextEGL::JihadUsePBufferOfSize(int aWidth, int aHeight)
+{
+    if (aWidth <= 0 || aHeight <= 0) {
+        return false;
+    }
+    const EGLint attrs[] = { LOCAL_EGL_WIDTH, aWidth, LOCAL_EGL_HEIGHT, aHeight, LOCAL_EGL_NONE };
+    EGLSurface surf = sEGLLibrary.fCreatePbufferSurface(EGL_DISPLAY(), mConfig, attrs);
+    if (!surf) {
+        fprintf(stderr, "[jihad-gpu] a %dx%d pbuffer could not be made (0x%x); the context keeps its surface\n",
+                aWidth, aHeight, sEGLLibrary.fGetError());
+        return false;
+    }
+    EGLSurface old = mJihadPbOverride;
+    SetEGLSurfaceOverride(surf);
+    mJihadPbOverride = surf;
+    if (old) {
+        sEGLLibrary.fDestroySurface(EGL_DISPLAY(), old);
+    }
+    return true;
+}
+
+bool
+GLContextEGL::JihadUseBandPBuffer(int aWidth, int aHeight)
+{
+    if (!mJihadBandPb || mJihadBandPbW != aWidth || mJihadBandPbH != aHeight) {
+        if (mJihadBandPb) {
+            if (mSurfaceOverride == mJihadBandPb) JihadUseFramePBuffer();
+            sEGLLibrary.fDestroySurface(EGL_DISPLAY(), mJihadBandPb);
+            mJihadBandPb = nullptr;
+        }
+        const EGLint attrs[] = { LOCAL_EGL_WIDTH, aWidth, LOCAL_EGL_HEIGHT, aHeight, LOCAL_EGL_NONE };
+        mJihadBandPb = sEGLLibrary.fCreatePbufferSurface(EGL_DISPLAY(), mConfig, attrs);
+        if (!mJihadBandPb) {
+            fprintf(stderr, "[jihad-gpu] a %dx%d band pbuffer could not be made (0x%x)\n", aWidth, aHeight, sEGLLibrary.fGetError());
+            return false;
+        }
+        mJihadBandPbW = aWidth; mJihadBandPbH = aHeight;
+        fprintf(stderr, "[jihad-gpu] band pbuffer %dx%d made\n", aWidth, aHeight);
+    }
+    if (mSurfaceOverride != mJihadBandPb) {
+        mSurfaceOverride = mJihadBandPb;
+        MakeCurrent(true);
+    }
+    return true;
+}
+
+void
+GLContextEGL::JihadUseFramePBuffer()
+{
+    EGLSurface frame = mJihadPbOverride ? mJihadPbOverride : EGL_NO_SURFACE;
+    if (mSurfaceOverride != frame) {
+        mSurfaceOverride = frame;
+        MakeCurrent(true);
+    }
+}
+
+bool
 GLContextEGL::MakeCurrentImpl(bool aForce) {
     if (IsDestroyed()) {
         //Clear and exit

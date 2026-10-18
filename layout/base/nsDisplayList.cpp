@@ -1891,8 +1891,15 @@ already_AddRefed<LayerManager> nsDisplayList::PaintRoot(nsDisplayListBuilder* aB
 
   // Add metrics if there are none in the layer tree with the id (create an id
   // if there isn't one already) of the root scroll frame/root content.
+  // Jihad T-502: the offscreen card's compositor applies the card's scroll to the root scroll
+  // frame's content as APZ would (AsyncCompositionManager), without APZ; the root metrics it
+  // needs come with the displayport the daemon sets on the root scroll frame
+  // (jihad_layout_set_displayport), so a root scroll frame with a displayport counts like APZ here.
+  const bool jihadRootDisplayPort = presShell->GetRootScrollFrame() &&
+    presShell->GetRootScrollFrame()->GetContent() &&
+    nsLayoutUtils::HasDisplayPort(presShell->GetRootScrollFrame()->GetContent());
   bool ensureMetricsForRootId =
-    nsLayoutUtils::AsyncPanZoomEnabled(frame) &&
+    (nsLayoutUtils::AsyncPanZoomEnabled(frame) || jihadRootDisplayPort) &&
     !gfxPrefs::LayoutUseContainersForRootFrames() &&
     aBuilder->IsPaintingToWindow() &&
     !presContext->GetParentPresContext();

@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "nsPrintfCString.h"   // Jihad T-502 diagnostic
 #include "CompositorOGL.h"
 #include "mozilla/TimeStamp.h"   // Jihad T-502 timing
 #include <stddef.h>                     // for size_t
@@ -60,6 +61,8 @@ using namespace std;
 using namespace gfx;
 
 namespace layers {
+
+extern double gJihadPhase[12];   // LayerManagerComposite.cpp (T-502 round 139, JIHAD_GPU_PHASES=1)
 
 using namespace mozilla::gl;
 
@@ -264,7 +267,9 @@ CompositorOGL::Initialize(nsCString* const out_failureReason)
     // the 20-40 ms, the same from a frame-sized renderbuffer).
     static const bool sPass = getenv("JIHAD_GPU_PASS") != nullptr;
     mGLContext->MakeCurrent();
-    const int n = sPass ? 1 : 2;
+    // JIHAD_GPU_ONE_TARGET=1: a single renderbuffer target (round 103 A/B: one of the two went bad)
+    static const bool sOneTarget = getenv("JIHAD_GPU_ONE_TARGET") != nullptr;
+    const int n = (sPass || sOneTarget) ? 1 : 2;
     bool ok = true;
     for (int t = 0; t < n && ok; ++t) {
       GLuint rb = 0, tex = 0, fbo = 0;
@@ -322,6 +327,7 @@ CompositorOGL::Initialize(nsCString* const out_failureReason)
       }
       mJihadWindowFBO = mJihadWindowTex = 0;
     } else {
+      mJihadTargetSize = mJihadPbSize;
       fprintf(stderr, "[jihad-gpu] %s window target%s %dx%d: FBO %u%s\n", sPass ? "texture" : "renderbuffer", n > 1 ? "s" : "",
               mJihadPbSize.width, mJihadPbSize.height, mJihadWindowFBO, n > 1 ? " and one more, read by a thread of their own" : "");
     }
@@ -775,11 +781,29 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
                                  LOCAL_GL_ONE, LOCAL_GL_ONE_MINUS_SRC_ALPHA);
   mGLContext->fEnable(LOCAL_GL_BLEND);
 
+  mJihadDraws = mJihadSurfaceDraws = mJihadClipBottomMax = mJihadQuadBottomMax = 0;
+  mJihadProbed = false;
+  for (int i = 0; i < 4; i++) { mJihadRawSc[i] = mJihadCacheSc[i] = mJihadRawVp[i] = mJihadCacheVp[i] = -1; }
+  mJihadClipBottomMin = 1 << 30;
   RefPtr<CompositingRenderTargetOGL> rt =
     CompositingRenderTargetOGL::RenderTargetForWindow(this,
                                                       IntSize(width, height),
                                                       mJihadWindowFBO);
   SetRenderTarget(rt);
+  {
+    // Jihad T-502 diagnostic: the geometry of every composite (every 40th, and every one whose
+    // height is not the frame's)
+    static uint32_t sN = 0;
+    static int sLastH = -1;
+    const bool odd = (height != sLastH && sLastH >= 0);
+    if ((sN++ % 40) == 0 || odd) {
+      fprintf(stderr, "[jihad-gpu] BeginFrame %u: render bounds %d,%d %dx%d, target %dx%d, clip %s, widget %dx%d, window fbo %u\n",
+              sN, aRenderBounds.x, aRenderBounds.y, aRenderBounds.width, aRenderBounds.height, width, height,
+              aClipRectIn ? nsPrintfCString("%d,%d %dx%d", aClipRectIn->x, aClipRectIn->y, aClipRectIn->width, aClipRectIn->height).get() : "none",
+              mWidgetSize.width, mWidgetSize.height, mJihadWindowFBO);
+    }
+    sLastH = height;
+  }
 
 #ifdef DEBUG
   mWindowRenderTarget = mCurrentRenderTarget;
@@ -793,7 +817,10 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
     // Jihad T-502: the window frame starts white and opaque like the software path's buffer,
     // so a frame with no layers is the blank frame the daemon knows (and not published black).
     // A partial composite (a clip rect given) clears only inside it.
-    mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    // JIHAD_GPU_CLEAR_MAGENTA=1 (round 104 diagnostic): magenta, so rows no draw reached show as such
+    static const bool sMagenta = getenv("JIHAD_GPU_CLEAR_MAGENTA") != nullptr;
+    if (sMagenta) mGLContext->fClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+    else mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
     if (aClipRectIn) {
       mGLContext->fEnable(LOCAL_GL_SCISSOR_TEST);
       mGLContext->fScissor(aClipRectIn->x, FlipY(aClipRectIn->y + aClipRectIn->height),
@@ -1129,6 +1156,12 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   MOZ_ASSERT(mFrameInProgress, "frame not started");
   MOZ_ASSERT(mCurrentRenderTarget, "No destination");
 
+  static const bool sJihadPhases = getenv("JIHAD_GPU_PHASES") != nullptr;
+  struct JihadDrawTimer {
+    bool on; TimeStamp t;
+    ~JihadDrawTimer() { if (on) { gJihadPhase[8] += (TimeStamp::Now() - t).ToMilliseconds(); gJihadPhase[9] += 1; } }
+  } jihadDrawTimer{sJihadPhases, sJihadPhases ? TimeStamp::Now() : TimeStamp()};
+
   MakeCurrent();
 
   IntPoint offset = mCurrentRenderTarget->GetOrigin();
@@ -1139,6 +1172,39 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   renderBound.MoveBy(offset);
 
   Rect destRect = aTransform.TransformAndClipBounds(aGeometry, renderBound);
+  // Jihad T-502 round 140: a quad the clip leaves nothing of is not drawn. The culling below
+  // never caught it: the empty rect, inflated by a pixel, is a 2x2 rect at the origin, which
+  // always meets the target, so a band pass issued every tile of the page (60 draws, ~8 ms of
+  // CPU on a desktop page) for the scissor to throw away. JIHAD_GPU_NO_CULL=1 restores that.
+  static const bool sJihadNoCull = getenv("JIHAD_GPU_NO_CULL") != nullptr;
+  if (destRect.IsEmpty() && !sJihadNoCull) {
+    if (sJihadPhases) gJihadPhase[10] += 1;
+    return;
+  }
+  {
+    static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
+    if (sDrawStats) {
+      if (JihadIsWindowTarget()) {
+        if (mJihadDraws < 48) {
+          JihadDrawRec& d = mJihadDrawRecs[mJihadDraws];
+          d.x = destRect.x; d.y = destRect.y; d.w = destRect.width; d.h = destRect.height;
+          d.cy = aClipRect.y; d.cb = aClipRect.YMost();
+          d.type = aEffectChain.mPrimaryEffect ? (int)aEffectChain.mPrimaryEffect->mType : -1;
+          d.r = d.g = d.b = d.a = -1.0f; d.opacity = aOpacity;
+          if (aEffectChain.mPrimaryEffect && aEffectChain.mPrimaryEffect->mType == EffectTypes::SOLID_COLOR) {
+            const gfx::Color& c = static_cast<EffectSolidColor*>(aEffectChain.mPrimaryEffect.get())->mColor;
+            d.r = c.r; d.g = c.g; d.b = c.b; d.a = c.a;
+          }
+        }
+        ++mJihadDraws;
+        mJihadClipBottomMax = std::max(mJihadClipBottomMax, aClipRect.YMost());
+        mJihadClipBottomMin = std::min(mJihadClipBottomMin, aClipRect.YMost());
+        mJihadQuadBottomMax = std::max(mJihadQuadBottomMax, (int)destRect.YMost());
+      } else {
+        ++mJihadSurfaceDraws;
+      }
+    }
+  }
 
   // XXX: This doesn't handle 3D transforms. It also doesn't handled rotated
   //      quads. Fix me.
@@ -1150,6 +1216,7 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   destRect.MoveBy(-offset);
   renderBound = Rect(0, 0, size.width, size.height);
   if (!renderBound.Intersects(destRect)) {
+    if (sJihadPhases) gJihadPhase[10] += 1;
     return;
   }
 
@@ -1167,6 +1234,13 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   ScopedGLState scopedScissorTestState(mGLContext, LOCAL_GL_SCISSOR_TEST, true);
   ScopedScissorRect autoScissorRect(mGLContext, clipRect.x, FlipY(clipRect.y + clipRect.height),
                                     clipRect.width, clipRect.height);
+  {
+    static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
+    if (sDrawStats && !mJihadProbed && JihadIsWindowTarget() && clipRect.height > 0) {
+      mJihadProbed = true;
+      mGLContext->JihadRawAndCached(mJihadRawSc, mJihadCacheSc, mJihadRawVp, mJihadCacheVp);
+    }
+  }
 
   MaskType maskType;
   EffectMask* effectMask;
@@ -1999,7 +2073,9 @@ void
 CompositorOGL::JihadSelectTarget()
 {
   if (!mJihadTargetFBO[1]) {
-    return;   // a single target (the pass, or the pbuffer itself)
+    // a single target (the pass, or the pbuffer itself); after a band frame it is the window again
+    if (mJihadTargetFBO[0]) mJihadWindowFBO = mJihadTargetFBO[0];
+    return;
   }
   const int idx = mJihadCur;
   {
@@ -2020,6 +2096,198 @@ CompositorOGL::JihadSelectTarget()
   mJihadWindowFBO = mJihadTargetFBO[idx];
 }
 
+// T-502: the rows kept from the slot's last frame, moved by the card's scroll since (the
+// compositor applies that scroll to the content; the daemon keeps what it had and asks only
+// for what entered and the fixed rows). Positive = scrolled down: row r of the new frame is row
+// r + shift of the old one.
+// Round 141: the kept rects (opaque stuck layers that held still) are the base frame's pixels at
+// the same place, not shifted with the content.
+static bool
+JihadKeepRect(const JihadFrameRequest* aReq, int k, int* x0, int* x1, int* y0, int* y1)
+{
+  const int* q = aReq->keep[k];
+  *x0 = std::max(0, q[0]); *x1 = std::min(aReq->w, q[1]);
+  *y0 = std::max(0, q[2]); *y1 = std::min(aReq->h, q[3]);
+  return *x1 > *x0 && *y1 > *y0;
+}
+
+static void
+JihadShiftRows(JihadFrameRequest* aReq)
+{
+  const int h = aReq->h, dy = aReq->shift;
+  if (aReq->src && aReq->dest && aReq->src != aReq->dest && aReq->stride == aReq->w * 4 && dy < h && dy > -h) {
+    // round 113: from the newest slot, one contiguous copy (different segments, no overlap)
+    const size_t stride = (size_t)aReq->stride;
+    const int from = dy > 0 ? dy : 0, to = dy > 0 ? 0 : -dy, rows = h - (dy > 0 ? dy : -dy);
+    memcpy(aReq->dest + (size_t)to * stride, aReq->src + (size_t)from * stride, (size_t)rows * stride);
+    for (int k = 0; k < aReq->nKeep && dy; k++) {
+      int x0, x1, y0, y1;
+      if (!JihadKeepRect(aReq, k, &x0, &x1, &y0, &y1)) continue;
+      for (int r = y0; r < y1; r++) {
+        memcpy(aReq->dest + (size_t)r * stride + (size_t)x0 * 4, aReq->src + (size_t)r * stride + (size_t)x0 * 4, (size_t)(x1 - x0) * 4);
+      }
+    }
+    return;
+  }
+  if (!dy || !aReq->dest || aReq->stride != aReq->w * 4 || dy >= h || dy <= -h) {
+    return;
+  }
+  // in place: the kept rects saved first and put back after the shift
+  static uint8_t* sSaved = nullptr;
+  static size_t sSavedCap = 0;
+  size_t savedBytes = 0;
+  for (int k = 0; k < aReq->nKeep; k++) {
+    int x0, x1, y0, y1;
+    if (JihadKeepRect(aReq, k, &x0, &x1, &y0, &y1)) savedBytes += (size_t)(x1 - x0) * 4 * (y1 - y0);
+  }
+  if (savedBytes > sSavedCap) {
+    free(sSaved);
+    sSaved = (uint8_t*)malloc(savedBytes);
+    sSavedCap = sSaved ? savedBytes : 0;
+  }
+  const bool keepOk = savedBytes && sSaved;
+  if (keepOk) {
+    uint8_t* p = sSaved;
+    for (int k = 0; k < aReq->nKeep; k++) {
+      int x0, x1, y0, y1;
+      if (!JihadKeepRect(aReq, k, &x0, &x1, &y0, &y1)) continue;
+      for (int r = y0; r < y1; r++, p += (size_t)(x1 - x0) * 4) {
+        memcpy(p, aReq->dest + (size_t)r * aReq->stride + (size_t)x0 * 4, (size_t)(x1 - x0) * 4);
+      }
+    }
+  }
+  struct Restore {
+    JihadFrameRequest* req; bool on;
+    ~Restore() {
+      if (!on) return;
+      uint8_t* p = sSaved;
+      for (int k = 0; k < req->nKeep; k++) {
+        int x0, x1, y0, y1;
+        if (!JihadKeepRect(req, k, &x0, &x1, &y0, &y1)) continue;
+        for (int r = y0; r < y1; r++, p += (size_t)(x1 - x0) * 4) {
+          memcpy(req->dest + (size_t)r * req->stride + (size_t)x0 * 4, p, (size_t)(x1 - x0) * 4);
+        }
+      }
+    }
+  } restore{aReq, keepOk};
+  // row by row with memcpy (a row's source and destination never overlap, the rows do): the
+  // toolchain's memmove took 10-13 ms for the 2.9 MB, memcpy has the NEON path
+  const size_t stride = (size_t)aReq->stride;
+  if (dy > 0) {
+    for (int r = 0; r < h - dy; r++) memcpy(aReq->dest + (size_t)r * stride, aReq->dest + (size_t)(r + dy) * stride, stride);
+  } else {
+    for (int r = h - 1; r >= -dy; r--) memcpy(aReq->dest + (size_t)r * stride, aReq->dest + (size_t)(r + dy) * stride, stride);
+  }
+}
+
+void
+CompositorOGL::JihadShiftRowsNow(JihadFrameRequest* aReq)
+{
+  JihadShiftRows(aReq);
+}
+
+void
+CompositorOGL::JihadEnsureTargetSize(int aWidth, int aHeight)
+{
+  static const bool sPbTargets = getenv("JIHAD_GPU_PB_TARGETS") != nullptr;
+  if (sPbTargets || aWidth <= 0 || aHeight <= 0 || !mJihadTargetRB[0]) {
+    return;   // the pbuffer-sized targets (A/B), or the texture target of the swizzle pass
+  }
+  if (mJihadTargetSize == gfx::IntSize(aWidth, aHeight)) {
+    return;
+  }
+  // the context's surface at the frame's size too (round 104; JIHAD_GPU_KEEP_PB=1 for A/B)
+  static const bool sKeepPb = getenv("JIHAD_GPU_KEEP_PB") != nullptr;
+  bool pbOk = false;
+  if (!sKeepPb && mGLContext->GetContextType() == GLContextType::EGL) {
+    pbOk = static_cast<GLContextEGL*>(mGLContext.get())->JihadUsePBufferOfSize(aWidth, aHeight);
+    if (pbOk) mJihadPbSize = gfx::IntSize(aWidth, aHeight);
+  }
+  mGLContext->MakeCurrent();
+  bool ok = true;
+  for (int t = 0; t < 2; ++t) {
+    if (!mJihadTargetRB[t]) continue;
+    mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, mJihadTargetRB[t]);
+    mGLContext->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */, aWidth, aHeight);
+    mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadTargetFBO[t]);
+    const GLenum st = mGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+    if (st != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+      fprintf(stderr, "[jihad-gpu] window target %d at %dx%d: incomplete (0x%x)\n", t, aWidth, aHeight, st);
+      ok = false;
+    }
+    mGLContext->fDisable(LOCAL_GL_SCISSOR_TEST);
+    mGLContext->fViewport(0, 0, aWidth, aHeight);
+    mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    mGLContext->fClear(LOCAL_GL_COLOR_BUFFER_BIT);
+  }
+  mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, 0);
+  mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  fprintf(stderr, "[jihad-gpu] window targets %s %dx%d (were %dx%d)%s; the pbuffer %s\n", ok ? "re-sized to" : "FAILED at",
+          aWidth, aHeight, mJihadTargetSize.width, mJihadTargetSize.height, "",
+          pbOk ? "too" : sKeepPb ? "kept (JIHAD_GPU_KEEP_PB)" : "NOT (kept its size)");
+  mJihadTargetSize = gfx::IntSize(aWidth, aHeight);
+}
+
+int
+CompositorOGL::JihadBeginBandPass(int aWidth)
+{
+  static const bool sOff = getenv("JIHAD_GPU_BAND_SURFACE") && !strcmp(getenv("JIHAD_GPU_BAND_SURFACE"), "0");
+  if (sOff || aWidth <= 0 || mGLContext->GetContextType() != GLContextType::EGL) {
+    return 0;
+  }
+  GLContextEGL* egl = static_cast<GLContextEGL*>(mGLContext.get());
+  if (!egl->JihadUseBandPBuffer(aWidth, JihadBandRows())) {
+    return 0;
+  }
+  if (!mJihadBandFBO || mJihadBandW != aWidth) {
+    if (!mJihadBandRB) mGLContext->fGenRenderbuffers(1, &mJihadBandRB);
+    mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, mJihadBandRB);
+    mGLContext->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */, aWidth, JihadBandRows());
+    mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, 0);
+    if (!mJihadBandFBO) mGLContext->fGenFramebuffers(1, &mJihadBandFBO);
+    mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadBandFBO);
+    mGLContext->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, mJihadBandRB);
+    const GLenum st = mGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+    if (st != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+      fprintf(stderr, "[jihad-gpu] band target %dx%d incomplete (0x%x)\n", aWidth, JihadBandRows(), st);
+      egl->JihadUseFramePBuffer();
+      return 0;
+    }
+    mJihadBandW = aWidth;
+    fprintf(stderr, "[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer\n", aWidth, JihadBandRows(), mJihadBandFBO);
+  }
+  mJihadWindowFBO = mJihadBandFBO;
+  return JihadBandRows();
+}
+
+void
+CompositorOGL::JihadEndBandPass()
+{
+  // The band surface stays current: making it current costs 11-13 ms on the Adreno 220, going
+  // back 0.3 ms (round 107), and a pan is band frame after band frame. A whole composite puts
+  // the frame's surface back first (JihadUseFrameSurface).
+  JihadSelectTarget();
+}
+
+void
+CompositorOGL::JihadUseFrameSurface()
+{
+  if (mGLContext->GetContextType() == GLContextType::EGL) {
+    static_cast<GLContextEGL*>(mGLContext.get())->JihadUseFramePBuffer();
+  }
+}
+
+uint8_t*
+CompositorOGL::JihadBandScratch(size_t aBytes)
+{
+  static size_t sHave = 0;
+  if (!mJihadBandScratch || sHave < aBytes) {
+    mJihadBandScratch = MakeUnique<uint8_t[]>(aBytes);
+    sHave = aBytes;
+  }
+  return mJihadBandScratch.get();
+}
+
 bool
 CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
 {
@@ -2028,7 +2296,55 @@ CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
   }
   aReq->composed = true;
   if (!JihadEnsureReadThread()) {
-    aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo, aReq->hi);
+    const TimeStamp t0 = TimeStamp::Now();
+    if (aReq->shift || aReq->src) mGLContext->fFlush();   // the GPU starts the composite while the rows are copied
+    JihadShiftRows(aReq);
+    const TimeStamp t1 = TimeStamp::Now();
+    aReq->ok = true;
+    if (aReq->hi > aReq->lo) aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo, aReq->hi);
+    const TimeStamp t2 = TimeStamp::Now();
+    if (aReq->ok && aReq->hi2 > aReq->lo2) aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo2, aReq->hi2);
+    // round 138: the fixed and stuck layers' columns
+    {
+      const int surfaceH = std::min<int>(aReq->h, mWidgetSize.height);
+      for (int c = 0; c < aReq->nCols && aReq->ok; c++) {
+        const int* cc = aReq->cols[c];
+        aReq->ok = JihadReadColumns(aReq->dest, aReq->stride, surfaceH, cc[0], cc[1], cc[2], cc[3] - cc[2], cc[2]);
+      }
+    }
+    // JIHAD_GPU_DUMP_TARGET=<path>: the first time a band read comes back all white (three
+    // samples a row), the whole target is read into <path> (raw BGRA, top-down) for a look
+    static const char* sDumpTarget = getenv("JIHAD_GPU_DUMP_TARGET");
+    static bool sDumpedTarget = false;
+    if (sDumpTarget && !sDumpedTarget && aReq->ok && aReq->scrollY > 100.0f && aReq->hi - aReq->lo < aReq->h) {   // a pan's partial frame
+      const int bands[2][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2} };
+      for (int b = 0; b < 2 && !sDumpedTarget; b++) {
+        const int lo = bands[b][0], hi = bands[b][1];
+        if (hi - lo < 8) continue;
+        bool allWhite = true;
+        for (int r = lo; r < hi && allWhite; r++) {
+          const uint8_t* row = aReq->dest + (size_t)r * aReq->stride;
+          for (int x : { aReq->w / 8, aReq->w / 2, aReq->w - aReq->w / 8 }) { const uint8_t* px = row + (size_t)x * 4; if (!(px[0] == 255 && px[1] == 255 && px[2] == 255)) { allWhite = false; break; } }
+        }
+        if (allWhite) {
+          sDumpedTarget = true;
+          uint8_t* whole = (uint8_t*)malloc((size_t)aReq->stride * aReq->h);
+          if (whole && JihadReadFrame(whole, aReq->stride, aReq->w, aReq->h, 0, aReq->h)) {
+            FILE* f = fopen(sDumpTarget, "wb");
+            if (f) { fwrite(whole, 1, (size_t)aReq->stride * aReq->h, f); fclose(f); }
+          }
+          free(whole);
+          fprintf(stderr, "[jihad-gpu] band %d..%d read back all white: the whole target dumped to %s (request: bands %d..%d %d..%d, shift %d, scroll %.1f,%.1f valid %d)\n",
+                  lo, hi, sDumpTarget, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->shift, aReq->scrollX, aReq->scrollY, (int)aReq->scrollValid);
+        }
+      }
+    }
+    static uint32_t sN = 0;
+    if (sN++ < 12 || (sN % 50) == 0) {
+      fprintf(stderr, "[jihad-gpu] read: shift %d rows %.1f ms, band %d..%d %.1f ms, band %d..%d %.1f ms\n",
+              aReq->shift, (t1 - t0).ToMilliseconds(), aReq->lo, aReq->hi, (t2 - t1).ToMilliseconds(),
+              aReq->lo2, aReq->hi2, (TimeStamp::Now() - t2).ToMilliseconds());
+    }
     aReq->done(aReq);
     return true;
   }
@@ -2088,11 +2404,13 @@ CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
     const double waitCpuMs = (cpu1.tv_sec - cpu0.tv_sec) * 1000.0 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1e6;
     t1 = TimeStamp::Now();
     const int w = aReq->w, h = aReq->h;
-    int lo = aReq->lo, hi = aReq->hi;
-    if (hi <= lo) { lo = 0; hi = h; }
-    if (lo < 0) lo = 0;
-    if (hi > h) hi = h;
-    if (hi > lo && aReq->dest && aReq->stride == w * 4) {
+    JihadShiftRows(aReq);
+    const int bands[2][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2} };
+    for (int b = 0; b < 2; b++) {
+      int lo = bands[b][0], hi = bands[b][1];
+      if (lo < 0) lo = 0;
+      if (hi > h) hi = h;
+      if (hi <= lo || !aReq->dest || aReq->stride != w * 4) continue;
       const int rows = hi - lo;
       uint8_t* band = aReq->dest + (size_t)lo * aReq->stride;
       gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadReadTargetFBO[aReq->target]);
@@ -2180,18 +2498,144 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     return true;
   }
   mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  // JIHAD_GPU_READ_FINISH=1: a glFinish before the read (round 100's guess at the white rows,
+  // which were the driver binning by the surface's size, round 104; 19 ms a whole frame, off)
+  static const bool sReadFinish = getenv("JIHAD_GPU_READ_FINISH") != nullptr;
+  if (sReadFinish) {
+    mGLContext->fFinish();
+  }
+  TimeStamp tFin = TimeStamp::Now();
   {
     // The window view is flipped: frame row r is GL row h-1-r, so the band's GL rows are
     // [h-hi, h-lo), read bottom-up into the band's rows and then reversed in place.
+    // Round 102 A/B: JIHAD_GPU_READ_SCRATCH=1 reads into private memory and copies;
+    // JIHAD_GPU_READ_CHUNK=<rows> reads in chunks of that many rows.
+    static const bool sScratch = getenv("JIHAD_GPU_READ_SCRATCH") != nullptr;
+    static const int sChunk = getenv("JIHAD_GPU_READ_CHUNK") ? atoi(getenv("JIHAD_GPU_READ_CHUNK")) : 0;
     ScopedPackState safePackState(mGLContext);
     mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
-    mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+    if (sScratch) {
+      uint8_t* tmp = JihadBandScratch((size_t)aStride * rows);
+      mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, tmp);
+      memcpy(band, tmp, (size_t)aStride * rows);
+    } else if (sChunk > 0) {
+      for (int done = 0; done < rows; done += sChunk) {
+        const int n = std::min(sChunk, rows - done);
+        mGLContext->fReadPixels(0, h - hi + done, w, n, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band + (size_t)done * aStride);
+      }
+    } else {
+      mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+    }
+    // JIHAD_GPU_READ_VERIFY=1: when frame row 700 (GL row h-1-700) of a whole read is white,
+    // read the region again into private memory and say what the second read holds there
+    static const bool sReadVerify = getenv("JIHAD_GPU_READ_VERIFY") != nullptr;
+    if (sReadVerify && lo == 0 && hi == h && h > 700) {
+      auto whiteAt = [&](const uint8_t* buf, int glRow) {
+        const uint8_t* row = buf + (size_t)glRow * aStride;
+        for (int x : { w / 8, w / 2, w - w / 8 }) { const uint8_t* px = row + (size_t)x * 4; if (!(px[0] == 255 && px[1] == 255 && px[2] == 255)) return false; }
+        return true;
+      };
+      auto whiteRunFromBottom = [&](const uint8_t* buf) { int g = 0; while (g < rows && whiteAt(buf, g)) ++g; return g; };
+      static uint32_t sChecked = 0, sWhite = 0, sSecondGood = 0;
+      ++sChecked;
+      if (whiteAt(band, h - 1 - 700)) {
+        ++sWhite;
+        uint8_t* again = (uint8_t*)malloc((size_t)aStride * rows);
+        if (again) {
+          mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, again);
+          const bool secondWhite = whiteAt(again, h - 1 - 700);
+          if (!secondWhite) ++sSecondGood;
+          fprintf(stderr, "[jihad-gpu] read verify: first read white from GL row 0 for %d rows; second read (private memory) %s, white for %d rows (white firsts %u of %u checked, second good %u)\n",
+                  whiteRunFromBottom(band), secondWhite ? "WHITE too" : "HAS CONTENT", whiteRunFromBottom(again), sWhite, sChecked, sSecondGood);
+          free(again);
+        }
+      }
+    }
   }
   TimeStamp t1 = TimeStamp::Now();
   JihadSwizzleAndFlipRows(band, aStride, w, rows, true);
+  {
+    static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
+    if (sDrawStats && lo == 0 && hi == h && h > 700) {
+      const uint8_t* row = aDest + (size_t)700 * aStride;
+      bool white = true;
+      for (int x : { w / 8, w / 2, w - w / 8 }) { const uint8_t* px = row + (size_t)x * 4; if (!(px[0] == 255 && px[1] == 255 && px[2] == 255)) white = false; }
+      {
+        // the sequence of whole reads: W/C (white at row 700 or content) with the target's FBO
+        static char sSeq[64]; static int sSeqN = 0;
+        const int fboIdx = (mJihadWindowFBO == mJihadTargetFBO[0]) ? 0 : (mJihadWindowFBO == mJihadTargetFBO[1]) ? 1 : 9;
+        bool magenta = true;
+        for (int x : { w / 8, w / 2, w - w / 8 }) { const uint8_t* px = row + (size_t)x * 4; if (!(px[0] == 255 && px[1] == 0 && px[2] == 255)) magenta = false; }
+        sSeq[sSeqN++] = white ? 'W' : magenta ? 'M' : 'C'; sSeq[sSeqN++] = (char)('0' + fboIdx);
+        if (sSeqN >= 60) { sSeq[sSeqN] = 0; fprintf(stderr, "[jihad-gpu] read sequence (W/C + target): %s\n", sSeq); sSeqN = 0; }
+      }
+      static uint32_t sN = 0;
+      static int sListedWhite = 0, sListedContent = 0;
+      if (mJihadDraws >= 20 && ((white && sListedWhite < 2) || (!white && sListedContent < 1))) {
+        if (white) ++sListedWhite; else ++sListedContent;
+        for (int i = 0; i < std::min(mJihadDraws, 48); i++) {
+          const JihadDrawRec& d = mJihadDrawRecs[i];
+          fprintf(stderr, "[jihad-gpu] draw %s #%d: rect %.0f,%.0f %.0fx%.0f clip y %d..%d type %d colour %.2f,%.2f,%.2f,%.2f opacity %.2f\n",
+                  white ? "W" : "C", i, d.x, d.y, d.w, d.h, d.cy, d.cb, d.type, d.r, d.g, d.b, d.a, d.opacity);
+        }
+      }
+      if (white || (sN++ % 20) == 0) {
+        fprintf(stderr, "[jihad-gpu] drawstats: row 700 %s; window draws %d (surface draws %d), clip bottom %d..%d, quad bottom max %d, viewport %dx%d; first draw: scissor raw %d,%d %dx%d cached %d,%d %dx%d, viewport raw %d,%d %dx%d cached %d,%d %dx%d\n",
+                white ? "WHITE" : "content", mJihadDraws, mJihadSurfaceDraws, mJihadClipBottomMin == (1 << 30) ? -1 : mJihadClipBottomMin,
+                mJihadClipBottomMax, mJihadQuadBottomMax, mViewportSize.width, mViewportSize.height,
+                mJihadRawSc[0], mJihadRawSc[1], mJihadRawSc[2], mJihadRawSc[3], mJihadCacheSc[0], mJihadCacheSc[1], mJihadCacheSc[2], mJihadCacheSc[3],
+                mJihadRawVp[0], mJihadRawVp[1], mJihadRawVp[2], mJihadRawVp[3], mJihadCacheVp[0], mJihadCacheVp[1], mJihadCacheVp[2], mJihadCacheVp[3]);
+      }
+    }
+  }
   if (sTimed++ < 12 || (sTimed % 100) == 0) {
-    fprintf(stderr, "[jihad-gpu] glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
-            rows, (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
+    fprintf(stderr, "[jihad-gpu] glFinish %.1f ms, glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
+            (tFin - t0).ToMilliseconds(), rows, (t1 - tFin).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
+  }
+  return true;
+}
+
+bool
+CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int aX0, int aX1, int aSrcRowLo, int aRows, int aDestRowLo,
+                                int aDestX)
+{
+  // Round 138: a stuck sidebar is ~540 rows but a fifth of the width; glReadPixels costs by the
+  // pixel on this driver (gpu-bench section 10: a 170-wide column of 542 rows 23% of the full
+  // rows), so the fixed and stuck layers are read as their columns. The view is flipped (target
+  // row r is GL row aSurfaceH-1-r): read bottom-up into private memory, swizzled and reversed
+  // there, then each row's span copied into the frame.
+  const int w = aX1 - aX0;
+  const int destX = aDestX < 0 ? aX0 : aDestX;
+  if (!mGLContext || !aDest || w <= 0 || aRows <= 0 || aSrcRowLo < 0 || aSrcRowLo + aRows > aSurfaceH ||
+      aX0 < 0 || aX1 * 4 > aStride || (destX + w) * 4 > aStride || aDestRowLo < 0) {
+    return false;
+  }
+  static uint8_t* sBuf = nullptr;
+  static size_t sCap = 0;
+  const size_t bytes = (size_t)w * 4 * aRows;
+  if (sCap < bytes) {
+    free(sBuf);
+    sBuf = (uint8_t*)malloc(bytes);
+    sCap = sBuf ? bytes : 0;
+    if (!sBuf) return false;
+  }
+  mGLContext->MakeCurrent();
+  mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  const TimeStamp t0 = TimeStamp::Now();
+  {
+    ScopedPackState safePackState(mGLContext);
+    mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), w, aRows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, sBuf);
+  }
+  const TimeStamp t1 = TimeStamp::Now();
+  JihadSwizzleAndFlipRows(sBuf, w * 4, w, aRows, true);
+  for (int r = 0; r < aRows; r++) {
+    memcpy(aDest + (size_t)(aDestRowLo + r) * aStride + (size_t)destX * 4, sBuf + (size_t)r * w * 4, (size_t)w * 4);
+  }
+  static uint32_t sN = 0;
+  if (sN++ < 12 || (sN % 100) == 0) {
+    fprintf(stderr, "[jihad-gpu] column read x %d..%d, rows %d..%d (target rows from %d of %d): glReadPixels %.1f ms, swizzle+copy %.1f ms\n",
+            aX0, aX1, aDestRowLo, aDestRowLo + aRows, aSrcRowLo, aSurfaceH, (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
   }
   return true;
 }

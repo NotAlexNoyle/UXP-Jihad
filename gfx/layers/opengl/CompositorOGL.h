@@ -155,9 +155,25 @@ protected:
 struct JihadFrameRequest {
   uint8_t* dest = nullptr;
   int stride = 0, w = 0, h = 0;
-  int lo = 0, hi = 0;                  // the rows to read, top-down ((0,0) = every row)
+  int lo = 0, hi = 0;                  // the rows to read, top-down ((0,0) = none asked for)
+  int lo2 = 0, hi2 = 0;                // a second band to read ((0,0) = none)
+  const uint8_t* src = nullptr;        // round 113: the kept rows come from this frame (the newest slot), not dest
+  int srcY = 0;                        // round 115: src's position (card px), when the engine decides the shift
+  bool engineShift = false;            //   the shift the diff saw (a scroll the page made) replaces the daemon's
+  bool verify = false;                 // T-503: a verify composite (JIHAD_GPU_VERIFY): no state the next frame uses changes
+  int frameY = 0; bool frameYValid = false;   // out: this frame's position (card px), when the engine decided it
+  int shift = 0;                       // rows the destination is shifted by (memmove) before the read: the
+                                       // card's scroll since the slot's frame, positive = scrolled down
+  int fixedLo = 0, fixedHi = 0;        // out: the rows fixed and sticky layers cover (0,0 = none)
+  int cols[4][4] = {};                 // round 138: column reads after the bands (x0, x1, y0, y1 on the
+  int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift
+  int keep[4][4] = {};                 // round 141: rects (x0, x1, y0, y1) the shift leaves where they are:
+  int nKeep = 0;                       //   opaque stuck layers that held still, copied unshifted from the base
+  bool scrollOnly = false;             // out: the composite's only change was the card's scroll
   int target = 0;                      // which window target holds the frame (the compositor fills it)
   int invLo = 0, invHi = 0;            // the rows the composite changed (the compositor fills them)
+  float scrollX = 0.0f, scrollY = 0.0f;   // the card's scroll (CSS px) for the compositor to apply
+  bool scrollValid = false;
   void* fence = nullptr;               // the EGL fence after the compose, or null (glFinish was used)
   mozilla::Atomic<bool> composed{false};   // the compose is issued; the read is pending
   bool ok = false;
@@ -193,11 +209,47 @@ public:
   bool JihadIsWindowTarget() const;
   // rows [aRowLo, aRowHi) of the frame, top-down; (0, 0) = every row
   bool JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeight, int aRowLo = 0, int aRowHi = 0);
+  // round 138: columns aX0..aX1 of the target's rows aSrcRowLo.. (aRows of them, top-down, on a
+  // target aSurfaceH rows tall) into the frame's rows aDestRowLo.. at the same columns
+  bool JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int aX0, int aX1, int aSrcRowLo, int aRows, int aDestRowLo,
+                        int aDestX = -1);   // round 142: the frame's column when packed elsewhere on the target
   // The asynchronous frame: SelectTarget before the compose picks the free window target,
   // ReadAsync after it fences the compose and hands the target to the read thread, which reads
   // rows [lo, hi) into dest and calls done (on the read thread). When no read thread could be
   // made the read happens here, synchronously, before ReadAsync returns.
   void JihadSelectTarget();
+  // T-502 round 101: the window targets (and the band target's width) sized to the frame the
+  // daemon asks for, re-specified when it changes. Composing a 768x942 frame into the corner of
+  // the 1100x1400 pbuffer-sized renderbuffers left frame rows 484..941 (the bottom 458 GL rows;
+  // 1400 - 942 = 458) white in about one composite in five on the Adreno 220, every quad drawn,
+  // glFinish no help (2026-10-18). JIHAD_GPU_PB_TARGETS=1 keeps the pbuffer size for A/B.
+  void JihadEnsureTargetSize(int aWidth, int aHeight);
+  // T-502 round 105: a scroll-only frame composes its bands stacked at the top of the frame-sized
+  // window target (full render bounds, a partial clip per band) and reads them back in one call.
+  // A separate band-sized FBO broke on the Adreno 220: the driver bins an FBO render by the EGL
+  // surface's size, so any target or viewport smaller than the surface lost rows (round 104).
+  // 0 rows when off (JIHAD_GPU_NO_BAND_TARGET=1).
+  int JihadBandMaxRows() const { static const bool sOff = getenv("JIHAD_GPU_NO_BAND_TARGET") != nullptr; return sOff ? 0 : (JihadBandRows() > 320 ? JihadBandRows() : 320); }
+  // Round 106: the band pass on its own surface (JIHAD_GPU_BAND_SURFACE=0 keeps the stack in the
+  // frame-sized target): a 256-row pbuffer and an FBO of the same size are made current, so the
+  // composite costs the band, not the frame; JihadEndBandPass puts the frame's surface and
+  // target back. Returns the band target's rows, 0 when the band pass is not available.
+  int JihadBeginBandPass(int aWidth);
+  void JihadEndBandPass();
+  void JihadUseFrameSurface();   // the frame's pbuffer current again (before a whole composite)
+  GLuint mJihadBandRB = 0, mJihadBandFBO = 0;
+  int mJihadBandW = 0;
+  // the band surface's rows: JIHAD_GPU_BAND_ROWS (64..942, default 256; round 137)
+  static int JihadBandRows() {
+    static const int sRows = [] {
+      const char* e = getenv("JIHAD_GPU_BAND_ROWS");
+      const int r = e ? atoi(e) : 256;
+      return r < 64 ? 64 : (r > 942 ? 942 : r);
+    }();
+    return sRows;
+  }
+  void JihadShiftRowsNow(JihadFrameRequest* aReq);
+  uint8_t* JihadBandScratch(size_t aBytes);   // the stacked bands' read, at least aBytes
   bool JihadReadAsync(JihadFrameRequest* aReq);
   void JihadReadOnReadThread(JihadFrameRequest* aReq);   // the read thread
   void JihadReadThreadInit();                            // the read thread, once
@@ -352,6 +404,15 @@ private:
   // their own through a context that shares them, so the compositor thread is never held by a
   // glReadPixels (20-45 ms on the Adreno 220) and a frame's read overlaps the next compose.
   GLuint mJihadTargetRB[2] = {0, 0}, mJihadTargetFBO[2] = {0, 0};
+  // T-502 diagnostic (JIHAD_GPU_DRAWSTATS): per composite, the draws on the window target
+  int mJihadDraws = 0, mJihadClipBottomMax = 0, mJihadQuadBottomMax = 0, mJihadClipBottomMin = 1 << 30;
+  int mJihadSurfaceDraws = 0;
+  struct JihadDrawRec { float x, y, w, h; int cy, cb; int type; float r, g, b, a, opacity; };
+  JihadDrawRec mJihadDrawRecs[48];
+  GLint mJihadRawSc[4], mJihadCacheSc[4], mJihadRawVp[4], mJihadCacheVp[4];   // at the first window draw
+  bool mJihadProbed = false;
+  gfx::IntSize mJihadTargetSize;                     // the window targets' storage size (round 101)
+  UniquePtr<uint8_t[]> mJihadBandScratch;              // one read of the stacked bands, split from here
   int mJihadCur = 0;                                 // the target the next frame draws into
   mozilla::Atomic<int32_t> mJihadTargetBusy[2];      // handed to the read thread, not yet read
   mozilla::Monitor mJihadReadMon{"jihad-read"};
