@@ -3989,6 +3989,9 @@ PluginInstanceChild::UpdateWindowAttributes(bool aForceSetWindow)
         //
         // After setwindow, not before, and once: the plugin needs its geometry first, and
         // UpdateWindowAttributes runs on every resize and every scroll.
+        // (Palm's NPEvent exists only where npapi.h defines it: the headless toolkit the device
+        // builds; the desktop GTK build has the X11 one, T-387)
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
         if (mPluginIface->event && !mJihadSentPalmGainFocus) {
             mJihadSentPalmGainFocus = true;
             NPEvent ev;
@@ -4000,6 +4003,7 @@ PluginInstanceChild::UpdateWindowAttributes(bool aForceSetWindow)
                     (int)handled);
             fflush(stderr);
         }
+#endif
     }
 }
 

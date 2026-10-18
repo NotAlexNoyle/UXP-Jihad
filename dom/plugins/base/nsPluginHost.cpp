@@ -4234,7 +4234,9 @@ PluginDestructionGuard::DelayDestroy(nsNPAPIPluginInstance *aInstance)
 extern "C" MOZ_EXPORT int
 jihad_plugin_palm_spotlight(int aOn, int aLeft, int aTop, int aRight, int aBottom)
 {
-#ifdef MOZ_ENABLE_NPAPI
+  // Palm's NPEvent exists only where npapi.h defines it: the headless toolkit the device builds
+  // (the desktop GTK build has the X11 one and no Palm plugin to tell; T-387)
+#if defined(MOZ_ENABLE_NPAPI) && defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
   RefPtr<nsPluginHost> host = nsPluginHost::GetInst();
   if (!host) {
     return 0;
