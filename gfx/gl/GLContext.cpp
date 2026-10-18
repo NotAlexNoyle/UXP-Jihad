@@ -812,6 +812,7 @@ GLContext::InitWithPrefixImpl(const char* prefix, bool trygl)
         "Adreno 205",
         "Adreno (TM) 200",
         "Adreno (TM) 205",
+        "Adreno (TM) 220",
         "Adreno (TM) 305",
         "Adreno (TM) 320",
         "Adreno (TM) 330",

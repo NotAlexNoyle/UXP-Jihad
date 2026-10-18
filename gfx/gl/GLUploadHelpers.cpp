@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "GLUploadHelpers.h"
+#include "mozilla/TimeStamp.h"   // Jihad T-502 device rounds
 
 #include "GLContext.h"
 #include "mozilla/gfx/2D.h"
@@ -90,8 +91,14 @@ CanUploadSubTextures(GLContext* gl)
 
     // There are certain GPUs that we don't want to use glTexSubImage2D on
     // because that function can be very slow and/or buggy
+    // The "(TM)" spellings and the 220 included: on the TouchPad's Adreno 220 twelve 256x256
+    // glTexSubImage2D updates of a 1024x768 texture cost 160 ms against 10 ms for one whole
+    // glTexImage2D (Jihad, tools/device/gpu-bench.c, 2026-10-17).
     if (gl->Renderer() == GLRenderer::Adreno200 ||
-        gl->Renderer() == GLRenderer::Adreno205)
+        gl->Renderer() == GLRenderer::Adreno205 ||
+        gl->Renderer() == GLRenderer::AdrenoTM200 ||
+        gl->Renderer() == GLRenderer::AdrenoTM205 ||
+        gl->Renderer() == GLRenderer::AdrenoTM220)
     {
         return false;
     }
@@ -415,9 +422,20 @@ UploadImageDataToTexture(GLContext* gl,
                          GLenum aTextureUnit,
                          GLenum aTextureTarget)
 {
+    // Jihad T-502 device rounds: the steps before the GL upload call, timed
+    const mozilla::TimeStamp jihadE0 = mozilla::TimeStamp::Now();
     gl->MakeCurrent();
+    const mozilla::TimeStamp jihadE1 = mozilla::TimeStamp::Now();
     gl->fActiveTexture(aTextureUnit);
     gl->fBindTexture(aTextureTarget, aTexture);
+    const mozilla::TimeStamp jihadE2 = mozilla::TimeStamp::Now();
+    struct JihadPreLog { const mozilla::TimeStamp &e0, &e1, &e2; ~JihadPreLog() {
+      static uint32_t sN = 0;
+      const double all = (mozilla::TimeStamp::Now() - e0).ToMilliseconds();
+      if (all >= 8.0 && sN++ < 60)
+        fprintf(stderr, "[jihad-gpu] upload steps: make current %.1f ms, bind %.1f ms, the rest %.1f ms (all %.1f)\n",
+                (e1 - e0).ToMilliseconds(), (e2 - e1).ToMilliseconds(), all - (e2 - e0).ToMilliseconds(), all);
+    } } jihadPreLog{jihadE0, jihadE1, jihadE2};
 
     GLenum format = 0;
     GLenum internalFormat = 0;
@@ -433,7 +451,7 @@ UploadImageDataToTexture(GLContext* gl,
             if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
               format = LOCAL_GL_BGRA;
               surfaceFormat = SurfaceFormat::R8G8B8A8;
-              type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+              type = gl->IsGLES() ? LOCAL_GL_UNSIGNED_BYTE : LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;   // Jihad: GLES has no 8_8_8_8_REV; BGRA_EXT takes UNSIGNED_BYTE
             } else {
               format = LOCAL_GL_RGBA;
               surfaceFormat = SurfaceFormat::B8G8R8A8;
@@ -447,7 +465,7 @@ UploadImageDataToTexture(GLContext* gl,
             if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
               format = LOCAL_GL_BGRA;
               surfaceFormat = SurfaceFormat::R8G8B8X8;
-              type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+              type = gl->IsGLES() ? LOCAL_GL_UNSIGNED_BYTE : LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;   // Jihad: GLES has no 8_8_8_8_REV; BGRA_EXT takes UNSIGNED_BYTE
             } else {
               format = LOCAL_GL_RGBA;
               surfaceFormat = SurfaceFormat::B8G8R8X8;
@@ -460,7 +478,7 @@ UploadImageDataToTexture(GLContext* gl,
               // Upload our RGBA as BGRA, but store that the uploaded format is
               // BGRA. (sample from R to get B)
               format = LOCAL_GL_BGRA;
-              type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+              type = gl->IsGLES() ? LOCAL_GL_UNSIGNED_BYTE : LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;   // Jihad: GLES has no 8_8_8_8_REV; BGRA_EXT takes UNSIGNED_BYTE
               surfaceFormat = SurfaceFormat::B8G8R8A8;
             } else {
               format = LOCAL_GL_RGBA;
@@ -474,7 +492,7 @@ UploadImageDataToTexture(GLContext* gl,
             // format used.
             if (gl->GetPreferredARGB32Format() == LOCAL_GL_BGRA) {
               format = LOCAL_GL_BGRA;
-              type = LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;
+              type = gl->IsGLES() ? LOCAL_GL_UNSIGNED_BYTE : LOCAL_GL_UNSIGNED_INT_8_8_8_8_REV;   // Jihad: GLES has no 8_8_8_8_REV; BGRA_EXT takes UNSIGNED_BYTE
               surfaceFormat = SurfaceFormat::B8G8R8X8;
             } else {
               format = LOCAL_GL_RGBA;
@@ -497,6 +515,9 @@ UploadImageDataToTexture(GLContext* gl,
         default:
             MOZ_ASSERT_UNREACHABLE("Unhandled image surface format!");
     }
+    if (gl->IsGLES() && (format == LOCAL_GL_BGRA || format == LOCAL_GL_RGBA)) {
+        internalFormat = format;   // Jihad: GLES2 wants them equal (TexImage2DHelper asserts it)
+    }
 
     if (aOutUploadSize) {
         *aOutUploadSize = 0;
@@ -506,6 +527,15 @@ UploadImageDataToTexture(GLContext* gl,
       return gfx::SurfaceFormat::UNKNOWN;
     }
 
+    // Jihad T-502 device rounds: the format this upload goes up as, and the call's own time
+    static uint32_t sJihadUploads = 0;
+    const mozilla::TimeStamp jihadT0 = mozilla::TimeStamp::Now();
+    struct JihadUpLog { const mozilla::TimeStamp& t0; GLenum fmt; GLenum type; int w, h; bool init; ~JihadUpLog() {
+      const double ms = (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
+      if (sJihadUploads++ < 40 || ms >= 8.0) {
+        if (sJihadUploads < 400) fprintf(stderr, "[jihad-gpu] upload call %dx%d format 0x%x type 0x%x init %d: %.1f ms\n", w, h, (unsigned)fmt, (unsigned)type, (int)init, ms);
+      }
+    } } jihadUpLog{jihadT0, format, type, aSize.width, aSize.height, aNeedInit};
     if (aNeedInit || !CanUploadSubTextures(gl)) {
         // If the texture needs initialized, or we are unable to
         // upload sub textures, then initialize and upload the entire
