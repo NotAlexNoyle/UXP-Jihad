@@ -69,6 +69,22 @@ ClientCanvasLayer::Initialize(const Data& aData)
   }
 
   UniquePtr<SurfaceFactory> factory = GLScreenBuffer::CreateFactory(mGLContext, caps, forwarder, mFlags);
+  // Jihad (T-511): a WebGL canvas whose context shares the compositor's textures (the share root,
+  // GLContextProviderEGL.cpp) hands the compositor its texture: no readback, no upload
+  if (!factory && !mGLFrontbuffer && !aData.mIsMirror && getenv("JIHAD_GPU_COMPOSITOR") &&
+      !getenv("JIHAD_GPU_NO_SHARE") && mGLContext->GetContextType() == gl::GLContextType::EGL &&
+      mGLContext->GetSharedContext()) {
+    RefPtr<LayersIPCChannel> channel = forwarder->GetTextureForwarder();
+    factory = MakeUnique<gl::SurfaceFactory_GLTexture>(mGLContext, caps, channel, mFlags);
+  }
+  // Jihad (T-511): which way a WebGL canvas reaches the compositor on the GPU path (the basic surface:
+  // read back, through the context's pbuffer, ScopedReadbackFB, and uploaded each frame)
+  if (getenv("JIHAD_GPU_COMPOSITOR")) {
+    static int sLogged = 0;
+    if (sLogged++ < 4)
+      fprintf(stderr, "[jihad-gpu] canvas layer: %s\n",
+              factory ? "a shared surface (zero copy)" : "the basic surface (read back through the pbuffer and uploaded each frame)");
+  }
 
   if (mGLFrontbuffer || aData.mIsMirror) {
     // We're using a source other than the one in the default screen.

@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "SharedSurface.h"
+#include "GLContextEGL.h"   // Jihad T-511: the pbuffer readback
 
 #include "../2d/2D.h"
 #include "GLBlitHelper.h"
@@ -421,11 +422,23 @@ ScopedReadbackFB::ScopedReadbackFB(SharedSurface* src)
         }
     case AttachmentType::GLTexture:
         {
-            mGL->fGenFramebuffers(1, &mTempFB);
-            mGL->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mTempFB);
-
             GLuint tex = src->ProdTexture();
             GLenum texImageTarget = src->ProdTextureTarget();
+            // Jihad (T-511): on the GPU path, a canvas frame is drawn onto the context's own pbuffer
+            // and read from there: the Adreno 220 reads a pbuffer ~10x faster than a texture
+            // framebuffer (the WebGL canvas's frame every frame)
+            if (getenv("JIHAD_GPU_COMPOSITOR") && !getenv("JIHAD_GPU_NO_PB_READ") &&
+                mGL->GetContextType() == GLContextType::EGL && texImageTarget == LOCAL_GL_TEXTURE_2D) {
+                const gfx::IntSize pb = GLContextEGL::Cast(mGL)->mJihadPbSize;
+                if (mGL->Screen() && src->mSize.width <= pb.width && src->mSize.height <= pb.height) {
+                    mGL->BlitHelper()->BlitTextureToFramebuffer(tex, 0, src->mSize, src->mSize,
+                                                                texImageTarget, true);
+                    mGL->Screen()->BindReadFB_Internal(0);   // the pbuffer itself, not the screen's FBO
+                    break;
+                }
+            }
+            mGL->fGenFramebuffers(1, &mTempFB);
+            mGL->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mTempFB);
             mGL->fFramebufferTexture2D(LOCAL_GL_FRAMEBUFFER,
                                        LOCAL_GL_COLOR_ATTACHMENT0,
                                        texImageTarget, tex, 0);

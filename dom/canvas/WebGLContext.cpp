@@ -712,7 +712,10 @@ WebGLContext::CreateAndInitGL(bool forceEnabled,
 
     //////
 
-    const bool useEGL = PR_GetEnv("MOZ_WEBGL_FORCE_EGL");
+    // Jihad (T-511): on the GPU path (JIHAD_GPU_COMPOSITOR) the headless build's default GL provider
+    // is the null one; the device's GPU is reached through EGL, as the compositor reaches it. On the
+    // software path the default provider fails and WebGL stays off.
+    const bool useEGL = PR_GetEnv("MOZ_WEBGL_FORCE_EGL") || PR_GetEnv("JIHAD_GPU_COMPOSITOR");
 
     bool tryNativeGL = true;
     bool tryANGLE = false;

@@ -5,6 +5,7 @@
 
 #include "GfxInfo.h"
 #include "nsUnicharUtils.h"
+#include <stdlib.h>   // Jihad T-511: getenv
 
 namespace mozilla {
 namespace widget {
@@ -61,6 +62,11 @@ GfxInfo::GetFeatureStatusImpl(int32_t aFeature,
   aSuggestedDriverVersion.SetIsVoid(true);
   if (aOS) {
     *aOS = OperatingSystem::Linux;
+  }
+  // Jihad (T-511): on the GPU path (JIHAD_GPU_COMPOSITOR: the device's GPU through EGL) WebGL's
+  // OpenGL context is allowed; UNKNOWN reads as blocklisted to WebGL
+  if (aFeature == nsIGfxInfo::FEATURE_WEBGL_OPENGL && getenv("JIHAD_GPU_COMPOSITOR")) {
+    *aStatus = nsIGfxInfo::FEATURE_STATUS_OK;
   }
   // Not blocklisted, not accelerated: leave the decision to the caller's
   // software fallback.
