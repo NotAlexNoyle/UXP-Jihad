@@ -2557,6 +2557,9 @@ public:
   static nsSize
   CalculateCompositionSizeForFrame(nsIFrame* aFrame, bool aSubtractScrollbars = true);
 
+  // Jihad T-505: the GPU path's overscan of the root scroll frame (top and bottom, app units)
+  static nsMargin JihadOverscanFor(nsIFrame* aFrame);
+
  /**
   * Calculate the composition size for the root scroll frame of the root
   * content document.
