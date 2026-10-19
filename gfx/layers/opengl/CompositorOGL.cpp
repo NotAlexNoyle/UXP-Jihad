@@ -2169,6 +2169,27 @@ JihadShiftRows(JihadFrameRequest* aReq)
   if (!dy || !aReq->dest || aReq->stride != aReq->w * 4 || dy >= h || dy <= -h) {
     return;
   }
+  // T-517: the daemon moved the frame's window by the shift (the destination starts dy rows further
+  // into its segment than the slot's frame did): the rows are where the shift would have put them.
+  // Only the kept rects (still layers) are copied, from where they were: dy rows back, the slot's
+  // frame's own rows
+  if (aReq->windowMoved) {
+    static uint8_t* sKept = nullptr;
+    static size_t sKeptCap = 0;
+    const size_t stride = (size_t)aReq->stride;
+    for (int k = 0; k < aReq->nKeep; k++) {
+      int x0, x1, y0, y1;
+      if (!JihadKeepRect(aReq, k, &x0, &x1, &y0, &y1)) continue;
+      const size_t rowBytes = (size_t)(x1 - x0) * 4, bytes = rowBytes * (y1 - y0);
+      if (bytes > sKeptCap) { free(sKept); sKept = (uint8_t*)malloc(bytes); sKeptCap = sKept ? bytes : 0; }
+      if (!sKept) return;
+      uint8_t* p = sKept;   // saved first: the rows read and written may overlap
+      for (int r = y0; r < y1; r++, p += rowBytes) memcpy(p, aReq->dest + ((ptrdiff_t)r - dy) * (ptrdiff_t)stride + (size_t)x0 * 4, rowBytes);
+      p = sKept;
+      for (int r = y0; r < y1; r++, p += rowBytes) memcpy(aReq->dest + (size_t)r * stride + (size_t)x0 * 4, p, rowBytes);
+    }
+    return;
+  }
   // in place: the kept rects saved first and put back after the shift
   static uint8_t* sSaved = nullptr;
   static size_t sSavedCap = 0;

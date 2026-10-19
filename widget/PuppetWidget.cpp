@@ -841,6 +841,7 @@ struct JihadReadJob {
   int srcY = 0; bool engineShift = false;   // round 115
   bool verify = false;   // T-503
   bool colsKnown = false; int colX0 = 0, colX1 = 0;   // T-511: the bands' stale columns (flag 4)
+  bool windowMoved = false;   // T-517 (flag 8): the shift is the daemon's window move, the rows in place
   int invLo, invHi;      // the rows the composite changed
   float scrollX = 0.0f, scrollY = 0.0f; bool scrollValid = false;   // the card's scroll for the compositor
   uint32_t token;
@@ -887,6 +888,7 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   job->req.lo = job->rowLo; job->req.hi = job->rowHi; job->req.lo2 = job->row2Lo; job->req.hi2 = job->row2Hi;
   job->req.shift = job->shift; job->req.src = job->src; job->req.srcY = job->srcY; job->req.engineShift = job->engineShift; job->req.verify = job->verify;
   job->req.colsKnown = job->colsKnown; job->req.colX0 = job->colX0; job->req.colX1 = job->colX1;
+  job->req.windowMoved = job->windowMoved;
   job->req.scrollX = job->scrollX; job->req.scrollY = job->scrollY; job->req.scrollValid = job->scrollValid;
   job->req.done = &JihadJobDone; job->req.cookie = job;
   // Once done() has run the daemon may forget (delete) the job at any moment (round 108's wake
@@ -1010,6 +1012,7 @@ PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, in
   job->row2Lo = aRow2Lo; job->row2Hi = aRow2Hi; job->shift = aShift; job->src = static_cast<const uint8_t*>(aSrc); job->srcY = aSrcY;
   job->engineShift = (aFlags & 1) != 0; job->verify = (aFlags & 2) != 0;
   job->colsKnown = (aFlags & 4) != 0;   // T-511: the column arguments are given (else garbage from an older daemon)
+  job->windowMoved = (aFlags & 8) != 0;   // T-517
   if (job->colsKnown) {
     job->colX0 = std::max(0, std::min(aColX0, aWidth)); job->colX1 = std::max(0, std::min(aColX1, aWidth));
   }
@@ -1466,7 +1469,8 @@ jihad_offscreen_compose_start(nsIWidget* aWidget, nsIDocShell* aDocShell, void* 
     return 0;
   }
   // flags: 1 engine shift, 2 verify (T-503), 4 the column arguments given (T-511; a daemon from
-  // before passes neither, and its poll array holds ten ints)
+  // before passes neither, and its poll array holds ten ints), 8 the shift is the daemon's window
+  // move (T-517: the rows are in place, only the kept rects copied)
   return static_cast<PuppetWidget*>(aWidget)->JihadComposeStart(aDocShell, aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aEngineShift,
                                                                 (aEngineShift & 4) ? aColX0 : 0, (aEngineShift & 4) ? aColX1 : 0);
 }
