@@ -3,6 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <sys/time.h>   // Jihad T-517: the timeline's clock
+#include <stdint.h>
+#include <atomic>
+namespace mozilla { namespace gl { extern std::atomic<uint32_t> gJihadUploads; extern std::atomic<uint64_t> gJihadUploadUs; } }   // GLUploadHelpers.cpp
 #include "LayerTransactionParent.h"
 #include <vector>                       // for vector
 #include "apz/src/AsyncPanZoomController.h"
@@ -264,6 +268,29 @@ LayerTransactionParent::RecvUpdate(InfallibleTArray<Edit>&& cset,
   profiler_tracing("Paint", "LayerTransaction", TRACING_INTERVAL_START);
   PROFILER_LABEL("LayerTransactionParent", "RecvUpdate",
     js::ProfileEntry::Category::GRAPHICS);
+
+  // Jihad (T-517): with JIHAD_GPU_TIMELINE a transaction that holds the compositor thread 3 ms or
+  // more is on the daemon's timeline (the express lane's frames queue behind it)
+  struct JihadTxnTimer {
+    mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
+    size_t edits = 0;
+    double compMs = 0, updatedMs = 0, endMs = 0;   // the compositable ops, ShadowLayersUpdated, EndTransaction
+    uint32_t up0 = gl::gJihadUploads;
+    uint64_t upUs0 = gl::gJihadUploadUs;
+    ~JihadTxnTimer() {
+      static const bool sOn = getenv("JIHAD_GPU_TIMELINE") != nullptr;
+      if (!sOn) return;
+      const double ms = (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
+      if (ms < 3.0) return;
+      struct timeval tv;
+      gettimeofday(&tv, nullptr);
+      fprintf(stderr, "[jihad-tl] t=%lld layer transaction on the compositor thread: %.1f ms, %zu edits "
+              "(compositable ops %.1f, %u uploads %.1f; layers updated %.1f; end %.1f; the rest %.1f)\n",
+              (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000, ms, edits, compMs, gl::gJihadUploads - up0,
+              (gl::gJihadUploadUs - upUs0) / 1000.0, updatedMs, endMs, ms - compMs - updatedMs - endMs);
+    }
+  } jihadTxnTimer;
+  jihadTxnTimer.edits = cset.Length();
 
 #ifdef COMPOSITOR_PERFORMANCE_WARNING
   TimeStamp updateStart = TimeStamp::Now();
@@ -625,10 +652,12 @@ LayerTransactionParent::RecvUpdate(InfallibleTArray<Edit>&& cset,
       break;
     }
     case Edit::TCompositableOperation: {
+      const TimeStamp jihadC0 = TimeStamp::Now();
       if (!ReceiveCompositableUpdate(edit.get_CompositableOperation(),
                                 replyv)) {
         return false;
       }
+      jihadTxnTimer.compMs += (TimeStamp::Now() - jihadC0).ToMilliseconds();
       break;
     }
     case Edit::TOpAttachCompositable: {
@@ -669,15 +698,19 @@ LayerTransactionParent::RecvUpdate(InfallibleTArray<Edit>&& cset,
     }
   }
 
+  const TimeStamp jihadU0 = TimeStamp::Now();
   mCompositorBridge->ShadowLayersUpdated(this, aTransactionId, targetConfig,
                                          aPlugins, isFirstPaint, scheduleComposite,
                                          paintSequenceNumber, isRepeatTransaction,
                                          aPaintSyncId, updateHitTestingTree);
+  const TimeStamp jihadU1 = TimeStamp::Now();
+  jihadTxnTimer.updatedMs = (jihadU1 - jihadU0).ToMilliseconds();
 
   {
     AutoResolveRefLayers resolve(mCompositorBridge->GetCompositionManager(this));
     layer_manager()->EndTransaction(TimeStamp(), LayerManager::END_NO_IMMEDIATE_REDRAW);
   }
+  jihadTxnTimer.endMs = (TimeStamp::Now() - jihadU1).ToMilliseconds();
 
   if (reply) {
     reply->SetCapacity(replyv.size());

@@ -55,6 +55,8 @@
 
 #include "GeckoProfiler.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 namespace mozilla {
 
 using namespace std;
@@ -337,7 +339,7 @@ CompositorOGL::Initialize(nsCString* const out_failureReason)
       mJihadWindowFBO = mJihadWindowTex = 0;
     } else {
       mJihadTargetSize = mJihadPbSize;
-      fprintf(stderr, "[jihad-gpu] %s window target%s %dx%d: FBO %u%s\n", sPass ? "texture" : "renderbuffer", n > 1 ? "s" : "",
+      JIHAD_GPU_LOG("[jihad-gpu] %s window target%s %dx%d: FBO %u%s\n", sPass ? "texture" : "renderbuffer", n > 1 ? "s" : "",
               mJihadPbSize.width, mJihadPbSize.height, mJihadWindowFBO, n > 1 ? " and one more, read by a thread of their own" : "");
     }
   }
@@ -806,7 +808,7 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
     static int sLastH = -1;
     const bool odd = (height != sLastH && sLastH >= 0);
     if ((sN++ % 40) == 0 || odd) {
-      fprintf(stderr, "[jihad-gpu] BeginFrame %u: render bounds %d,%d %dx%d, target %dx%d, clip %s, widget %dx%d, window fbo %u\n",
+      JIHAD_GPU_LOG("[jihad-gpu] BeginFrame %u: render bounds %d,%d %dx%d, target %dx%d, clip %s, widget %dx%d, window fbo %u\n",
               sN, aRenderBounds.x, aRenderBounds.y, aRenderBounds.width, aRenderBounds.height, width, height,
               aClipRectIn ? nsPrintfCString("%d,%d %dx%d", aClipRectIn->x, aClipRectIn->y, aClipRectIn->width, aClipRectIn->height).get() : "none",
               mWidgetSize.width, mWidgetSize.height, mJihadWindowFBO);
@@ -1181,7 +1183,7 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
           if (TextureSource* src = static_cast<const TexturedEffect*>(e)->mTexture) { tw = src->GetSize().width; th = src->GetSize().height; }
         }
         const gfx::Rect dst = xf.TransformBounds(rect);
-        fprintf(stderr, "[jihad-gpu] slow draw %.1f ms: effect %d, texture %dx%d, %.0fx%.0f px drawn at %.0f,%.0f (scale %.3f)\n",
+        JIHAD_GPU_LOG("[jihad-gpu] slow draw %.1f ms: effect %d, texture %dx%d, %.0fx%.0f px drawn at %.0f,%.0f (scale %.3f)\n",
                 ms, e ? (int)e->mType : -1, tw, th, dst.width, dst.height, dst.x, dst.y, xf._11);
       }
     }
@@ -2002,7 +2004,7 @@ CompositorOGL::JihadEnsureSwizzlePass(int aW, int aH)
       return false;
     }
     mJihadReadSize = gfx::IntSize(aW, aH);
-    fprintf(stderr, "[jihad-gpu] swizzle pass: program %u, read target %dx%d (FBO %u)\n", mJihadSwizzleProg, aW, aH, mJihadReadFBO);
+    JIHAD_GPU_LOG("[jihad-gpu] swizzle pass: program %u, read target %dx%d (FBO %u)\n", mJihadSwizzleProg, aW, aH, mJihadReadFBO);
   }
   return true;
 }
@@ -2083,7 +2085,7 @@ CompositorOGL::JihadReadThreadInit()
     fprintf(stderr, "[jihad-gpu] read thread: shared context failed (%s)\n", fail.get());
   }
   const bool fence = sEGLLibrary.IsExtensionSupported(GLLibraryEGL::KHR_fence_sync);
-  fprintf(stderr, "[jihad-gpu] read thread: %s%s\n", ok ? "up, shared context on both window targets" : "DOWN",
+  JIHAD_GPU_LOG("[jihad-gpu] read thread: %s%s\n", ok ? "up, shared context on both window targets" : "DOWN",
           ok ? (fence ? ", EGL fences" : ", no EGL fence: glFinish on the compositor thread") : "");
   MonitorAutoLock lock(mJihadReadMon);
   if (ok) mJihadReadCtx = ctx;
@@ -2120,11 +2122,11 @@ CompositorOGL::JihadSelectTarget()
     MonitorAutoLock lock(mJihadReadMon);
     const TimeStamp t0 = TimeStamp::Now();
     static uint32_t sWaits = 0;
-    if (mJihadTargetBusy[idx] && sWaits++ < 40) fprintf(stderr, "[jihad-gpu] compositor thread: target %d still being read, waiting\n", idx);
+    if (mJihadTargetBusy[idx] && sWaits++ < 40) JIHAD_GPU_LOG("[jihad-gpu] compositor thread: target %d still being read, waiting\n", idx);
     while (mJihadTargetBusy[idx]) {
       lock.Wait(PR_MillisecondsToInterval(20));
       if (TimeStamp::Now() - t0 > TimeDuration::FromSeconds(2)) {
-        fprintf(stderr, "[jihad-gpu] target %d still being read after 2 s: taking it\n", idx);
+        JIHAD_GPU_LOG("[jihad-gpu] target %d still being read after 2 s: taking it\n", idx);
         mJihadTargetBusy[idx] = 0;
         break;
       }
@@ -2328,7 +2330,7 @@ CompositorOGL::JihadBeginBandPass(int aWidth)
       return 0;
     }
     mJihadBandW = aWidth;
-    fprintf(stderr, "[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer\n", aWidth, JihadBandRows(), mJihadBandFBO);
+    JIHAD_GPU_LOG("[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer\n", aWidth, JihadBandRows(), mJihadBandFBO);
   }
   mJihadWindowFBO = mJihadBandFBO;
   return JihadBandRows();
@@ -2420,14 +2422,14 @@ CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
             if (f) { fwrite(whole, 1, (size_t)aReq->stride * aReq->h, f); fclose(f); }
           }
           free(whole);
-          fprintf(stderr, "[jihad-gpu] band %d..%d read back all white: the whole target dumped to %s (request: bands %d..%d %d..%d, shift %d, scroll %.1f,%.1f valid %d)\n",
+          JIHAD_GPU_LOG("[jihad-gpu] band %d..%d read back all white: the whole target dumped to %s (request: bands %d..%d %d..%d, shift %d, scroll %.1f,%.1f valid %d)\n",
                   lo, hi, sDumpTarget, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->shift, aReq->scrollX, aReq->scrollY, (int)aReq->scrollValid);
         }
       }
     }
     static uint32_t sN = 0;
     if (sN++ < 12 || (sN % 50) == 0) {
-      fprintf(stderr, "[jihad-gpu] read: shift %d rows %.1f ms, band %d..%d %.1f ms, band %d..%d %.1f ms\n",
+      JIHAD_GPU_LOG("[jihad-gpu] read: shift %d rows %.1f ms, band %d..%d %.1f ms, band %d..%d %.1f ms\n",
               aReq->shift, (t1 - t0).ToMilliseconds(), aReq->lo, aReq->hi, (t2 - t1).ToMilliseconds(),
               aReq->lo2, aReq->hi2, (TimeStamp::Now() - t2).ToMilliseconds());
     }
@@ -2451,7 +2453,7 @@ CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
   {
     static int sN = 0;
     if (sN++ < 12 || (sN % 100) == 0) {
-      fprintf(stderr, "[jihad-gpu] compositor thread: %s %.1f ms\n", aReq->fence ? "fence+flush" : "glFinish",
+      JIHAD_GPU_LOG("[jihad-gpu] compositor thread: %s %.1f ms\n", aReq->fence ? "fence+flush" : "glFinish",
               (TimeStamp::Now() - tf0).ToMilliseconds());
     }
   }
@@ -2476,7 +2478,7 @@ CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
     static uint32_t sReads = 0;
     const uint32_t readNo = ++sReads;
-    if (readNo <= 40) fprintf(stderr, "[jihad-gpu] read thread: read %u of target %d, rows %d..%d, %s\n", readNo, aReq->target, aReq->lo, aReq->hi, aReq->fence ? "waiting on the fence" : "no fence");
+    if (readNo <= 40) JIHAD_GPU_LOG("[jihad-gpu] read thread: read %u of target %d, rows %d..%d, %s\n", readNo, aReq->target, aReq->lo, aReq->hi, aReq->fence ? "waiting on the fence" : "no fence");
     if (aReq->fence) {
       // bounded: a fence that never signals (2026-10-17, run 55: the first partial composite)
       // must not hang the pipeline; after the timeout the read goes ahead (the compositor
@@ -2510,7 +2512,7 @@ CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
       JihadSwizzleAndFlipRows(band, aReq->stride, w, rows, true);
       static int sTimed = 0;
       if (sTimed++ < 12 || (sTimed % 100) == 0) {
-        fprintf(stderr, "[jihad-gpu] read thread: fence wait %.1f ms (%.1f ms of CPU), glReadPixels %d rows %.1f ms, swizzle+flip %.1f ms\n",
+        JIHAD_GPU_LOG("[jihad-gpu] read thread: fence wait %.1f ms (%.1f ms of CPU), glReadPixels %d rows %.1f ms, swizzle+flip %.1f ms\n",
                 (t1 - t0).ToMilliseconds(), waitCpuMs, rows, (t2 - t1).ToMilliseconds(), (TimeStamp::Now() - t2).ToMilliseconds());
       }
     }
@@ -2578,7 +2580,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     if (scissor) gl->fEnable(LOCAL_GL_SCISSOR_TEST);
     gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
     if (sTimed++ < 12 || (sTimed % 100) == 0) {
-      fprintf(stderr, "[jihad-gpu] swizzle pass %.1f ms (issued), glReadPixels %d rows %.1f ms\n",
+      JIHAD_GPU_LOG("[jihad-gpu] swizzle pass %.1f ms (issued), glReadPixels %d rows %.1f ms\n",
               (t1 - t0).ToMilliseconds(), rows, (TimeStamp::Now() - t1).ToMilliseconds());
     }
     return true;
@@ -2631,7 +2633,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
           mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, again);
           const bool secondWhite = whiteAt(again, h - 1 - 700);
           if (!secondWhite) ++sSecondGood;
-          fprintf(stderr, "[jihad-gpu] read verify: first read white from GL row 0 for %d rows; second read (private memory) %s, white for %d rows (white firsts %u of %u checked, second good %u)\n",
+          JIHAD_GPU_LOG("[jihad-gpu] read verify: first read white from GL row 0 for %d rows; second read (private memory) %s, white for %d rows (white firsts %u of %u checked, second good %u)\n",
                   whiteRunFromBottom(band), secondWhite ? "WHITE too" : "HAS CONTENT", whiteRunFromBottom(again), sWhite, sChecked, sSecondGood);
           free(again);
         }
@@ -2653,7 +2655,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
         bool magenta = true;
         for (int x : { w / 8, w / 2, w - w / 8 }) { const uint8_t* px = row + (size_t)x * 4; if (!(px[0] == 255 && px[1] == 0 && px[2] == 255)) magenta = false; }
         sSeq[sSeqN++] = white ? 'W' : magenta ? 'M' : 'C'; sSeq[sSeqN++] = (char)('0' + fboIdx);
-        if (sSeqN >= 60) { sSeq[sSeqN] = 0; fprintf(stderr, "[jihad-gpu] read sequence (W/C + target): %s\n", sSeq); sSeqN = 0; }
+        if (sSeqN >= 60) { sSeq[sSeqN] = 0; JIHAD_GPU_LOG("[jihad-gpu] read sequence (W/C + target): %s\n", sSeq); sSeqN = 0; }
       }
       static uint32_t sN = 0;
       static int sListedWhite = 0, sListedContent = 0;
@@ -2661,12 +2663,12 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
         if (white) ++sListedWhite; else ++sListedContent;
         for (int i = 0; i < std::min(mJihadDraws, 48); i++) {
           const JihadDrawRec& d = mJihadDrawRecs[i];
-          fprintf(stderr, "[jihad-gpu] draw %s #%d: rect %.0f,%.0f %.0fx%.0f clip y %d..%d type %d colour %.2f,%.2f,%.2f,%.2f opacity %.2f\n",
+          JIHAD_GPU_LOG("[jihad-gpu] draw %s #%d: rect %.0f,%.0f %.0fx%.0f clip y %d..%d type %d colour %.2f,%.2f,%.2f,%.2f opacity %.2f\n",
                   white ? "W" : "C", i, d.x, d.y, d.w, d.h, d.cy, d.cb, d.type, d.r, d.g, d.b, d.a, d.opacity);
         }
       }
       if (white || (sN++ % 20) == 0) {
-        fprintf(stderr, "[jihad-gpu] drawstats: row 700 %s; window draws %d (surface draws %d), clip bottom %d..%d, quad bottom max %d, viewport %dx%d; first draw: scissor raw %d,%d %dx%d cached %d,%d %dx%d, viewport raw %d,%d %dx%d cached %d,%d %dx%d\n",
+        JIHAD_GPU_LOG("[jihad-gpu] drawstats: row 700 %s; window draws %d (surface draws %d), clip bottom %d..%d, quad bottom max %d, viewport %dx%d; first draw: scissor raw %d,%d %dx%d cached %d,%d %dx%d, viewport raw %d,%d %dx%d cached %d,%d %dx%d\n",
                 white ? "WHITE" : "content", mJihadDraws, mJihadSurfaceDraws, mJihadClipBottomMin == (1 << 30) ? -1 : mJihadClipBottomMin,
                 mJihadClipBottomMax, mJihadQuadBottomMax, mViewportSize.width, mViewportSize.height,
                 mJihadRawSc[0], mJihadRawSc[1], mJihadRawSc[2], mJihadRawSc[3], mJihadCacheSc[0], mJihadCacheSc[1], mJihadCacheSc[2], mJihadCacheSc[3],
@@ -2676,7 +2678,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
   }
   static const bool sTimelineRead = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every read
   if (sTimed++ < 12 || (sTimed % 100) == 0 || sTimelineRead) {
-    fprintf(stderr, "[jihad-gpu] glFinish %.1f ms, glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
+    JIHAD_GPU_LOG("[jihad-gpu] glFinish %.1f ms, glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
             (tFin - t0).ToMilliseconds(), rows, (t1 - tFin).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
   }
   return true;
@@ -2721,7 +2723,7 @@ CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int 
   }
   static uint32_t sN = 0;
   if (sN++ < 12 || (sN % 100) == 0) {
-    fprintf(stderr, "[jihad-gpu] column read x %d..%d, rows %d..%d (target rows from %d of %d): glReadPixels %.1f ms, swizzle+copy %.1f ms\n",
+    JIHAD_GPU_LOG("[jihad-gpu] column read x %d..%d, rows %d..%d (target rows from %d of %d): glReadPixels %.1f ms, swizzle+copy %.1f ms\n",
             aX0, aX1, aDestRowLo, aDestRowLo + aRows, aSrcRowLo, aSurfaceH, (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
   }
   return true;
@@ -2787,7 +2789,7 @@ CompositorOGL::CopyToTarget(DrawTarget* aTarget, const nsIntPoint& aTopLeft, con
       }
       aTarget->ReleaseBits(data);
       TimeStamp t2 = TimeStamp::Now();
-      fprintf(stderr, "[jihad-gpu] direct read %dx%d (frame %dx%d): glReadPixels %.1f ms, swizzle %.1f ms%s\n",
+      JIHAD_GPU_LOG("[jihad-gpu] direct read %dx%d (frame %dx%d): glReadPixels %.1f ms, swizzle %.1f ms%s\n",
               w, h, width, height, (t1 - t0).ToMilliseconds(), (t2 - t1).ToMilliseconds(),
               okRead ? "" : " (stride mismatch: not read)");
       if (okRead) {
@@ -2823,7 +2825,7 @@ CompositorOGL::CopyToTarget(DrawTarget* aTarget, const nsIntPoint& aTopLeft, con
   aTarget->SetTransform(oldMatrix);
   if (sJihadGpuLog) {
     TimeStamp jihadT2 = TimeStamp::Now();
-    fprintf(stderr, "[jihad-gpu] copy-to-target %dx%d: glReadPixels(+convert) %.1f ms, flipped draw %.1f ms\n",
+    JIHAD_GPU_LOG("[jihad-gpu] copy-to-target %dx%d: glReadPixels(+convert) %.1f ms, flipped draw %.1f ms\n",
             width, height, (jihadT1 - jihadT0).ToMilliseconds(), (jihadT2 - jihadT1).ToMilliseconds());
   }
   aTarget->Flush();

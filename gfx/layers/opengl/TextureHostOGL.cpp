@@ -20,6 +20,8 @@
 #include "GLBlitTextureImageHelper.h"
 #include "GeckoProfiler.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 #ifdef XP_MACOSX
 #include "mozilla/layers/MacIOSurfaceTextureHostOGL.h"
 #endif
@@ -110,7 +112,7 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
     static const bool sPhases = getenv("JIHAD_GPU_PHASES") != nullptr;
     if (sPhases) gJihadPhase[11] += all;
     if (sN++ < 30 || all >= 8.0) {
-      if (sN < 300) fprintf(stderr, "[jihad-gpu] texture source update: make current %.1f ms, %s %.1f ms, upload %.1f ms (all %.1f)\n",
+      if (sN < 300) JIHAD_GPU_LOG("[jihad-gpu] texture source update: make current %.1f ms, %s %.1f ms, upload %.1f ms (all %.1f)\n",
                             t1.IsNull() ? 0.0 : (t1 - t0).ToMilliseconds(), *created ? "texture created" : "texture kept",
                             (t1.IsNull() || t2.IsNull()) ? 0.0 : (t2 - t1).ToMilliseconds(), t2.IsNull() ? 0.0 : (t3 - t2).ToMilliseconds(), all);
     }
@@ -143,7 +145,7 @@ TextureImageTextureSourceOGL::Update(gfx::DataSourceSurface* aSurface,
       const TimeStamp jihadG0 = TimeStamp::Now();
       gl->fGetIntegerv(LOCAL_GL_MAX_TEXTURE_SIZE, &maxTextureSize);
       { static uint32_t sN = 0; const double ms = (TimeStamp::Now() - jihadG0).ToMilliseconds();
-        if (ms >= 3.0 && sN++ < 40) fprintf(stderr, "[jihad-gpu] glGetIntegerv(MAX_TEXTURE_SIZE): %.1f ms\n", ms); }
+        if (ms >= 3.0 && sN++ < 40) JIHAD_GPU_LOG("[jihad-gpu] glGetIntegerv(MAX_TEXTURE_SIZE): %.1f ms\n", ms); }
       if (size.width > maxTextureSize || size.height > maxTextureSize) {
         NS_WARNING("Texture exceeds maximum texture size, refusing upload");
         return false;

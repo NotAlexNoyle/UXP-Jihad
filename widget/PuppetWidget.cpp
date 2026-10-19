@@ -6,6 +6,7 @@
 #include <unistd.h>   // Jihad T-502: write() to the done fd
 #include "mozilla/Maybe.h"   // Jihad T-515
 #include <sys/time.h>        // Jihad T-515: the timeline's clock
+#include <atomic>            // Jihad T-517
 #include "base/basictypes.h"
 
 #include "ClientLayerManager.h"
@@ -33,6 +34,9 @@
 #include "nsPIDOMWindow.h"   // T-502 device rounds
 #include "nsIDocument.h"   // T-502 device rounds
 #include "mozilla/layers/CompositorOGL.h"   // T-502: JihadFrameRequest
+
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+namespace mozilla { namespace gl { extern std::atomic<uint32_t> gJihadUploads; extern std::atomic<uint64_t> gJihadUploadUs; } }   // T-517, GLUploadHelpers.cpp
 #include "base/task.h"
 // Jihad offscreen render-document support:
 #include "gfxContext.h"
@@ -660,14 +664,14 @@ PuppetWidget::GetLayerManager(PLayerTransactionChild* aShadowManager,
         // takes over, so a device whose EGL refuses still paints.
         mJihadCompositorTried = true;
         CreateCompositor(mBounds.width, mBounds.height);
-        fprintf(stderr, "[jihad-gpu] compositor %s for %dx%d (compositor backend %d)\n",
+        JIHAD_GPU_LOG("[jihad-gpu] compositor %s for %dx%d (compositor backend %d)\n",
                 mLayerManager ? "created" : "NOT created: software layers",
                 mBounds.width, mBounds.height,
                 mLayerManager ? (int)mLayerManager->GetCompositorBackendType() : -1);
       }
       if (!mLayerManager) {
         if (JihadGpuCompositor() && !mJihadCompositorTried) {
-          fprintf(stderr, "[jihad-gpu] compositor not attempted: OMTC %s, TabChild %p\n",
+          JIHAD_GPU_LOG("[jihad-gpu] compositor not attempted: OMTC %s, TabChild %p\n",
                   gfxPlatform::UsesOffMainThreadCompositing() ? "on" : "off", (void*)mTabChild);
         }
         // Jihad: no compositor/IPC — paint on this thread with a BasicLayerManager
@@ -895,16 +899,19 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   // pipe made that immediate): nothing below may touch it unless the compose never started.
   const uint32_t token = job->token;
   const double queuedMs = (t0 - job->posted).ToMilliseconds();
+  const uint32_t up0 = mozilla::gl::gJihadUploads;
+  const uint64_t upUs0 = mozilla::gl::gJihadUploadUs;
   const bool started = job->bridge->JihadComposeAndRead(&job->req, job->scale, job->offX, job->offY);
   static uint32_t sN = 0;
   static const bool sTimeline = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every job, on the daemon's clock
   if (sTimeline) {
     struct timeval tv;
     gettimeofday(&tv, nullptr);
-    fprintf(stderr, "[jihad-tl] t=%lld job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n",
-            (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000, token, queuedMs, (mozilla::TimeStamp::Now() - t0).ToMilliseconds());
+    fprintf(stderr, "[jihad-tl] t=%lld job %u: queued %.1f ms on the compositor loop, composed in %.1f ms (%u uploads %.1f)\n",
+            (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000, token, queuedMs, (mozilla::TimeStamp::Now() - t0).ToMilliseconds(),
+            mozilla::gl::gJihadUploads - up0, (mozilla::gl::gJihadUploadUs - upUs0) / 1000.0);
   } else if (sN++ < 30 || (sN % 50) == 0) {
-    fprintf(stderr, "[jihad-gpu] job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n", token,
+    JIHAD_GPU_LOG("[jihad-gpu] job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n", token,
             queuedMs, (mozilla::TimeStamp::Now() - t0).ToMilliseconds());
   }
   if (!started) {
@@ -965,7 +972,7 @@ PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
   mozilla::TimeStamp t1 = mozilla::TimeStamp::Now();
   static uint32_t sFrames = 0;
   if (sFrames < 20 || (sFrames % 50) == 0) {
-    fprintf(stderr, "[jihad-gpu] frame %u: layers %.1f ms\n", sFrames, (t1 - t0).ToMilliseconds());
+    JIHAD_GPU_LOG("[jihad-gpu] frame %u: layers %.1f ms\n", sFrames, (t1 - t0).ToMilliseconds());
   }
   if (sFrames == 5 || (sFrames % 200) == 0) {
     // T-502 device rounds: every flag that throttles the page's JavaScript (timers to a second,
@@ -976,7 +983,7 @@ PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
     nsIFrame* rootFrame = presShell->GetRootFrame();
     nsIFrame* displayRoot = rootFrame ? nsLayoutUtils::GetDisplayRootFrame(rootFrame) : nullptr;
     nsPIDOMWindowOuter* win = aDocShell->GetWindow();
-    fprintf(stderr, "[jihad-gpu] activity: docshell %s, pres shell %s, document %s, frame requests %s, painted-pres-shell %d, window %s\n",
+    JIHAD_GPU_LOG("[jihad-gpu] activity: docshell %s, pres shell %s, document %s, frame requests %s, painted-pres-shell %d, window %s\n",
             dsActive ? "active" : "INACTIVE", presShell->IsActive() ? "active" : "INACTIVE",
             doc && doc->Hidden() ? "HIDDEN" : "visible",
             doc && doc->ShouldThrottleFrameRequests() ? "THROTTLED" : "full rate",
@@ -1216,7 +1223,7 @@ PuppetWidget::JihadComposeTo(nsIDocShell* aDocShell, void* aDest, int aStride,
     }
     static uint32_t sSnapFrames = 0;
     if (sSnapFrames++ < 20) {
-      fprintf(stderr, "[jihad-gpu] snapshot road frame %u: layers %.1f ms, snapshot %.1f ms, ok=%d\n",
+      JIHAD_GPU_LOG("[jihad-gpu] snapshot road frame %u: layers %.1f ms, snapshot %.1f ms, ok=%d\n",
               sSnapFrames, (t1 - t0).ToMilliseconds(), (mozilla::TimeStamp::Now() - t1).ToMilliseconds(), (int)okSnap);
     }
     return okSnap;

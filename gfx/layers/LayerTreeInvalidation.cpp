@@ -27,6 +27,8 @@
 #include "mozilla/layers/LayerManagerComposite.h"
 #include "TreeTraversal.h"              // for ForEachNode
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 using namespace mozilla::gfx;
 
 namespace mozilla {
@@ -234,7 +236,7 @@ public:
                                 FuzzyEqual(now._21, mTransform._21) && FuzzyEqual(now._22, mTransform._22);
         const IntRect vb = mLayer->GetLocalVisibleRegion().ToUnknownRegion().GetBounds();
         Layer* par = mLayer->GetParent();
-        fprintf(stderr, "[jihad-gpu] diff: layer %p (parent %p type %d metadata %u, type %d, fixed %d sticky %d, metadata %u, flags 0x%x, visible %d,%d %dx%d, clip %d) transform moved by %.1f,%.1f%s; old ty %.1f new ty %.1f\n",
+        JIHAD_GPU_LOG("[jihad-gpu] diff: layer %p (parent %p type %d metadata %u, type %d, fixed %d sticky %d, metadata %u, flags 0x%x, visible %d,%d %dx%d, clip %d) transform moved by %.1f,%.1f%s; old ty %.1f new ty %.1f\n",
                 mLayer, par, par ? (int)par->GetType() : -1, par ? (unsigned)par->GetScrollMetadataCount() : 0u,
                 (int)mLayer->GetType(), (int)mLayer->GetIsFixedPosition(), (int)mLayer->GetIsStickyPosition(),
                 (unsigned)mLayer->GetScrollMetadataCount(), (unsigned)mLayer->GetContentFlags(), vb.x, vb.y, vb.width, vb.height,
@@ -305,7 +307,7 @@ public:
         const IntRect vOld = mVisibleRegion.GetBounds();
         const IntRect vNew = mLayer->GetLocalVisibleRegion().ToUnknownRegion().GetBounds();
         const Matrix4x4 now = GetTransformForInvalidation(mLayer);
-        fprintf(stderr, "[jihad-gpu] diff big: layer %p type %d metadata %u: result y %d..%d; transform changed %d (ty %.1f -> %.1f), invalid (layer) y %d..%d, visible old y %d..%d new y %d..%d, clip changed %d\n",
+        JIHAD_GPU_LOG("[jihad-gpu] diff big: layer %p type %d metadata %u: result y %d..%d; transform changed %d (ty %.1f -> %.1f), invalid (layer) y %d..%d, visible old y %d..%d new y %d..%d, clip changed %d\n",
                 mLayer, (int)mLayer->GetType(), (unsigned)mLayer->GetScrollMetadataCount(), rb.y, rb.YMost(), (int)transformChanged,
                 mTransform._42, now._42, inv.y, inv.YMost(), vOld.y, vOld.YMost(), vNew.y, vNew.YMost(),
                 (int)(mUseClipRect && otherClip && !mClipRect.IsEqualInterior(*otherClip)));

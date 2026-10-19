@@ -24,6 +24,8 @@
 #include "gfx2DGlue.h"
 #include "ReadbackProcessor.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 namespace mozilla {
 namespace layers {
 
@@ -150,7 +152,7 @@ ClientLayerManager::CreatePaintedLayerWithHint(PaintedLayerCreationHint aHint)
     // Jihad T-502 device rounds: whether painted layers are tiled (layers.enable-tiles is a
     // once-only gfx pref: goanna.js, not prefs.js)
     static bool sLogged = false;
-    if (!sLogged) { sLogged = true; fprintf(stderr, "[jihad-gpu] painted layers: %s\n", gfxPrefs::LayersTilesEnabled() ? "tiled" : "single-buffer (not tiled)"); }
+    if (!sLogged) { sLogged = true; JIHAD_GPU_LOG("[jihad-gpu] painted layers: %s\n", gfxPrefs::LayersTilesEnabled() ? "tiled" : "single-buffer (not tiled)"); }
   }
   if (gfxPrefs::LayersTilesEnabled()) {
     RefPtr<ClientTiledPaintedLayer> layer = new ClientTiledPaintedLayer(this, aHint);

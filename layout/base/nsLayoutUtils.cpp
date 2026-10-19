@@ -125,6 +125,8 @@
 #include "mozilla/RestyleManager.h"
 #include "LayoutLogging.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 // Make sure getpid() works.
 #ifdef XP_WIN
 #include <process.h>
@@ -9464,7 +9466,7 @@ jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, f
   const ScreenMargin margins(aTop, right, bottom, aSide);
   static int sLogged = 0;
   if (sLogged++ < 6) {
-    fprintf(stderr, "[jihad-gpu] displayport: scroll port %.0fx%.0f CSS px, shown %.0fx%.0f, margins top %.0f right %.0f bottom %.0f left %.0f\n",
+    JIHAD_GPU_LOG("[jihad-gpu] displayport: scroll port %.0fx%.0f CSS px, shown %.0fx%.0f, margins top %.0f right %.0f bottom %.0f left %.0f\n",
             portW, portH, aVisW, aVisH, aTop, right, bottom, aSide);
   }
   if (!nsLayoutUtils::SetDisplayPortMargins(content, ps, margins, 0)) {
