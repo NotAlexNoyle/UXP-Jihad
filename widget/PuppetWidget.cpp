@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include <unistd.h>   // Jihad T-502: write() to the done fd
+#include "mozilla/Maybe.h"   // Jihad T-515
 #include "base/basictypes.h"
 
 #include "ClientLayerManager.h"
@@ -911,30 +912,40 @@ PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride
                                 int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo, int aRow2Hi, int aShift,
                                 const void* aSrc, int aSrcY, int aFlags)
 {
-  const bool aEngineShift = (aFlags & 1) != 0;
   if (!aDocShell || !aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
     return 0;
   }
+  if (!JihadPaintLayers(aDocShell)) {
+    return 0;
+  }
+  return JihadPostJob(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags);
+}
+
+bool
+PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
+{
+  if (!aDocShell) {
+    return false;
+  }
   nsCOMPtr<nsIPresShell> presShell = aDocShell->GetPresShell();
   if (!presShell) {
-    return 0;
+    return false;
   }
   presShell->FlushPendingNotifications(Flush_Layout);
   nsViewManager* vm = presShell->GetViewManager();
   nsView* root = vm ? vm->GetRootView() : nullptr;
   nsIWidget* viewWidget = root ? root->GetWidget() : nullptr;
   if (!viewWidget) {
-    return 0;
+    return false;
   }
   LayerManager* lm = viewWidget->GetLayerManager();
   ClientLayerManager* clm = lm ? lm->AsClientLayerManager() : nullptr;
   mozilla::layers::CompositorBridgeParent* bridge = JihadBridge();
   if (!clm || !bridge) {
-    return 0;
+    return false;
   }
-  MessageLoop* loop = mozilla::layers::CompositorThreadHolder::Loop();
-  if (!loop) {
-    return 0;
+  if (!mozilla::layers::CompositorThreadHolder::Loop()) {
+    return false;
   }
   mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
   nsRegion dirty(root->GetDimensions());
@@ -942,8 +953,7 @@ PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride
   mozilla::TimeStamp t1 = mozilla::TimeStamp::Now();
   static uint32_t sFrames = 0;
   if (sFrames < 20 || (sFrames % 50) == 0) {
-    fprintf(stderr, "[jihad-gpu] frame %u: layers %.1f ms, posted (rows %d..%d asked)\n",
-            sFrames, (t1 - t0).ToMilliseconds(), aRowLo, aRowHi);
+    fprintf(stderr, "[jihad-gpu] frame %u: layers %.1f ms\n", sFrames, (t1 - t0).ToMilliseconds());
   }
   if (sFrames == 5 || (sFrames % 200) == 0) {
     // T-502 device rounds: every flag that throttles the page's JavaScript (timers to a second,
@@ -962,31 +972,84 @@ PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride
             win && win->IsBackground() ? "BACKGROUND" : "foreground");
   }
   ++sFrames;
+  return true;
+}
+
+// T-515: a job posted to the compositor thread, from the main thread (after its paint) or from the
+// express lane (no paint); the list is shared, so under its lock
+uint32_t
+PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo,
+                           int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
+                           const float* aView, bool aScrollValid)
+{
+  mozilla::layers::CompositorBridgeParent* bridge = JihadBridge();
+  MessageLoop* loop = mozilla::layers::CompositorThreadHolder::Loop();
+  if (!bridge || !loop || !aDest) {
+    return 0;
+  }
+  mozilla::MutexAutoLock listLock(mJihadJobsLock);
   uint32_t token = mJihadNextToken++;
   if (mJihadNextToken == 0) {
     mJihadNextToken = 1;
   }
   JihadReadJob* job = new JihadReadJob(bridge, static_cast<uint8_t*>(aDest), aStride, aWidth, aHeight,
-                                       mJihadScale, mJihadOffX, mJihadOffY, aRowLo, aRowHi, token);
-  job->scrollX = mJihadScrollX; job->scrollY = mJihadScrollY; job->scrollValid = mJihadScrollValid;
-  job->row2Lo = aRow2Lo; job->row2Hi = aRow2Hi; job->shift = aShift; job->src = static_cast<const uint8_t*>(aSrc); job->srcY = aSrcY; job->engineShift = aEngineShift; job->verify = (aFlags & 2) != 0;
+                                       aView ? (aView[0] > 0.0f ? aView[0] : 1.0f) : mJihadScale,
+                                       aView ? aView[1] : mJihadOffX, aView ? aView[2] : mJihadOffY, aRowLo, aRowHi, token);
+  job->scrollX = aView ? aView[3] : mJihadScrollX; job->scrollY = aView ? aView[4] : mJihadScrollY;
+  job->scrollValid = aView ? aScrollValid : mJihadScrollValid;
+  job->row2Lo = aRow2Lo; job->row2Hi = aRow2Hi; job->shift = aShift; job->src = static_cast<const uint8_t*>(aSrc); job->srcY = aSrcY;
+  job->engineShift = (aFlags & 1) != 0; job->verify = (aFlags & 2) != 0;
   job->posted = mozilla::TimeStamp::Now();
   mJihadJobs.push_back(job);
   loop->PostTask(NewRunnableFunction(&JihadReadOnCompositorThread, job));
   return token;
 }
 
+uint32_t
+PuppetWidget::JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi,
+                               int aRow2Lo, int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
+                               const float* aView, bool aScrollValid)
+{
+  if (!aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
+    return 0;
+  }
+  return JihadPostJob(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags,
+                      aView, aScrollValid);
+}
+
 int
 PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly)
 {
+  // T-515: the job list is shared with the express lane. Without a wait the whole poll holds the
+  // list's lock: a forget from another thread between the find and the job's monitor would let the
+  // compositor task free the job under it. A wait (the synchronous compose, the main thread's own
+  // token) releases it while waiting.
+  mozilla::Maybe<mozilla::MutexAutoLock> heldLock;
+  if (!aWait) {
+    heldLock.emplace(mJihadJobsLock);
+  }
   JihadReadJob* job = nullptr;
-  size_t at = 0;
-  for (size_t i = 0; i < mJihadJobs.size(); ++i) {
-    if (mJihadJobs[i]->token == aToken) { job = mJihadJobs[i]; at = i; break; }
+  {
+    mozilla::Maybe<mozilla::MutexAutoLock> findLock;
+    if (aWait) {
+      findLock.emplace(mJihadJobsLock);
+    }
+    for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+      if (mJihadJobs[i]->token == aToken) { job = mJihadJobs[i]; break; }
+    }
   }
   if (!job) {
     return -1;
   }
+  auto removeJob = [&]() {
+    mozilla::Maybe<mozilla::MutexAutoLock> eraseLock;
+    if (aWait) {
+      eraseLock.emplace(mJihadJobsLock);
+    }
+    for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+      if (mJihadJobs[i] == job) { mJihadJobs.erase(mJihadJobs.begin() + i); break; }
+    }
+  };
   bool finished = false, ok = false;
   {
     mozilla::MonitorAutoLock lock(job->mon);
@@ -1020,20 +1083,36 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
     }
   }
   if (finished) {
-    mJihadJobs.erase(mJihadJobs.begin() + at);
+    removeJob();
     delete job;
     return ok ? 1 : -1;
   }
   if (aWait) {
-    mJihadJobs.erase(mJihadJobs.begin() + at);   // abandoned: the task frees it
+    removeJob();   // abandoned: the task frees it
     return -1;
   }
   return 0;
 }
 
+int
+PuppetWidget::JihadComposePeek(uint32_t aToken)
+{
+  mozilla::MutexAutoLock listLock(mJihadJobsLock);
+  for (size_t i = 0; i < mJihadJobs.size(); ++i) {
+    JihadReadJob* job = mJihadJobs[i];
+    if (job->token != aToken) {
+      continue;
+    }
+    mozilla::MonitorAutoLock lock(job->mon);
+    return job->done ? 1 : (job->req.composed ? 2 : 0);
+  }
+  return -1;
+}
+
 void
 PuppetWidget::JihadComposeForget(uint32_t aToken)
 {
+  mozilla::MutexAutoLock listLock(mJihadJobsLock);   // T-515
   for (size_t i = 0; i < mJihadJobs.size(); ++i) {
     JihadReadJob* job = mJihadJobs[i];
     if (job->token != aToken) {
@@ -1043,7 +1122,7 @@ PuppetWidget::JihadComposeForget(uint32_t aToken)
     {
       mozilla::MonitorAutoLock lock(job->mon);
       done = job->done;
-      if (!done) job->abandoned = true; job->req.cancelled = true;
+      if (!done) { job->abandoned = true; job->req.cancelled = true; }
     }
     mJihadJobs.erase(mJihadJobs.begin() + i);
     if (done) delete job;
@@ -1054,13 +1133,14 @@ PuppetWidget::JihadComposeForget(uint32_t aToken)
 void
 PuppetWidget::JihadComposeAbandonAll()
 {
+  mozilla::MutexAutoLock listLock(mJihadJobsLock);   // T-515
   for (size_t i = 0; i < mJihadJobs.size(); ++i) {
     JihadReadJob* job = mJihadJobs[i];
     bool done;
     {
       mozilla::MonitorAutoLock lock(job->mon);
       done = job->done;
-      if (!done) job->abandoned = true; job->req.cancelled = true;
+      if (!done) { job->abandoned = true; job->req.cancelled = true; }
     }
     if (done) delete job;
   }
@@ -1326,6 +1406,33 @@ jihad_offscreen_compose(nsIWidget* aWidget, nsIDocShell* aDocShell, void* aDest,
   }
   return static_cast<PuppetWidget*>(aWidget)->JihadComposeTo(aDocShell, aDest, aStride,
                                                              aWidth, aHeight);
+}
+
+// T-515: the frame's halves on their own (see PuppetWidget::JihadPaintLayers, JihadComposePost).
+// paint_layers: the main thread; compose_post: any thread. aUseView 0: the view last set.
+MOZ_EXPORT int
+jihad_offscreen_paint_layers(nsIWidget* aWidget, nsIDocShell* aDocShell)
+{
+  return (aWidget && static_cast<PuppetWidget*>(aWidget)->JihadPaintLayers(aDocShell)) ? 1 : 0;
+}
+MOZ_EXPORT int
+jihad_offscreen_compose_peek(nsIWidget* aWidget, uint32_t aToken)
+{
+  return aWidget ? static_cast<PuppetWidget*>(aWidget)->JihadComposePeek(aToken) : -1;
+}
+MOZ_EXPORT uint32_t
+jihad_offscreen_compose_post(nsIWidget* aWidget, void* aDest, int aStride, int aWidth, int aHeight,
+                             int aRowLo, int aRowHi, int aRow2Lo, int aRow2Hi, int aShift,
+                             const void* aSrc, int aSrcY, int aFlags, int aUseView, double aScale,
+                             double aOffX, double aOffY, double aScrollX, double aScrollY, int aScrollValid)
+{
+  if (!aWidget) {
+    return 0;
+  }
+  const float view[5] = { (float)aScale, (float)aOffX, (float)aOffY, (float)aScrollX, (float)aScrollY };
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposePost(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi,
+                                                               aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags,
+                                                               aUseView ? view : nullptr, aScrollValid != 0);
 }
 
 // T-502: the frame in two halves (see PuppetWidget::JihadComposeStart).
