@@ -1436,6 +1436,22 @@ jihad_offscreen_paint_layers(nsIWidget* aWidget, nsIDocShell* aDocShell)
 {
   return (aWidget && static_cast<PuppetWidget*>(aWidget)->JihadPaintLayers(aDocShell)) ? 1 : 0;
 }
+// T-511 (review): the daemon gave the GPU path up (a stall past its bound, refused jobs): WebGL
+// makes no more EGL contexts on that GPU. jihad_gpu_compositor_on() is what the engine's GPU-path
+// checks ask (JIHAD_GPU_COMPOSITOR in the environment, and not given up); the environment is not
+// changed, other threads read it.
+static mozilla::Atomic<bool> sJihadGpuGivenUp(false);
+MOZ_EXPORT void
+jihad_offscreen_gpu_given_up()
+{
+  sJihadGpuGivenUp = true;
+}
+MOZ_EXPORT bool
+jihad_gpu_compositor_on()
+{
+  static const bool sEnv = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  return sEnv && !sJihadGpuGivenUp;
+}
 MOZ_EXPORT int
 jihad_offscreen_compose_peek(nsIWidget* aWidget, uint32_t aToken)
 {

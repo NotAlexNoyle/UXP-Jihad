@@ -7,6 +7,8 @@
 #include "nsUnicharUtils.h"
 #include <stdlib.h>   // Jihad T-511: getenv
 
+extern "C" bool jihad_gpu_compositor_on();   // Jihad T-511: widget/PuppetWidget.cpp (the GPU path on, not given up)
+
 namespace mozilla {
 namespace widget {
 
@@ -63,9 +65,9 @@ GfxInfo::GetFeatureStatusImpl(int32_t aFeature,
   if (aOS) {
     *aOS = OperatingSystem::Linux;
   }
-  // Jihad (T-511): on the GPU path (JIHAD_GPU_COMPOSITOR: the device's GPU through EGL) WebGL's
-  // OpenGL context is allowed; UNKNOWN reads as blocklisted to WebGL
-  if (aFeature == nsIGfxInfo::FEATURE_WEBGL_OPENGL && getenv("JIHAD_GPU_COMPOSITOR")) {
+  // Jihad (T-511): on the GPU path (JIHAD_GPU_COMPOSITOR: the device's GPU through EGL, and the
+  // daemon has not given it up) WebGL's OpenGL context is allowed; UNKNOWN reads as blocklisted
+  if (aFeature == nsIGfxInfo::FEATURE_WEBGL_OPENGL && jihad_gpu_compositor_on()) {
     *aStatus = nsIGfxInfo::FEATURE_STATUS_OK;
   }
   // Not blocklisted, not accelerated: leave the decision to the caller's
