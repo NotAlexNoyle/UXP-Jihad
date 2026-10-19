@@ -291,9 +291,11 @@ public:
   // Forget drops a token whose buffer went away.
   uint32_t JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride,
                              int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo = 0, int aRow2Hi = 0, int aShift = 0,
-                             const void* aSrc = nullptr, int aSrcY = 0, int aFlags = 0);   // aFlags: 1 engine shift, 2 verify
+                             const void* aSrc = nullptr, int aSrcY = 0, int aFlags = 0,   // aFlags: 1 engine shift, 2 verify, 4 columns
+                             int aColX0 = 0, int aColX1 = 0);   // T-511: the bands' stale columns (flag 4)
   // aOut (10 ints, may be null): the rows the tree changed, the rows fixed layers cover, the two
-  // bands read, the frame's position and its valid flag; aScrollOnly: the composite's only change was the card's scroll
+  // bands read, the frame's position and its valid flag; 12 for a job posted with flag 4 (T-511):
+  // the columns the composite changed; aScrollOnly: the composite's only change was the card's scroll
   int JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly = nullptr);
   // T-515: the frame's two halves on their own. PaintLayers (the main thread) flushes and paints the
   // layers, as Start does first; Post (any thread: the express lane while the main thread runs the
@@ -303,7 +305,7 @@ public:
   bool JihadPaintLayers(nsIDocShell* aDocShell);
   uint32_t JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi,
                             int aRow2Lo, int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
-                            const float* aView, bool aScrollValid);
+                            const float* aView, bool aScrollValid, int aColX0 = 0, int aColX1 = 0);
   void JihadComposeForget(uint32_t aToken);
   // T-515: a job's state without taking its result: 1 done, 2 composed (being read), 0 pending, -1 unknown
   int JihadComposePeek(uint32_t aToken);
@@ -464,7 +466,7 @@ private:
   mozilla::Mutex mJihadJobsLock{"jihad-compose-jobs"};   // T-515: the list from the main thread and the express lane
   uint32_t JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo,
                         int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
-                        const float* aView = nullptr, bool aScrollValid = false);
+                        const float* aView = nullptr, bool aScrollValid = false, int aColX0 = 0, int aColX1 = 0);
   uint32_t mJihadNextToken = 1;
   float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // T-502: the card's scroll for the compositor
   bool mJihadScrollValid = false;
