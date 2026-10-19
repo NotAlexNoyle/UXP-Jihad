@@ -2631,7 +2631,8 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
       }
     }
   }
-  if (sTimed++ < 12 || (sTimed % 100) == 0) {
+  static const bool sTimelineRead = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every read
+  if (sTimed++ < 12 || (sTimed % 100) == 0 || sTimelineRead) {
     fprintf(stderr, "[jihad-gpu] glFinish %.1f ms, glReadPixels %d rows %.1f ms, CPU swizzle+flip %.1f ms\n",
             (tFin - t0).ToMilliseconds(), rows, (t1 - tFin).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());
   }

@@ -2255,7 +2255,8 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   const bool logScrollOnly = aReq->scrollOnly;
   const bool started = ogl->JihadReadAsync(aReq);
   static uint32_t sFrames = 0;
-  if (sFrames < 20 || (sFrames % 50) == 0) {
+  static const bool sTimeline = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every frame
+  if (sFrames < 20 || (sFrames % 50) == 0 || sTimeline) {
     fprintf(stderr, "[jihad-gpu] compositor thread: compose %.1f ms, handoff %.1f ms (frame %u, rows %d..%d and %d..%d of %d, %d columns, %d kept, changed %d..%d, fixed %d..%d%s%s, started=%d)\n",
             (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds(), sFrames,
             lo, hi, logLo2, logHi2, aHeight, logCols, logKeep, invLo, invHi, logFixedLo, logFixedHi,

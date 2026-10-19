@@ -5,6 +5,7 @@
 
 #include <unistd.h>   // Jihad T-502: write() to the done fd
 #include "mozilla/Maybe.h"   // Jihad T-515
+#include <sys/time.h>        // Jihad T-515: the timeline's clock
 #include "base/basictypes.h"
 
 #include "ClientLayerManager.h"
@@ -892,7 +893,13 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   const double queuedMs = (t0 - job->posted).ToMilliseconds();
   const bool started = job->bridge->JihadComposeAndRead(&job->req, job->scale, job->offX, job->offY);
   static uint32_t sN = 0;
-  if (sN++ < 30 || (sN % 50) == 0) {
+  static const bool sTimeline = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every job, on the daemon's clock
+  if (sTimeline) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    fprintf(stderr, "[jihad-tl] t=%lld job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n",
+            (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000, token, queuedMs, (mozilla::TimeStamp::Now() - t0).ToMilliseconds());
+  } else if (sN++ < 30 || (sN % 50) == 0) {
     fprintf(stderr, "[jihad-gpu] job %u: queued %.1f ms on the compositor loop, composed in %.1f ms\n", token,
             queuedMs, (mozilla::TimeStamp::Now() - t0).ToMilliseconds());
   }
