@@ -508,7 +508,18 @@ WebGLContext::InitAndValidateGL(FailureReason* const out_failReason)
     gl->GetUIntegerv(LOCAL_GL_STENCIL_VALUE_MASK,      &mStencilValueMaskFront);
     gl->GetUIntegerv(LOCAL_GL_STENCIL_BACK_VALUE_MASK, &mStencilValueMaskBack);
     gl->GetUIntegerv(LOCAL_GL_STENCIL_WRITEMASK,       &mStencilWriteMaskFront);
-    gl->GetUIntegerv(LOCAL_GL_STENCIL_BACK_WRITEMASK,  &mStencilWriteMaskBack);
+    // Jihad (T-511): the Adreno 220's GLES 2.0 driver answers GL_INVALID_ENUM for the back write
+    // mask (valid in GLES 2.0), and the error left behind failed the whole context's init below
+    // ("GL error 0x500 occurred during WebGL context initialization"). Queried in its own error
+    // scope; the front mask stands in (both start as all ones).
+    {
+        GLint backWriteMask = 0;
+        if (gl->GetPotentialInteger(LOCAL_GL_STENCIL_BACK_WRITEMASK, &backWriteMask)) {
+            mStencilWriteMaskBack = GLuint(backWriteMask);
+        } else {
+            mStencilWriteMaskBack = mStencilWriteMaskFront;
+        }
+    }
 
     AssertUintParamCorrect(gl, LOCAL_GL_STENCIL_VALUE_MASK,      mStencilValueMaskFront);
     AssertUintParamCorrect(gl, LOCAL_GL_STENCIL_BACK_VALUE_MASK, mStencilValueMaskBack);

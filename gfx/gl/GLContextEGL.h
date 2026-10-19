@@ -136,6 +136,8 @@ public:
                                      const gfx::IntSize& size,
                                      const SurfaceCaps& minCaps,
                                      nsACString* const out_FailureId);
+    // Jihad (T-511): the share root of the GPU path's pbuffer contexts (JIHAD_GPU_NO_SHARE=1: none)
+    static GLContextEGL* JihadShareRoot(CreateContextFlags flags, const SurfaceCaps& minCaps);
 
 protected:
     friend class GLContextProviderEGL;
@@ -144,6 +146,10 @@ public:
     const EGLConfig  mConfig;
 protected:
     EGLSurface mSurface;
+public:
+    // Jihad (T-511): the size of this context's own pbuffer surface (0x0 when it has none)
+    mozilla::gfx::IntSize mJihadPbSize;
+protected:
 public:
     const EGLContext mContext;
 protected:

@@ -84,6 +84,7 @@
 #include "GLContextProvider.h"
 #include "GLLibraryEGL.h"
 #include "GLScreenBuffer.h"
+#include "mozilla/StaticMutex.h"   // Jihad T-511: the share root
 #include "mozilla/ArrayUtils.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/widget/CompositorWidget.h"
@@ -246,6 +247,13 @@ GLContextEGL::~GLContextEGL()
     printf_stderr("Destroying context %p surface %p on display %p\n", mContext, mSurface, EGL_DISPLAY());
 #endif
 
+    // Jihad (T-511): released from this thread before it is destroyed. MarkDestroyed() above leaves it
+    // current, and the Adreno 220 driver then kept pointers into its framebuffers: the next context's
+    // teardown on this thread faulted in set_framebuffer (libGLESv2 gl2_surface_update_writeonly_flag)
+    // on the second WebGL page closed, every time (device rounds 290-296)
+    if (getenv("JIHAD_GPU_COMPOSITOR") && sEGLLibrary.fGetCurrentContext() == mContext) {
+        sEGLLibrary.fMakeCurrent(EGL_DISPLAY(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
     sEGLLibrary.fDestroyContext(EGL_DISPLAY(), mContext);
     sEGLLibrary.UnsetCachedCurrentContext();
 
@@ -914,6 +922,49 @@ ChooseConfig(GLLibraryEGL* egl, CreateContextFlags flags, const SurfaceCaps& min
     return config;
 }
 
+// Jihad (T-511): every pbuffer context on the GPU path, the compositor's and each WebGL canvas's, in
+// one share group under a 1x1 root that lives as long as the process, so a WebGL frame reaches the
+// compositor as a texture it samples (the shared GL texture surface) with no readback: 23.7-25 fps
+// for a 480 px canvas, where the readback through the pbuffer gave 16 and through its texture
+// framebuffer 8-9. The driver has no EGLImage from a GL texture (EGL_BAD_PARAMETER, gpu-bench.c
+// section 17). JIHAD_GPU_NO_SHARE=1: unshared contexts, the readback through the pbuffer.
+static StaticMutex sJihadShareLock;
+static GLContextEGL* sJihadShareRoot = nullptr;   // leaked on purpose: no teardown order to get wrong
+static bool sJihadShareTried = false;
+
+/*static*/ GLContextEGL*
+GLContextEGL::JihadShareRoot(CreateContextFlags flags, const SurfaceCaps& minCaps)
+{
+    if (!getenv("JIHAD_GPU_COMPOSITOR") || getenv("JIHAD_GPU_NO_SHARE")) {
+        return nullptr;
+    }
+    StaticMutexAutoLock lock(sJihadShareLock);
+    if (sJihadShareTried) {
+        return sJihadShareRoot;
+    }
+    sJihadShareTried = true;
+    SurfaceCaps configCaps;
+    EGLConfig config = ChooseConfig(&sEGLLibrary, flags, minCaps, &configCaps);
+    if (config == EGL_NO_CONFIG) {
+        return nullptr;
+    }
+    mozilla::gfx::IntSize one(1, 1);
+    EGLSurface surface = CreatePBufferSurfaceTryingPowerOfTwo(config, LOCAL_EGL_NONE, one);
+    if (!surface) {
+        return nullptr;
+    }
+    nsCString failureId;
+    RefPtr<GLContextEGL> gl = CreateGLContext(flags, configCaps, nullptr, true, config, surface, &failureId);
+    if (!gl) {
+        sEGLLibrary.fDestroySurface(sEGLLibrary.Display(), surface);
+        fprintf(stderr, "[jihad-gpu] share root: no context (%s): contexts unshared\n", failureId.get());
+        return nullptr;
+    }
+    sJihadShareRoot = gl.forget().take();
+    fprintf(stderr, "[jihad-gpu] share root made: the compositor's and WebGL's contexts share textures\n");
+    return sJihadShareRoot;
+}
+
 /*static*/ already_AddRefed<GLContextEGL>
 GLContextEGL::CreateEGLPBufferOffscreenContext(CreateContextFlags flags,
                                                const mozilla::gfx::IntSize& size,
@@ -947,7 +998,7 @@ GLContextEGL::CreateEGLPBufferOffscreenContext(CreateContextFlags flags,
         return nullptr;
     }
 
-    RefPtr<GLContextEGL> gl = GLContextEGL::CreateGLContext(flags, configCaps, nullptr,
+    RefPtr<GLContextEGL> gl = GLContextEGL::CreateGLContext(flags, configCaps, JihadShareRoot(flags, minCaps),
                                                             true, config, surface,
                                                             out_failureId);
     if (!gl) {
@@ -955,6 +1006,7 @@ GLContextEGL::CreateEGLPBufferOffscreenContext(CreateContextFlags flags,
         sEGLLibrary.fDestroySurface(sEGLLibrary.Display(), surface);
         return nullptr;
     }
+    gl->mJihadPbSize = pbSize;   // Jihad T-511
 
     return gl.forget();
 }
@@ -993,6 +1045,18 @@ GLContextProviderEGL::CreateHeadless(CreateContextFlags flags,
 {
     mozilla::gfx::IntSize dummySize = mozilla::gfx::IntSize(16, 16);
     SurfaceCaps dummyCaps = SurfaceCaps::Any();
+    // Jihad (T-511): on the GPU path an offscreen context (a WebGL canvas's) whose frames are read
+    // back (no share group: JIHAD_GPU_NO_SHARE=1, or no root could be made) gets a pbuffer as large
+    // as a canvas on this screen is, RGBA: they are read back through it (ScopedReadbackFB), where a
+    // read from its texture framebuffer ran ~10x slower on the Adreno 220 (8-9 fps for a 480 px
+    // canvas, 16 through the pbuffer). 4 MB of GPU memory a context, so not when the compositor
+    // samples the canvas's texture (no difference measured there, rounds 301).
+    // JIHAD_GPU_NO_PB_READ=1: the 16x16 one, as before.
+    if (getenv("JIHAD_GPU_COMPOSITOR") && !getenv("JIHAD_GPU_NO_PB_READ") &&
+        !GLContextEGL::JihadShareRoot(flags, SurfaceCaps::ForRGBA())) {
+        dummySize = mozilla::gfx::IntSize(1024, 1024);
+        dummyCaps = SurfaceCaps::ForRGBA();
+    }
     return GLContextEGL::CreateEGLPBufferOffscreenContext(flags, dummySize, dummyCaps,
                                                           out_failureId);
 }
