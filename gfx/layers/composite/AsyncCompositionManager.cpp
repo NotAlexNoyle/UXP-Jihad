@@ -43,6 +43,8 @@
 #include "TreeTraversal.h"              // for ForEachNode, BreadthFirstSearch
 #include "VsyncSource.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 struct nsCSSValueSharedList;
 
 namespace mozilla {
@@ -516,7 +518,7 @@ AsyncCompositionManager::AlignFixedAndStickyLayers(Layer* aTransformedSubtreeRoo
     // Jihad T-502 diagnostic (every 50th fixed/sticky layer aligned)
     static uint32_t sN = 0;
     if ((sN++ % 50) == 0) {
-      fprintf(stderr, "[jihad-gpu] align fixed: layer %p (parent %p, fixed %d sticky %d) under subtree root %p (root's parent %p), scroll id %llu: anchor %.1f,%.1f, translation %.1f,%.1f\n",
+      JIHAD_GPU_LOG("[jihad-gpu] align fixed: layer %p (parent %p, fixed %d sticky %d) under subtree root %p (root's parent %p), scroll id %llu: anchor %.1f,%.1f, translation %.1f,%.1f\n",
               layer, layer->GetParent(), (int)layer->GetIsFixedPosition(), (int)layer->GetIsStickyPosition(), aTransformedSubtreeRoot,
               aTransformedSubtreeRoot->GetParent(), (unsigned long long)aTransformScrollId, anchor.x, anchor.y, translation.x, translation.y);
     }
@@ -943,11 +945,11 @@ AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
           static uint32_t sSeen = 0, sRootSeen = 0;
           if (layer->GetScrollMetadataCount() > 0 && (sSeen++ % 50) == 0) {
             const FrameMetrics& m0 = layer->GetScrollMetadata(0).GetMetrics();
-            fprintf(stderr, "[jihad-gpu] async scroll: layer %p has %u metadata (first: root content %d, id %llu, offset %.1f,%.1f), card scroll valid %d want %.1f,%.1f, controller %d\n",
+            JIHAD_GPU_LOG("[jihad-gpu] async scroll: layer %p has %u metadata (first: root content %d, id %llu, offset %.1f,%.1f), card scroll valid %d want %.1f,%.1f, controller %d\n",
                     layer, (unsigned)layer->GetScrollMetadataCount(), (int)m0.IsRootContent(), (unsigned long long)m0.GetScrollId(),
                     m0.GetScrollOffset().x, m0.GetScrollOffset().y, (int)mJihadScrollValid, mJihadScrollX, mJihadScrollY, (int)(layer->GetAsyncPanZoomController(0) != nullptr));
           } else if (layer->GetScrollMetadataCount() == 0 && !layer->GetParent() && (sRootSeen++ % 500) == 0) {
-            fprintf(stderr, "[jihad-gpu] async scroll: the root layer %p has no metadata (card scroll valid %d want %.1f,%.1f)\n", layer, (int)mJihadScrollValid, mJihadScrollX, mJihadScrollY);
+            JIHAD_GPU_LOG("[jihad-gpu] async scroll: the root layer %p has no metadata (card scroll valid %d want %.1f,%.1f)\n", layer, (int)mJihadScrollValid, mJihadScrollX, mJihadScrollY);
           }
         }
         for (uint32_t i = 0; i < layer->GetScrollMetadataCount(); i++) {
@@ -964,7 +966,7 @@ AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
               jihadScroll = true;
               static uint32_t sN = 0;
               if (sN++ < 10 || (sN % 25) == 0) {
-                fprintf(stderr, "[jihad-gpu] async scroll: want %.1f,%.1f, painted at %.1f,%.1f, zoom %.4f x %.4f -> translation %.1f,%.1f on layer %p (parent %p, id %llu)\n",
+                JIHAD_GPU_LOG("[jihad-gpu] async scroll: want %.1f,%.1f, painted at %.1f,%.1f, zoom %.4f x %.4f -> translation %.1f,%.1f on layer %p (parent %p, id %llu)\n",
                         want.x, want.y, jm.GetScrollOffset().x, jm.GetScrollOffset().y, jm.GetZoom().xScale, jm.GetZoom().yScale, -translation.x, -translation.y,
                         layer, layer->GetParent(), (unsigned long long)jm.GetScrollId());
               }

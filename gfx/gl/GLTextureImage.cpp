@@ -20,6 +20,8 @@
 
 #include "TextureImageEGL.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 using namespace mozilla::gfx;
 
 namespace mozilla {
@@ -191,7 +193,7 @@ void JihadConvertTexture(GLContext* aGL, GLuint aTexture)
         aGL->fFramebufferTexture2D(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_TEXTURE_2D, aTexture, 0);
         static int sStatusLogged = 0;
         if (sStatusLogged++ < 1) {
-            fprintf(stderr, "[jihad-gpu] texture conversion: framebuffer status 0x%x\n", aGL->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER));
+            JIHAD_GPU_LOG("[jihad-gpu] texture conversion: framebuffer status 0x%x\n", aGL->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER));
         }
         aGL->fClear(LOCAL_GL_COLOR_BUFFER_BIT);
         aGL->fFramebufferTexture2D(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_TEXTURE_2D, 0, 0);
@@ -235,7 +237,7 @@ GLuint JihadTakePooledTexture(GLContext* aGL, const gfx::IntSize& aSize)
         if (tex) sJihadPoolHits++; else sJihadPoolMisses++;
         const uint32_t n = sJihadPoolHits + sJihadPoolMisses;
         if (n <= 4 || (n % 50) == 0) {
-            fprintf(stderr, "[jihad-gpu] texture pool: %u taken from the pool, %u new (%u converted, %.1f ms each), %u kept, %u deleted (pool full), %zu in the pool\n",
+            JIHAD_GPU_LOG("[jihad-gpu] texture pool: %u taken from the pool, %u new (%u converted, %.1f ms each), %u kept, %u deleted (pool full), %zu in the pool\n",
                     sJihadPoolHits, sJihadPoolMisses, sJihadConverted, sJihadConverted ? sJihadConvertMs / sJihadConverted : 0.0,
                     sJihadPoolKept, sJihadPoolFull, sJihadPool.size());
         }
@@ -303,7 +305,7 @@ void JihadFlushRetiredTextures(GLContext* aGL)
     static uint32_t sN = 0;
     const double ms = (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
     if (sN++ < 10 || ms >= 3.0) {
-        if (sN < 200) fprintf(stderr, "[jihad-gpu] retired textures: %u deleted in %.1f ms\n", (unsigned)mine.size(), ms);
+        if (sN < 200) JIHAD_GPU_LOG("[jihad-gpu] retired textures: %u deleted in %.1f ms\n", (unsigned)mine.size(), ms);
     }
 }
 

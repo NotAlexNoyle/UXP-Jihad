@@ -5,6 +5,7 @@
 
 #include "GLUploadHelpers.h"
 #include "mozilla/TimeStamp.h"   // Jihad T-502 device rounds
+#include <atomic>               // Jihad T-517
 
 #include "GLContext.h"
 #include "mozilla/gfx/2D.h"
@@ -13,6 +14,8 @@
 #include "nsRegion.h"
 #include "GfxTexturesReporter.h"
 #include "mozilla/gfx/Logging.h"
+
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
 
 namespace mozilla {
 
@@ -409,6 +412,10 @@ TexImage2DHelper(GLContext* gl,
     }
 }
 
+// Jihad (T-517): every upload's count and time (us), for the timeline's transaction and job lines
+std::atomic<uint32_t> gJihadUploads(0);
+std::atomic<uint64_t> gJihadUploadUs(0);
+
 SurfaceFormat
 UploadImageDataToTexture(GLContext* gl,
                          unsigned char* aData,
@@ -432,8 +439,10 @@ UploadImageDataToTexture(GLContext* gl,
     struct JihadPreLog { const mozilla::TimeStamp &e0, &e1, &e2; ~JihadPreLog() {
       static uint32_t sN = 0;
       const double all = (mozilla::TimeStamp::Now() - e0).ToMilliseconds();
+      ++gJihadUploads;
+      gJihadUploadUs += (uint64_t)(all * 1000.0);
       if (all >= 8.0 && sN++ < 60)
-        fprintf(stderr, "[jihad-gpu] upload steps: make current %.1f ms, bind %.1f ms, the rest %.1f ms (all %.1f)\n",
+        JIHAD_GPU_LOG("[jihad-gpu] upload steps: make current %.1f ms, bind %.1f ms, the rest %.1f ms (all %.1f)\n",
                 (e1 - e0).ToMilliseconds(), (e2 - e1).ToMilliseconds(), all - (e2 - e0).ToMilliseconds(), all);
     } } jihadPreLog{jihadE0, jihadE1, jihadE2};
 
@@ -533,7 +542,7 @@ UploadImageDataToTexture(GLContext* gl,
     struct JihadUpLog { const mozilla::TimeStamp& t0; GLenum fmt; GLenum type; int w, h; bool init; ~JihadUpLog() {
       const double ms = (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
       if (sJihadUploads++ < 40 || ms >= 8.0) {
-        if (sJihadUploads < 400) fprintf(stderr, "[jihad-gpu] upload call %dx%d format 0x%x type 0x%x init %d: %.1f ms\n", w, h, (unsigned)fmt, (unsigned)type, (int)init, ms);
+        if (sJihadUploads < 400) JIHAD_GPU_LOG("[jihad-gpu] upload call %dx%d format 0x%x type 0x%x init %d: %.1f ms\n", w, h, (unsigned)fmt, (unsigned)type, (int)init, ms);
       }
     } } jihadUpLog{jihadT0, format, type, aSize.width, aSize.height, aNeedInit};
     if (aNeedInit || !CanUploadSubTextures(gl)) {

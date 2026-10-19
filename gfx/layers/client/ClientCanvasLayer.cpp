@@ -22,6 +22,8 @@
 #include "gfxUtils.h"
 #include "TextureClientSharedSurface.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 
 using namespace mozilla::gfx;
 using namespace mozilla::gl;
@@ -82,7 +84,7 @@ ClientCanvasLayer::Initialize(const Data& aData)
   if (getenv("JIHAD_GPU_COMPOSITOR")) {
     static int sLogged = 0;
     if (sLogged++ < 4)
-      fprintf(stderr, "[jihad-gpu] canvas layer: %s\n",
+      JIHAD_GPU_LOG("[jihad-gpu] canvas layer: %s\n",
               factory ? "a shared surface (zero copy)" : "the basic surface (read back through the pbuffer and uploaded each frame)");
   }
 

@@ -94,6 +94,8 @@
 #include "ScopedGLHelpers.h"
 #include "TextureImageEGL.h"
 
+#include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+
 using namespace mozilla::gfx;
 
 namespace mozilla {
@@ -382,7 +384,7 @@ GLContextEGL::JihadUseBandPBuffer(int aWidth, int aHeight)
             return false;
         }
         mJihadBandPbW = aWidth; mJihadBandPbH = aHeight;
-        fprintf(stderr, "[jihad-gpu] band pbuffer %dx%d made\n", aWidth, aHeight);
+        JIHAD_GPU_LOG("[jihad-gpu] band pbuffer %dx%d made\n", aWidth, aHeight);
     }
     if (mSurfaceOverride != mJihadBandPb) {
         mSurfaceOverride = mJihadBandPb;
@@ -961,7 +963,7 @@ GLContextEGL::JihadShareRoot(CreateContextFlags flags, const SurfaceCaps& minCap
         return nullptr;
     }
     sJihadShareRoot = gl.forget().take();
-    fprintf(stderr, "[jihad-gpu] share root made: the compositor's and WebGL's contexts share textures\n");
+    JIHAD_GPU_LOG("[jihad-gpu] share root made: the compositor's and WebGL's contexts share textures\n");
     return sJihadShareRoot;
 }
 

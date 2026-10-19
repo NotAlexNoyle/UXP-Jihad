@@ -57,6 +57,7 @@ EXPORTS.mozilla.gfx += [
 ]
 
 EXPORTS.mozilla.gfx += ['ssse3-scaler.h']
+EXPORTS.mozilla.gfx += ['JihadGpuLog.h']  # Jihad (T-512): the GPU path's diagnostics gate
 
 if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('cocoa', 'uikit'):
     EXPORTS.mozilla.gfx += [
