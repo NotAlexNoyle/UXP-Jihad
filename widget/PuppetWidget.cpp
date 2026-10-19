@@ -1015,7 +1015,7 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
       if (aOut) { aOut[0] = job->req.invLo; aOut[1] = job->req.invHi; aOut[8] = job->req.frameY; aOut[9] = job->req.frameYValid ? 1 : 0; }
       return 2;
     } else if (aWait) {
-      job->abandoned = true;
+      job->abandoned = true; job->req.cancelled = true;
       fprintf(stderr, "[jihad-gpu] compose: no answer from the compositor thread in 3 s\n");
     }
   }
@@ -1043,7 +1043,7 @@ PuppetWidget::JihadComposeForget(uint32_t aToken)
     {
       mozilla::MonitorAutoLock lock(job->mon);
       done = job->done;
-      if (!done) job->abandoned = true;
+      if (!done) job->abandoned = true; job->req.cancelled = true;
     }
     mJihadJobs.erase(mJihadJobs.begin() + i);
     if (done) delete job;
@@ -1060,7 +1060,7 @@ PuppetWidget::JihadComposeAbandonAll()
     {
       mozilla::MonitorAutoLock lock(job->mon);
       done = job->done;
-      if (!done) job->abandoned = true;
+      if (!done) job->abandoned = true; job->req.cancelled = true;
     }
     if (done) delete job;
   }
