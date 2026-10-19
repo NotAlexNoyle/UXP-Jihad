@@ -1988,7 +1988,42 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       TimeStamp tb0 = TimeStamp::Now();
       double msCompose = 0, msRead = 0, msShift = 0;
       int at = 0;
-      for (int b = 0; b < 2 && ok; b++) {
+      // T-517: the bands and the column chunks as regions of one frame (LayerManagerComposite::
+      // JihadSetRegions); JIHAD_GPU_PASS_PER_REGION=1 composes each on its own, as before
+      static const bool sPassPerRegion = getenv("JIHAD_GPU_PASS_PER_REGION") != nullptr;
+      if (!sPassPerRegion && ok) {
+        gfx::Matrix4x4 worlds[12];
+        gfx::IntRect rects[12];
+        int nr = 0;
+        for (int b = 0; b < 2; b++) {
+          if (!hs[b]) continue;
+          const int lo = std::max(0, bands[b][0]);
+          worlds[nr] = world;
+          worlds[nr].PostTranslate(0.0f, (float)(at - lo), 0.0f);   // frame row lo -> stacked row at
+          rects[nr++] = gfx::IntRect(0, at, aWidth, hs[b]);
+          at += hs[b];
+        }
+        for (int c = 0; c < nChunks && nr < 12; c++) {
+          const JihadChunk& ch = chunks[c];
+          worlds[nr] = world;
+          worlds[nr].PostTranslate((float)(ch.atX - ch.srcX), (float)(fullRows - ch.srcLo), 0.0f);
+          rects[nr++] = gfx::IntRect(ch.atX, fullRows, ch.w, ch.h);
+        }
+        mLayerManager->JihadSetWorldTransform(nr ? worlds[0] : world);
+        mLayerManager->UpdateRenderBounds(passBounds);    // the target and viewport are the surface's size
+        mLayerManager->JihadIgnoreDiff(true);
+        mLayerManager->JihadResetLastInvalid();
+        mLayerManager->JihadSetBand(gfx::IntRect(), gfx::IntRect());
+        mLayerManager->JihadSetRegions(worlds, rects, nr);
+        if (!passRows) ogl->JihadSelectTarget();
+        TimeStamp c0 = TimeStamp::Now();
+        sJihadInCompose = true;
+        ForceComposeToTarget(nullptr, nullptr);
+        sJihadInCompose = false;
+        mLayerManager->JihadSetRegions(nullptr, nullptr, 0);
+        msCompose += (TimeStamp::Now() - c0).ToMilliseconds();
+      }
+      for (int b = 0; b < 2 && ok && sPassPerRegion; b++) {
         if (!hs[b]) continue;
         const int lo = std::max(0, bands[b][0]), hb = hs[b];
         gfx::Matrix4x4 wb = world;
@@ -2007,7 +2042,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         at += hb;
       }
       // round 142: the column chunks, each with the world moved so its rows land at (atX, fullRows)
-      for (int c = 0; c < nChunks && ok; c++) {
+      for (int c = 0; c < nChunks && ok && sPassPerRegion; c++) {
         const JihadChunk& ch = chunks[c];
         gfx::Matrix4x4 wb = world;
         wb.PostTranslate((float)(ch.atX - ch.srcX), (float)(fullRows - ch.srcLo), 0.0f);

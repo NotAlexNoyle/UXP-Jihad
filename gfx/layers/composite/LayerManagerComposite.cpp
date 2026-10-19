@@ -544,10 +544,11 @@ LayerManagerComposite::UpdateAndRender()
     mJihadLastChanged = onFrame.GetBounds();
   }
   mJihadPartialOn = false;
-  if ((!mJihadBand.IsEmpty() || !mJihadBand2.IsEmpty() || !mJihadBand3.IsEmpty()) && !mTarget) {
+  if ((!mJihadBand.IsEmpty() || !mJihadBand2.IsEmpty() || !mJihadBand3.IsEmpty() || mJihadRegionN > 0) && !mTarget) {
     if (!mJihadBand.IsEmpty()) invalid.Or(invalid, mJihadBand);
     if (!mJihadBand2.IsEmpty()) invalid.Or(invalid, mJihadBand2);
     if (!mJihadBand3.IsEmpty()) invalid.Or(invalid, mJihadBand3);
+    for (int k = 0; k < mJihadRegionN; k++) invalid.Or(invalid, mJihadRegionRect[k]);   // T-517
     mJihadPartialOn = true;
   } else if (!mTarget && !mJihadLastChanged.IsEmpty() && mClonedLayerTreeProperties &&
              !invalid.Contains(mRenderBounds)) {
@@ -1034,12 +1035,28 @@ LayerManagerComposite::Render(const nsIntRegion& aInvalidRegion, const nsIntRegi
   // Render our layers.
   const TimeStamp jihadR0 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
   if (JihadPhases()) gJihadPhase[2] += (jihadR0 - jihadB0).ToMilliseconds();
+  if (mJihadRegionN > 0 && mJihadPartialOn) {
+    // T-517: the band frame's regions, each at its own world and inside its own rect, in this one
+    // frame: the transaction, the diff and BeginFrame/EndFrame once (a pass cost ~5 ms of CPU
+    // whatever it drew; a Wikipedia pan frame took four or five of them)
+    for (int k = 0; k < mJihadRegionN; k++) {
+      IntRect r = mJihadRegionRect[k].Intersect(IntRect(clipRect.x, clipRect.y, clipRect.width, clipRect.height));
+      if (r.IsEmpty()) continue;
+      mRoot->ComputeEffectiveTransforms(mJihadRegionWorld[k]);
+      const ParentLayerIntRect rc(r.x, r.y, r.width, r.height);
+      RootLayer()->Prepare(ViewAs<RenderTargetPixel>(rc, PixelCastJustification::RenderTargetIsParentLayerForRoot));
+      RootLayer()->RenderLayer(r);
+    }
+    mRoot->ComputeEffectiveTransforms(mJihadWorld);   // the state the frame's other users expect
+    if (JihadPhases()) gJihadPhase[4] += (TimeStamp::Now() - jihadR0).ToMilliseconds();
+  } else {
   RootLayer()->Prepare(ViewAs<RenderTargetPixel>(clipRect, PixelCastJustification::RenderTargetIsParentLayerForRoot));
   const TimeStamp jihadR1 = JihadPhases() ? TimeStamp::Now() : TimeStamp();
   RootLayer()->RenderLayer(clipRect.ToUnknownRect());
   if (JihadPhases()) {
     gJihadPhase[3] += (jihadR1 - jihadR0).ToMilliseconds();
     gJihadPhase[4] += (TimeStamp::Now() - jihadR1).ToMilliseconds();
+  }
   }
 
   if (!mRegionToClear.IsEmpty()) {
