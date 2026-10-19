@@ -164,6 +164,8 @@ struct JihadFrameRequest {
   int frameY = 0; bool frameYValid = false;   // out: this frame's position (card px), when the engine decided it
   int shift = 0;                       // rows the destination is shifted by (memmove) before the read: the
                                        // card's scroll since the slot's frame, positive = scrolled down
+  bool windowMoved = false;            // T-517 (flag 8): the daemon moved the frame's window by the shift
+                                       //   instead: the rows are in place, only the kept rects are copied
   int fixedLo = 0, fixedHi = 0;        // out: the rows fixed and sticky layers cover (0,0 = none)
   int cols[4][4] = {};                 // round 138: column reads after the bands (x0, x1, y0, y1 on the
   int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift
