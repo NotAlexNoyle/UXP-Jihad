@@ -1160,9 +1160,25 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
 
   static const bool sJihadPhases = getenv("JIHAD_GPU_PHASES") != nullptr;
   struct JihadDrawTimer {
-    bool on; TimeStamp t;
-    ~JihadDrawTimer() { if (on) { gJihadPhase[8] += (TimeStamp::Now() - t).ToMilliseconds(); gJihadPhase[9] += 1; } }
-  } jihadDrawTimer{sJihadPhases, sJihadPhases ? TimeStamp::Now() : TimeStamp()};
+    bool on; TimeStamp t; const EffectChain& chain; const gfx::Matrix4x4& xf; const gfx::Rect& rect;
+    ~JihadDrawTimer() {
+      if (!on) return;
+      const double ms = (TimeStamp::Now() - t).ToMilliseconds();
+      gJihadPhase[8] += ms; gJihadPhase[9] += 1;
+      // T-504: a draw that blocks (the GL call waits in the driver), with what it drew
+      static uint32_t sSlow = 0;
+      if (ms >= 5.0 && sSlow++ < 80) {
+        const Effect* e = chain.mPrimaryEffect;
+        int tw = 0, th = 0;
+        if (e && (e->mType == EffectTypes::RGB)) {
+          if (TextureSource* src = static_cast<const TexturedEffect*>(e)->mTexture) { tw = src->GetSize().width; th = src->GetSize().height; }
+        }
+        const gfx::Rect dst = xf.TransformBounds(rect);
+        fprintf(stderr, "[jihad-gpu] slow draw %.1f ms: effect %d, texture %dx%d, %.0fx%.0f px drawn at %.0f,%.0f (scale %.3f)\n",
+                ms, e ? (int)e->mType : -1, tw, th, dst.width, dst.height, dst.x, dst.y, xf._11);
+      }
+    }
+  } jihadDrawTimer{sJihadPhases, sJihadPhases ? TimeStamp::Now() : TimeStamp(), aEffectChain, aTransform, aVisibleRect};
 
   MakeCurrent();
 
@@ -1307,6 +1323,18 @@ CompositorOGL::DrawGeometry(const Geometry& aGeometry,
   // could be visible
   bool bEnableAA = gfxPrefs::LayersDEAAEnabled() &&
                    !aTransform.Is2DIntegerTranslation();
+  // Jihad T-504: on the GPU path an axis-aligned scale (the card's zoom, tiles painted at another
+  // resolution) gets no edge antialiasing: its edges stay axis-aligned, and DEAA's own shader
+  // variants were compiled on their first use, ~150 ms each on the Adreno 220, in the first frame
+  // of a zoom (two of them: the first frame at a new zoom took 300-385 ms). Rotated and skewed
+  // layers keep it.
+  static const bool sJihadGpu = getenv("JIHAD_GPU_COMPOSITOR") && !getenv("JIHAD_GPU_DEAA");
+  if (bEnableAA && sJihadGpu) {
+    gfx::Matrix m2;
+    if (aTransform.Is2D(&m2) && m2.PreservesAxisAlignedRectangles()) {
+      bEnableAA = false;
+    }
+  }
 
   bool colorMatrix = aEffectChain.mSecondaryEffects[EffectTypes::COLOR_MATRIX];
   ShaderConfigOGL config = GetShaderConfigFor(aEffectChain.mPrimaryEffect,
