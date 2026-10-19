@@ -80,6 +80,8 @@
 #include "mozilla/dom/WebGLRenderingContextBinding.h"
 
 
+extern "C" bool jihad_gpu_compositor_on();   // Jihad T-511: widget/PuppetWidget.cpp
+
 namespace mozilla {
 
 using namespace mozilla::dom;
@@ -714,8 +716,9 @@ WebGLContext::CreateAndInitGL(bool forceEnabled,
 
     // Jihad (T-511): on the GPU path (JIHAD_GPU_COMPOSITOR) the headless build's default GL provider
     // is the null one; the device's GPU is reached through EGL, as the compositor reaches it. On the
-    // software path the default provider fails and WebGL stays off.
-    const bool useEGL = PR_GetEnv("MOZ_WEBGL_FORCE_EGL") || PR_GetEnv("JIHAD_GPU_COMPOSITOR");
+    // software path, and once the daemon has given the GPU path up, the default provider fails and
+    // WebGL stays off.
+    const bool useEGL = PR_GetEnv("MOZ_WEBGL_FORCE_EGL") || jihad_gpu_compositor_on();
 
     bool tryNativeGL = true;
     bool tryANGLE = false;
