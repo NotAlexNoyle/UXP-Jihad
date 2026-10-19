@@ -13,6 +13,7 @@
 #ifndef mozilla_widget_PuppetWidget_h__
 #define mozilla_widget_PuppetWidget_h__
 
+#include "mozilla/Mutex.h"   // Jihad T-515
 #include "mozilla/gfx/2D.h"
 #include "mozilla/RefPtr.h"
 #include "nsBaseScreen.h"
@@ -294,7 +295,18 @@ public:
   // aOut (10 ints, may be null): the rows the tree changed, the rows fixed layers cover, the two
   // bands read, the frame's position and its valid flag; aScrollOnly: the composite's only change was the card's scroll
   int JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly = nullptr);
+  // T-515: the frame's two halves on their own. PaintLayers (the main thread) flushes and paints the
+  // layers, as Start does first; Post (any thread: the express lane while the main thread runs the
+  // page's script) composes the layer tree as it stands and reads it, at the view given (aView:
+  // scale, offset x, offset y, scroll x, scroll y; null = the view last set) and aScrollValid. The
+  // token is polled and forgotten as any other.
+  bool JihadPaintLayers(nsIDocShell* aDocShell);
+  uint32_t JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi,
+                            int aRow2Lo, int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
+                            const float* aView, bool aScrollValid);
   void JihadComposeForget(uint32_t aToken);
+  // T-515: a job's state without taking its result: 1 done, 2 composed (being read), 0 pending, -1 unknown
+  int JihadComposePeek(uint32_t aToken);
   void JihadComposeAbandonAll();
   void JihadSetScroll(double aX, double aY, bool aValid) { mJihadScrollX = (float)aX; mJihadScrollY = (float)aY; mJihadScrollValid = aValid; }
   mozilla::layers::CompositorBridgeParent* JihadBridge();
@@ -449,6 +461,10 @@ private:
   bool mJihadSharedLayerManager = false; // T-502: mLayerManager is the parent's (a child widget)
   float mJihadScale = 1.0f;              // T-502: the card's zoom, applied by the compositor
   std::vector<::JihadReadJob*> mJihadJobs;   // T-502: frames in flight on the compositor thread
+  mozilla::Mutex mJihadJobsLock{"jihad-compose-jobs"};   // T-515: the list from the main thread and the express lane
+  uint32_t JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo,
+                        int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
+                        const float* aView = nullptr, bool aScrollValid = false);
   uint32_t mJihadNextToken = 1;
   float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // T-502: the card's scroll for the compositor
   bool mJihadScrollValid = false;
