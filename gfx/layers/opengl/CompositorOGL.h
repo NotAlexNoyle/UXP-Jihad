@@ -176,6 +176,9 @@ struct JihadFrameRequest {
   bool scrollValid = false;
   void* fence = nullptr;               // the EGL fence after the compose, or null (glFinish was used)
   mozilla::Atomic<bool> composed{false};   // the compose is issued; the read is pending
+  // T-509: the daemon gave the frame up (a bound passed, the GPU path is off): nothing is written
+  // into dest from then on (a slot the software path may be painting)
+  mozilla::Atomic<bool> cancelled{false};
   bool ok = false;
   void (*done)(JihadFrameRequest*) = nullptr;
   void* cookie = nullptr;

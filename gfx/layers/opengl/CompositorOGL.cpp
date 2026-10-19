@@ -119,6 +119,13 @@ CompositorOGL::CreateContext()
 {
   RefPtr<GLContext> context;
 
+  // T-509 device test (JIHAD_GPU_TEST_NO_EGL=1): no GL context for the compositor, as when EGL
+  // fails; the daemon must find the GPU path unusable and render in software
+  if (getenv("JIHAD_GPU_TEST_NO_EGL")) {
+    fprintf(stderr, "[jihad-gpu] JIHAD_GPU_TEST_NO_EGL: the compositor gets no GL context\n");
+    return nullptr;
+  }
+
   // Used by mock widget to create an offscreen context
   nsIWidget* widget = mWidget->RealWidget();
   void* widgetOpenGLContext = widget ? widget->GetNativeData(NS_NATIVE_OPENGL_CONTEXT) : nullptr;
@@ -2213,6 +2220,9 @@ JihadShiftRows(JihadFrameRequest* aReq)
 void
 CompositorOGL::JihadShiftRowsNow(JihadFrameRequest* aReq)
 {
+  if (aReq->cancelled) {
+    return;   // T-509
+  }
   JihadShiftRows(aReq);
 }
 
@@ -2321,6 +2331,9 @@ CompositorOGL::JihadBandScratch(size_t aBytes)
 bool
 CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
 {
+  if (aReq && aReq->cancelled) {
+    return false;   // T-509: given up, dest untouched
+  }
   if (!aReq || !aReq->done) {
     return false;
   }

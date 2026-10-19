@@ -5,6 +5,7 @@
 
 #include "mozilla/layers/CompositorBridgeParent.h"
 #include <stdio.h>                      // for fprintf, stdout
+#include <unistd.h>                     // Jihad T-509: sleep() for JIHAD_GPU_TEST_STALL
 #include <stdint.h>                     // for uint64_t
 #include <map>                          // for _Rb_tree_iterator, etc
 #include <utility>                      // for pair
@@ -1698,6 +1699,19 @@ JihadMergeIntervals(int (*aIv)[2], int aN, int aH)
 bool
 CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY)
 {
+  // T-509 device test (JIHAD_GPU_TEST_STALL=<n>): the nth job holds the compositor thread 6 s, as a
+  // GPU wait that does not come back would; the daemon gives the frame up and goes on in software
+  {
+    static const int sStallAt = getenv("JIHAD_GPU_TEST_STALL") ? atoi(getenv("JIHAD_GPU_TEST_STALL")) : 0;
+    static int sJobsSeen = 0;
+    if (sStallAt > 0 && aReq && ++sJobsSeen == sStallAt) {
+      fprintf(stderr, "[jihad-gpu] JIHAD_GPU_TEST_STALL: job %d holds the compositor thread 6 s\n", sJobsSeen);
+      sleep(6);
+    }
+  }
+  if (aReq && aReq->cancelled) {
+    return false;   // T-509: given up while it waited
+  }
   // T-503: a verify composite (JIHAD_GPU_VERIFY) changes nothing the next frame reads: the
   // request count, the last scroll and view, the fixed rects and keeps, the diff baseline. It
   // used to consume an anchor move's change, and the next frame then kept stale rows.
@@ -1984,7 +1998,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       {
         ogl->gl()->fFlush();
         TimeStamp c1 = TimeStamp::Now();
-        ogl->JihadShiftRowsNow(aReq);
+        if (aReq->cancelled) ok = false; else ogl->JihadShiftRowsNow(aReq);   // T-509: given up, dest untouched
         msShift = (TimeStamp::Now() - c1).ToMilliseconds();
       }
       if (ok) {
