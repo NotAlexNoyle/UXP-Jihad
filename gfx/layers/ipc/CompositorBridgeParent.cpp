@@ -1183,6 +1183,8 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
 
   static const bool sJihadPhases = getenv("JIHAD_GPU_PHASES") != nullptr;
   const TimeStamp jihadS0 = sJihadPhases ? TimeStamp::Now() : TimeStamp();
+  double jihadPhase0[12];   // T-504: this composite's own phases, logged when it is slow
+  if (sJihadPhases) for (int i = 0; i < 12; i++) jihadPhase0[i] = gJihadPhase[i];
   if (aTarget) {
     mLayerManager->BeginTransactionWithDrawTarget(aTarget, *aRect);
   } else {
@@ -1229,6 +1231,14 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   mLayerManager->SetDebugOverlayWantsNextFrame(false);
   mLayerManager->EndTransaction(time);
   if (sJihadPhases && sJihadInCompose) {
+    const double all = (TimeStamp::Now() - jihadS0).ToMilliseconds();
+    static uint32_t sSlow = 0;
+    if (all >= 80.0 && sSlow++ < 40) {
+      double d[12];
+      for (int i = 0; i < 12; i++) d[i] = gJihadPhase[i] - jihadPhase0[i];
+      fprintf(stderr, "[jihad-gpu] slow composite %.0f ms: shadow props %.1f, async transforms %.1f, post-process %.1f, transforms+diff %.1f, begin frame %.1f, prepare %.1f, render layers %.1f (draws %.1f: %.0f calls, %.0f culled; uploads %.1f), end frame %.1f\n",
+              all, d[6], d[7], d[0], d[1], d[2], d[3], d[4], d[8], d[9], d[10], d[11], d[5]);
+    }
     static uint32_t sN = 0;
     if ((++sN % 20) == 0) {
       size_t layers = 0, painted = 0;
