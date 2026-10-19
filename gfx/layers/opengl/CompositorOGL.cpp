@@ -2344,9 +2344,18 @@ CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
     JihadShiftRows(aReq);
     const TimeStamp t1 = TimeStamp::Now();
     aReq->ok = true;
-    if (aReq->hi > aReq->lo) aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo, aReq->hi);
+    // T-511: the bands as one column (readX0..readX1) when the compositor found only it stale
+    const int surfaceRows = std::min<int>(aReq->h, mWidgetSize.height);
+    auto readBand = [&](int aLo, int aHi) {
+      if (aReq->readX1 > aReq->readX0) {
+        const int lo = std::max(0, aLo), hi = std::min(surfaceRows, aHi);
+        return hi <= lo || JihadReadColumns(aReq->dest, aReq->stride, surfaceRows, aReq->readX0, aReq->readX1, lo, hi - lo, lo, aReq->readX0);
+      }
+      return JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aLo, aHi);
+    };
+    if (aReq->hi > aReq->lo) aReq->ok = readBand(aReq->lo, aReq->hi);
     const TimeStamp t2 = TimeStamp::Now();
-    if (aReq->ok && aReq->hi2 > aReq->lo2) aReq->ok = JihadReadFrame(aReq->dest, aReq->stride, aReq->w, aReq->h, aReq->lo2, aReq->hi2);
+    if (aReq->ok && aReq->hi2 > aReq->lo2) aReq->ok = readBand(aReq->lo2, aReq->hi2);
     // round 138: the fixed and stuck layers' columns
     {
       const int surfaceH = std::min<int>(aReq->h, mWidgetSize.height);

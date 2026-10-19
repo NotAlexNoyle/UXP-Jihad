@@ -172,6 +172,14 @@ struct JihadFrameRequest {
   bool scrollOnly = false;             // out: the composite's only change was the card's scroll
   int target = 0;                      // which window target holds the frame (the compositor fills it)
   int invLo = 0, invHi = 0;            // the rows the composite changed (the compositor fills them)
+  // T-511, the column read: the columns the daemon's bands are stale in ((0,0) = none asked for,
+  // (0,w) = whole rows), given when colsKnown. The bands are then read as the one column they and
+  // the change span when it is narrow (readX0..readX1; (0,0) = whole rows), and the change's own
+  // columns go back to the daemon (invX0..invX1, with invLo..invHi)
+  bool colsKnown = false;
+  int colX0 = 0, colX1 = 0;
+  int readX0 = 0, readX1 = 0;
+  int invX0 = 0, invX1 = 0;
   float scrollX = 0.0f, scrollY = 0.0f;   // the card's scroll (CSS px) for the compositor to apply
   bool scrollValid = false;
   void* fence = nullptr;               // the EGL fence after the compose, or null (glFinish was used)

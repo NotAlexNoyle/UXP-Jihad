@@ -1696,6 +1696,33 @@ JihadMergeIntervals(int (*aIv)[2], int aN, int aH)
   return n;
 }
 
+// T-511, the column read: the frame's bands are read as one column (x0..x1) when the daemon said
+// which columns its bands are stale in, nothing else asks for whole rows (a shift and its entering
+// rows, the rows kept from another frame, the fixed layers' columns), and the column that the
+// change and the stale columns span is under three quarters of the width. A 480 px WebGL canvas
+// on a 768 px card changes 482 rows a frame; every one of them was read whole.
+static bool
+JihadColumnRead(const JihadFrameRequest* aReq, int aInvX0, int aInvX1, int aInvLo, int aInvHi, int aWidth,
+                int* aX0, int* aX1)
+{
+  static const bool sOff = getenv("JIHAD_GPU_NO_COLUMN_READ") != nullptr;
+  if (sOff || !aReq->colsKnown || aReq->shift != 0 || aReq->src || aReq->nCols > 0 || aReq->nKeep > 0 || aWidth <= 0) {
+    return false;
+  }
+  int x0 = aWidth, x1 = 0;
+  if (aReq->colX1 > aReq->colX0) { x0 = aReq->colX0; x1 = aReq->colX1; }
+  if (aInvHi > aInvLo) {
+    if (aInvX1 <= aInvX0) return false;   // rows changed in columns not known: whole rows
+    x0 = std::min(x0, aInvX0); x1 = std::max(x1, aInvX1);
+  }
+  x0 = std::max(0, x0 & ~7); x1 = std::min(aWidth, (x1 + 7) & ~7);
+  if (x1 <= x0 || (x1 - x0) * 4 > aWidth * 3) {
+    return false;
+  }
+  *aX0 = x0; *aX1 = x1;
+  return true;
+}
+
 bool
 CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY)
 {
@@ -1746,6 +1773,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   }
   const TimeStamp tEntry = TimeStamp::Now();
   const int aWidth = aReq->w, aHeight = aReq->h;
+  aReq->readX0 = aReq->readX1 = 0; aReq->invX0 = aReq->invX1 = 0;   // T-511
   // the card's zoom about the frame's top-left, after the residual visual offset (CSS px)
   gfx::Matrix4x4 world = gfx::Matrix4x4::Scaling(aScale > 0.0f ? aScale : 1.0f,
                                                  aScale > 0.0f ? aScale : 1.0f, 1.0f);
@@ -1797,7 +1825,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   // surface: the bands' GPU cost, not the frame's); otherwise the whole path composes it, the
   // diff's region invalidated by hand. JIHAD_GPU_NO_DIFF_FIRST=1 turns it off.
   bool diffFirst = false, diffTaken = false, dfHaveShift = false;
-  int dfShift = 0, dfInvLo = 0, dfInvHi = 0, dfFixLo = 0, dfFixHi = 0;
+  int dfShift = 0, dfInvLo = 0, dfInvHi = 0, dfFixLo = 0, dfFixHi = 0, dfInvX0 = 0, dfInvX1 = 0;
   {
     static const bool sNoDiffFirst = getenv("JIHAD_GPU_NO_DIFF_FIRST") != nullptr;
     if (!aReq->verify && treeChanged && !viewChanged && !sNoDiffFirst && ogl->JihadBandMaxRows() > 0 && aReq->dest &&
@@ -1813,6 +1841,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       if (!cb.IsEmpty()) {
         dfInvLo = std::max(0, cb.y); dfInvHi = std::min(aHeight, cb.YMost());
         if (dfInvHi < dfInvLo) dfInvHi = dfInvLo;
+        dfInvX0 = std::max(0, cb.x); dfInvX1 = std::min(aWidth, cb.XMost());   // T-511
       }
       float sdx = 0.0f, sdy = 0.0f;
       if (aReq->src && aReq->engineShift && JihadDiffScrollShift(&sdx, &sdy)) {
@@ -2001,7 +2030,17 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         if (aReq->cancelled) ok = false; else ogl->JihadShiftRowsNow(aReq);   // T-509: given up, dest untouched
         msShift = (TimeStamp::Now() - c1).ToMilliseconds();
       }
-      if (ok) {
+      // T-511: one band and no column chunks: the band read as the column the change spans
+      int cx0 = 0, cx1 = 0;
+      const bool colRead = ok && diffFirst && hs[0] > 0 && !hs[1] && nChunks == 0 &&
+                           JihadColumnRead(aReq, dfInvX0, dfInvX1, dfInvLo, dfInvHi, aWidth, &cx0, &cx1);
+      if (colRead) {
+        TimeStamp r0 = TimeStamp::Now();
+        ok = ogl->JihadReadColumns(aReq->dest, aReq->stride, passRows ? passRows : aHeight, cx0, cx1, 0, hs[0],
+                                   std::max(0, bands[0][0]), cx0);
+        aReq->readX0 = cx0; aReq->readX1 = cx1;
+        msRead = (TimeStamp::Now() - r0).ToMilliseconds();
+      } else if (ok) {
         TimeStamp r0 = TimeStamp::Now();
         uint8_t* scratch = fullRows ? ogl->JihadBandScratch(aWidth * 4 * fullRows) : nullptr;
         if (fullRows) ok = scratch && ogl->JihadReadFrame(scratch, aReq->stride, aWidth, passRows ? passRows : aHeight, 0, fullRows);
@@ -2031,6 +2070,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       mLayerManager->JihadSetBand(gfx::IntRect(), gfx::IntRect());
       ogl->JihadSelectTarget();
       aReq->invLo = diffFirst ? dfInvLo : 0; aReq->invHi = diffFirst ? dfInvHi : 0;
+      aReq->invX0 = diffFirst ? dfInvX0 : 0; aReq->invX1 = diffFirst ? dfInvX1 : 0;   // T-511
       aReq->scrollOnly = !diffFirst;
       // round 127: the fixed rows as of this frame (a sticky element may have become stuck during
       // the pan), from the effective transforms at the frame's own world
@@ -2065,8 +2105,8 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       aReq->ok = ok;
       static uint32_t sBandFrames = 0;
       if (sBandFrames < 12 || (sBandFrames % 10) == 0) {
-        fprintf(stderr, "[jihad-gpu] compositor thread: band frame %u: rows %d..%d and %d..%d, %d columns in %d chunks (%d rows), %d kept, entry %.1f ms, surface in %.1f ms, compose %.1f ms, shift %.1f ms, read %.1f ms, surface out %.1f ms, all %.1f ms, ok=%d\n",
-                sBandFrames, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->nCols, nChunks, chunkRows, aReq->nKeep, msEntry, msBegin, msCompose, msShift, msRead, msEnd, (TimeStamp::Now() - tEntry).ToMilliseconds(), (int)ok);
+        fprintf(stderr, "[jihad-gpu] compositor thread: band frame %u: rows %d..%d and %d..%d, x %d..%d, %d columns in %d chunks (%d rows), %d kept, entry %.1f ms, surface in %.1f ms, compose %.1f ms, shift %.1f ms, read %.1f ms, surface out %.1f ms, all %.1f ms, ok=%d\n",
+                sBandFrames, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->readX0, aReq->readX1 ? aReq->readX1 : aWidth, aReq->nCols, nChunks, chunkRows, aReq->nKeep, msEntry, msBegin, msCompose, msShift, msRead, msEnd, (TimeStamp::Now() - tEntry).ToMilliseconds(), (int)ok);
       }
       ++sBandFrames;
       aReq->done(aReq);
@@ -2128,11 +2168,12 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     }
   }
   const gfx::IntRect changed = mLayerManager->JihadLastChanged();   // what the tree changed
-  int invLo = 0, invHi = 0;
+  int invLo = 0, invHi = 0, invX0 = 0, invX1 = 0;
   if (!changed.IsEmpty()) {
     invLo = std::max(0, changed.y);
     invHi = std::min(aHeight, changed.YMost());
     if (invHi < invLo) invHi = invLo;
+    invX0 = std::max(0, changed.x); invX1 = std::min(aWidth, changed.XMost());   // T-511
   }
   aReq->scrollOnly = scrollOnly;
   // the rows fixed and sticky layers cover, after this composite's effective transforms: the
@@ -2250,17 +2291,23 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   }
   const int lo = aReq->lo, hi = aReq->hi;
   aReq->invLo = invLo; aReq->invHi = invHi;
+  aReq->invX0 = invX0; aReq->invX1 = invX1;
+  {
+    int cx0 = 0, cx1 = 0;   // T-511: the bands read as one column (JihadReadAsync)
+    if (JihadColumnRead(aReq, invX0, invX1, invLo, invHi, aWidth, &cx0, &cx1)) { aReq->readX0 = cx0; aReq->readX1 = cx1; }
+  }
   // the log's values now: once the read hands the frame over, aReq belongs to the daemon
   const int logLo2 = aReq->lo2, logHi2 = aReq->hi2, logFixedLo = aReq->fixedLo, logFixedHi = aReq->fixedHi, logCols = aReq->nCols, logKeep = aReq->nKeep;
+  const int logReadX0 = aReq->readX0, logReadX1 = aReq->readX1;
   const bool logScrollOnly = aReq->scrollOnly;
   const bool started = ogl->JihadReadAsync(aReq);
   static uint32_t sFrames = 0;
   static const bool sTimeline = getenv("JIHAD_GPU_TIMELINE") != nullptr;   // T-515 device rounds: every frame
   if (sFrames < 20 || (sFrames % 50) == 0 || sTimeline) {
-    fprintf(stderr, "[jihad-gpu] compositor thread: compose %.1f ms, handoff %.1f ms (frame %u, rows %d..%d and %d..%d of %d, %d columns, %d kept, changed %d..%d, fixed %d..%d%s%s, started=%d)\n",
+    fprintf(stderr, "[jihad-gpu] compositor thread: compose %.1f ms, handoff %.1f ms (frame %u, rows %d..%d and %d..%d of %d, x %d..%d, %d columns, %d kept, changed %d..%d x %d..%d, fixed %d..%d%s%s, started=%d)\n",
             (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds(), sFrames,
-            lo, hi, logLo2, logHi2, aHeight, logCols, logKeep, invLo, invHi, logFixedLo, logFixedHi,
-            treeChanged ? ", tree changed" : "", logScrollOnly ? ", scroll only" : "", (int)started);
+            lo, hi, logLo2, logHi2, aHeight, logReadX0, logReadX1 ? logReadX1 : aWidth, logCols, logKeep, invLo, invHi, invX0, invX1,
+            logFixedLo, logFixedHi, treeChanged ? ", tree changed" : "", logScrollOnly ? ", scroll only" : "", (int)started);
   }
   ++sFrames;
   return started;
