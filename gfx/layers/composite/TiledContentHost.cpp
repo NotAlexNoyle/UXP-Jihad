@@ -593,6 +593,25 @@ TiledContentHost::RenderLayerBuffer(TiledLayerBufferComposite& aLayerBuffer,
     }
 
     tileDrawRegion.ScaleRoundOut(resolution, resolution);
+    {
+      // Jihad (T-517): a tile wholly outside the clip is not locked, bound or given an effect only
+      // for the compositor to drop its quad: a band frame's regions each met every tile of the page
+      // (a Wikipedia pan frame: five regions, ~30 tiles). JIHAD_GPU_NO_TILE_CULL=1 for A/B
+      static const bool sNoTileCull = getenv("JIHAD_GPU_NO_TILE_CULL") != nullptr;
+      // The clip is the current render target's own coordinates, the transform's result is not:
+      // the target's origin added, as the compositor's DrawQuad does (an intermediate surface, a
+      // layer with opacity, starts away from 0,0)
+      CompositingRenderTarget* target = mCompositor->GetCurrentRenderTarget();
+      if (!sNoTileCull && target && aTransform.Is2D()) {
+        const IntPoint origin = target->GetOrigin();
+        const IntRect tb = tileDrawRegion.GetBounds();
+        gfx::Rect onTarget = aTransform.TransformBounds(gfx::Rect(tb.x, tb.y, tb.width, tb.height));
+        onTarget.Inflate(1.0f);
+        if (!onTarget.Intersects(gfx::Rect(aClipRect.x + origin.x, aClipRect.y + origin.y, aClipRect.width, aClipRect.height))) {
+          continue;
+        }
+      }
+    }
     RenderTile(tile, aEffectChain, aOpacity,
                aTransform, aSamplingFilter, aClipRect, tileDrawRegion,
                tileOffset * resolution, aLayerBuffer.GetTileSize(),
