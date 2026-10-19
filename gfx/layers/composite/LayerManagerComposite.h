@@ -130,6 +130,13 @@ public:
   // real frame must see the changes the verify composite also drew)
   void JihadHoldBaseline(bool aHold) { mJihadHoldBaseline = aHold; }
   void JihadSetBand(const gfx::IntRect& aBand, const gfx::IntRect& aBand2 = gfx::IntRect(), const gfx::IntRect& aBand3 = gfx::IntRect()) { mJihadBand = aBand; mJihadBand2 = aBand2; mJihadBand3 = aBand3; }
+  // T-517: a band frame's regions composed in one frame (one transaction, one BeginFrame and
+  // EndFrame): region k is the layer tree at world aWorlds[k], drawn only inside aRects[k] (target
+  // pixels). aN 0 ends it. At most 12.
+  void JihadSetRegions(const gfx::Matrix4x4* aWorlds, const gfx::IntRect* aRects, int aN) {
+    mJihadRegionN = 0;
+    for (int k = 0; k < aN && k < 12; k++) { mJihadRegionWorld[k] = aWorlds[k]; mJihadRegionRect[k] = aRects[k]; mJihadRegionN++; }
+  }
   // the card's scroll alone moved (an async transform on the root scroll frame's content, which
   // the layer diff reports as the content's whole bounds): the diff is dropped, the bands asked
   // for are composed and read
@@ -384,6 +391,9 @@ private:
   gfx::IntRect mJihadLastInvalid;   // Jihad T-502
   bool mJihadHoldBaseline = false;
   gfx::IntRect mJihadLastChanged, mJihadBand, mJihadBand2, mJihadBand3;   // Jihad T-502 (band 3: round 138's columns)
+  gfx::Matrix4x4 mJihadRegionWorld[12];   // T-517: JihadSetRegions
+  gfx::IntRect mJihadRegionRect[12];
+  int mJihadRegionN = 0;
   bool mJihadIgnoreDiff = false;
   bool mJihadCompensateScroll = false;
   bool mJihadPartialOn = false;                  // this Render is a partial composite
