@@ -8158,6 +8158,20 @@ nsLayoutUtils::ScrollbarAreaToExcludeFromCompositionBoundsFor(nsIFrame* aScrollF
 // units), set by jihad_layout_set_displayport; the GPU path's root composition covers it
 NS_DECLARE_FRAME_PROPERTY_DELETABLE(JihadShownSizeProperty, nsSize)
 
+// Jihad T-505: the GPU path's frame carries rows above and below what the card shows (overscan,
+// app units: top and bottom), set by jihad_layout_set_overscan; the root scroll frame's clip
+// (nsGfxScrollFrame's BuildDisplayList) is widened by it so those rows are composed
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(JihadOverscanProperty, nsMargin)
+
+/* static */ nsMargin
+nsLayoutUtils::JihadOverscanFor(nsIFrame* aFrame)
+{
+  if (const nsMargin* m = aFrame ? aFrame->GetProperty(JihadOverscanProperty()) : nullptr) {
+    return *m;
+  }
+  return nsMargin();
+}
+
 /* static */ nsSize
 nsLayoutUtils::CalculateCompositionSizeForFrame(nsIFrame* aFrame, bool aSubtractScrollbars)
 {
@@ -9377,6 +9391,32 @@ nsLayoutUtils::GetNonAnonymousStyleContext(nsIFrame* aFrame)
 // displayport is set.
 #include "nsIDocShell.h"
 #include "nsIScrollableFrame.h"
+// T-505: the rows the GPU path's frame carries above and below what the card shows (CSS px): the
+// root scroll frame's clip is widened by them. 0 on success; 1 no pres shell, 2 no root scroll frame.
+extern "C" MOZ_EXPORT int
+jihad_layout_set_overscan(nsIDocShell* aDocShell, float aTop, float aBottom)
+{
+  if (!aDocShell) {
+    return 1;
+  }
+  nsCOMPtr<nsIPresShell> ps = aDocShell->GetPresShell();
+  if (!ps) {
+    return 1;
+  }
+  nsIFrame* rsf = ps->GetRootScrollFrame();
+  if (!rsf) {
+    return 2;
+  }
+  const nsMargin m(nsPresContext::CSSPixelsToAppUnits(std::max(0.0f, aTop)), 0,
+                   nsPresContext::CSSPixelsToAppUnits(std::max(0.0f, aBottom)), 0);
+  const nsMargin* before = rsf->GetProperty(JihadOverscanProperty());
+  if (!before || *before != m) {
+    rsf->SetProperty(JihadOverscanProperty(), new nsMargin(m));
+    rsf->SchedulePaint();
+  }
+  return 0;
+}
+
 extern "C" MOZ_EXPORT int
 jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, float aSide, float aTop, float aBottom)
 {

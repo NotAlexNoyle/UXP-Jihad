@@ -3457,6 +3457,15 @@ ScrollFrameHelper::BuildDisplayList(nsDisplayListBuilder*   aBuilder,
         double res = mOuter->PresContext()->PresShell()->GetResolution();
         clipRect.width = NSToCoordRound(clipRect.width / res);
         clipRect.height = NSToCoordRound(clipRect.height / res);
+        // Jihad T-505: the GPU path's frame carries rows above and below what the card shows
+        static const bool sJihadGpuOs = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+        if (sJihadGpuOs) {
+          const nsMargin os = nsLayoutUtils::JihadOverscanFor(mOuter);
+          if (os.top > 0 || os.bottom > 0) {
+            clipRect.y -= NSToCoordRound(os.top / res);
+            clipRect.height += NSToCoordRound((os.top + os.bottom) / res);
+          }
+        }
       }
     }
 
