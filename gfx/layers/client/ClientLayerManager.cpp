@@ -441,7 +441,12 @@ ClientLayerManager::DidComposite(uint64_t aTransactionId,
                                  const TimeStamp& aCompositeStart,
                                  const TimeStamp& aCompositeEnd)
 {
-  MOZ_ASSERT(mWidget);
+  // Jihad (T-515): the embedder's offscreen compose jobs can be acknowledged after the widget is
+  // gone (a card closed while a job it had asked for was waited out): nothing is left to tell. The
+  // widget's teardown nulls mWidget; it was dereferenced here (SIGSEGV at 0, 2026-10-19).
+  if (!mWidget) {
+    return;
+  }
 
   // |aTransactionId| will be > 0 if the compositor is acknowledging a shadow
   // layers transaction.
