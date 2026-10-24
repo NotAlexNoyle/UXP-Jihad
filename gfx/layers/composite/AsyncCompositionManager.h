@@ -239,6 +239,8 @@ private:
   bool mIsFirstPaint;
   float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // Jihad T-502
   bool mJihadScrollValid = false;
+  float mJihadPrevScrollY = 0.0f;   // T-513: the card's scroll at the composite before
+  float mJihadProbe = 64.0f;        // T-513: how far a sticky layer is probed for sticking (layer px)
   std::vector<Layer*> mJihadStuck;   // round 127 (raw: valid until the next composite)
 
   // This flag is set during a layers update, so that the first composition

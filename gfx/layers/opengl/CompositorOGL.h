@@ -250,6 +250,9 @@ public:
   int JihadBeginBandPass(int aWidth);
   void JihadEndBandPass();
   void JihadUseFrameSurface();   // the frame's pbuffer current again (before a whole composite)
+  // T-513 (review): the reads that follow belong to a request the daemon may give up while the GPU
+  // is read (a stall shows up inside glReadPixels); null when they are done
+  void JihadSetCancel(const mozilla::Atomic<bool>* aCancel) { mJihadCancel = aCancel; }
   GLuint mJihadBandRB = 0, mJihadBandFBO = 0;
   int mJihadBandW = 0;
   // the band surface's rows: JIHAD_GPU_BAND_ROWS (64..942, default 256; round 137)
@@ -426,6 +429,8 @@ private:
   bool mJihadProbed = false;
   gfx::IntSize mJihadTargetSize;                     // the window targets' storage size (round 101)
   UniquePtr<uint8_t[]> mJihadBandScratch;              // one read of the stacked bands, split from here
+  size_t mJihadBandScratchSize = 0;                    // its size (T-513: per compositor)
+  const mozilla::Atomic<bool>* mJihadCancel = nullptr; // T-513: the frame being read was given up (JihadSetCancel)
   int mJihadCur = 0;                                 // the target the next frame draws into
   mozilla::Atomic<int32_t> mJihadTargetBusy[2];      // handed to the read thread, not yet read
   mozilla::Monitor mJihadReadMon{"jihad-read"};
