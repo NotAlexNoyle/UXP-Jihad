@@ -37,6 +37,7 @@
 
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
 namespace mozilla { namespace gl { extern std::atomic<uint32_t> gJihadUploads; extern std::atomic<uint64_t> gJihadUploadUs; } }   // T-517, GLUploadHelpers.cpp
+namespace mozilla { namespace layers { extern std::atomic<uint32_t> gJihadLateWrites; } }   // T-513, CompositorOGL.cpp
 #include "base/task.h"
 // Jihad offscreen render-document support:
 #include "gfxContext.h"
@@ -1452,6 +1453,13 @@ MOZ_EXPORT void
 jihad_offscreen_gpu_given_up()
 {
   sJihadGpuGivenUp = true;
+}
+// T-513 (review): how many reads of a given-up frame had already written into its slot (a GPU stall
+// inside glReadPixels outlasting the daemon's bound); the daemon repaints in software when it moves
+MOZ_EXPORT uint32_t
+jihad_offscreen_late_writes()
+{
+  return mozilla::layers::gJihadLateWrites;
 }
 MOZ_EXPORT bool
 jihad_gpu_compositor_on()

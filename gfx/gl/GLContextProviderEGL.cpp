@@ -259,6 +259,10 @@ GLContextEGL::~GLContextEGL()
     sEGLLibrary.fDestroyContext(EGL_DISPLAY(), mContext);
     sEGLLibrary.UnsetCachedCurrentContext();
 
+    // Jihad (T-513 review): the frame-sized and the band pbuffers made for this context
+    if (mJihadBandPb && mJihadBandPb != mSurface) DestroySurface(mJihadBandPb);
+    if (mJihadPbOverride && mJihadPbOverride != mSurface && mJihadPbOverride != mJihadBandPb) DestroySurface(mJihadPbOverride);
+    mJihadBandPb = mJihadPbOverride = nullptr;
     DestroySurface(mSurface);
 }
 

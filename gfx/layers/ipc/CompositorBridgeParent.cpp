@@ -1969,7 +1969,9 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     JihadChunk chunks[12];
     int nChunks = 0;
     const int chunkRows = JihadPackColumns(aReq->cols, aReq->nCols, fullAsked, ogl->JihadBandRows(), aWidth, chunks, &nChunks);
-    const bool fits = chunkRows >= 0 && fullAsked + chunkRows <= bandMax;
+    // T-513 (review): the regions of one composite are at most 12, bands included: chunks past that
+    // would be read without being composed, so such a frame does not fit
+    const bool fits = chunkRows >= 0 && fullAsked + chunkRows <= bandMax && nChunks + (b1 ? 1 : 0) + (b2 ? 1 : 0) <= 12;
     if ((scrollOnly || diffFirst) && bandMax > 0 && (b1 || b2) && fits && aReq->dest && aReq->stride == aWidth * 4 &&
         !getenv("JIHAD_GPU_READ_THREAD")) {
       // Both bands stacked in the band target (band 2 under band 1), composed one after the
@@ -1984,6 +1986,13 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       // stack at the top of the frame-sized target (round 105)
       const TimeStamp tp0 = TimeStamp::Now();
       const int passRows = (top > 0 && top <= ogl->JihadBandRows()) ? ogl->JihadBeginBandPass(aWidth) : 0;
+      if (!passRows) {
+        // T-513 (review): stacked at the top of the frame-sized target, so the frame's own surface
+        // current (a band frame before this one left the band pbuffer current, and on the Adreno 220
+        // every target must match the current surface's size: memory compositor-scroll-traps)
+        ogl->JihadUseFrameSurface();
+        ogl->JihadEnsureTargetSize(aWidth, aHeight);
+      }
       const double msBegin = (TimeStamp::Now() - tp0).ToMilliseconds();
       const gfx::IntRect passBounds = passRows ? gfx::IntRect(0, 0, aWidth, passRows) : whole;
       bool ok = top > 0 && top <= bandMax;
@@ -2067,6 +2076,9 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         if (aReq->cancelled) ok = false; else ogl->JihadShiftRowsNow(aReq);   // T-509: given up, dest untouched
         msShift = (TimeStamp::Now() - c1).ToMilliseconds();
       }
+      // T-513 (review): the reads below belong to a request the daemon may give up meanwhile
+      struct CancelScope { CompositorOGL* o; ~CancelScope() { o->JihadSetCancel(nullptr); } } cancelScope{ogl};
+      ogl->JihadSetCancel(&aReq->cancelled);
       // T-511: one band and no column chunks: the band read as the column the change spans
       int cx0 = 0, cx1 = 0;
       const bool colRead = ok && diffFirst && hs[0] > 0 && !hs[1] && nChunks == 0 &&
@@ -2081,6 +2093,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         TimeStamp r0 = TimeStamp::Now();
         uint8_t* scratch = fullRows ? ogl->JihadBandScratch(aWidth * 4 * fullRows) : nullptr;
         if (fullRows) ok = scratch && ogl->JihadReadFrame(scratch, aReq->stride, aWidth, passRows ? passRows : aHeight, 0, fullRows);
+        if (ok && fullRows && aReq->cancelled) ok = false;   // T-513 (review): given up: the slot not touched
         if (ok && fullRows) {
           int from = 0;
           for (int b = 0; b < 2; b++) {

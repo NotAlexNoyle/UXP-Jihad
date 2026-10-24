@@ -572,12 +572,16 @@ GLTextureHost::Lock()
   if (!mTextureSource) {
     gfx::SurfaceFormat format = mHasAlpha ? gfx::SurfaceFormat::R8G8B8A8
                                           : gfx::SurfaceFormat::R8G8B8X8;
+    // Jihad (T-513 review): the name is the client's, as the comment always said: the producer's
+    // SharedSurface_GLTexture deletes it on its own context. Deleted here too, in the GPU path's one
+    // share group (engine 0051) a name handed out again in between (a tile texture, a WebGL
+    // texture) was deleted under its new owner.
     mTextureSource = new GLTextureSource(mCompositor,
                                          mTexture,
                                          mTarget,
                                          mSize,
                                          format,
-                                         false /* owned by the client */);
+                                         true /* owned by the client */);
   }
 
   return true;

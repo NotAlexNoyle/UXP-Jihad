@@ -558,7 +558,7 @@ AsyncCompositionManager::AlignFixedAndStickyLayers(Layer* aTransformedSubtreeRoo
       const LayerRect& outer = layer->GetStickyScrollRangeOuter();
       const LayerRect& inner = layer->GetStickyScrollRangeInner();
       const LayerPoint base = translation - unconsumedTranslation;   // the translation before the sticky clamp
-      for (const float probe : { 64.0f, -64.0f }) {
+      for (const float probe : { mJihadProbe, -mJihadProbe }) {
         const float ty = base.y + probe;
         const float hy = IntervalOverlap(ty, outer.y, outer.YMost()) - IntervalOverlap(ty, inner.y, inner.YMost());
         if (fabsf(hy) > 0.5f) held = true;
@@ -863,6 +863,17 @@ AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
                                                           bool* aOutFoundRoot)
 {
   mJihadStuck.clear();   // Jihad T-502 round 127: this composite's stuck sticky layers
+  {
+    // T-513 (review): a sticky layer is probed as far as twice this composite's scroll step (64 px at
+    // least): a fast flick crossed the threshold by more than a fixed 64 px in one frame, its stuck
+    // position was not read and its old pixels slid with the content as a ghost strip
+    // (a frame may compose more than once at one scroll: only a move sets it)
+    const float step = mJihadScrollValid ? fabsf(mJihadScrollY - mJihadPrevScrollY) : 0.0f;
+    if (step > 0.5f) {
+      mJihadProbe = std::max(64.0f, std::min(2.0f * step, 1024.0f));
+      mJihadPrevScrollY = mJihadScrollY;
+    }
+  }
   bool appliedTransform = false;
   std::stack<Maybe<ParentLayerIntRect>> stackDeferredClips;
 
