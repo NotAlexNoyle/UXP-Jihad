@@ -9420,13 +9420,22 @@ jihad_layout_set_overscan(nsIDocShell* aDocShell, float aTop, float aBottom)
 }
 
 extern "C" MOZ_EXPORT int
-jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, float aSide, float aTop, float aBottom)
+jihad_layout_set_displayport2(nsIDocShell* aDocShell, float aVisW, float aVisH, float aShiftX, float aShiftY,
+                              float aSide, float aTop, float aBottom)
 {
   // T-502 round 131: the card shows aVisW x aVisH CSS px (its size over its zoom), which can be
   // larger than the scroll port (a fit-zoomed page: 1116x1369 CSS px shown, a 768x942 scroll
-  // port); the displayport must cover what is shown plus the slack asked for, so the right and
-  // bottom margins add the difference (round 126's margins relative to the scroll port left the
-  // right third and the bottom of a fit-zoomed page unpainted)
+  // port); the displayport must cover what is shown plus the slack asked for.
+  // T-524 (2026-10-24): what is shown sits at (aShiftX, aShiftY) CSS px from the engine's own scroll
+  // (the compositor's shift: on a zoomed-in page laid out at the card's width the engine has no
+  // sideways scroll range at all, so the whole of the card's x is the shift), and the pres shell's
+  // resolution follows the zoom (T-504). GetDisplayPortFromMarginsData takes the ROOT's base rect in
+  // layout device px (it scales it by the parent's resolution, 1 here, adds the margins in screen px
+  // and divides the whole by the cumulative resolution): a base in CSS px shrank by the resolution
+  // (the 1116 px scroll port to 479 at 2.33, the margins to 71), the displayport ended 550 CSS px
+  // from the engine's scroll and the card, 531 px over, saw its right third white, then at 2.98 nothing
+  // (desktop Wikipedia, the emulated finger's double tap). So the base is what the card shows, at the
+  // shift, times the resolution, and the margins are screen px: CSS px times the resolution.
   if (!aDocShell) {
     return 1;
   }
@@ -9456,21 +9465,34 @@ jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, f
       rsf->SchedulePaint();
     }
   }
-  // the base is the scroll port, set every time: layout seeds it once from the composition size
-  // (the engine window, 768x942 CSS px) and a fit-zoomed page's scroll port is larger (round 131)
-  nsLayoutUtils::SetDisplayPortBase(content, nsRect(nsPoint(0, 0), port.Size()));
+  float res = ps->GetResolution();
+  if (!(res > 0.0f)) {
+    res = 1.0f;
+  }
   const float portW = nsPresContext::AppUnitsToFloatCSSPixels(port.width);
   const float portH = nsPresContext::AppUnitsToFloatCSSPixels(port.height);
-  const float right = std::max(0.0f, aVisW - portW) + aSide;
-  const float bottom = std::max(0.0f, aVisH - portH) + aBottom;
-  const ScreenMargin margins(aTop, right, bottom, aSide);
+  // the base: what the card shows, where it is, in layout device px (CSS px times the resolution);
+  // at a resolution of 1 and no shift this is the scroll port or the larger shown area, as before
+  const float baseW = std::max(aVisW, aShiftX > 0.0f ? 0.0f : portW);
+  const float baseH = std::max(aVisH, aShiftY > 0.0f ? 0.0f : portH);
+  const nsRect base(nsPresContext::CSSPixelsToAppUnits(aShiftX * res), nsPresContext::CSSPixelsToAppUnits(aShiftY * res),
+                    nsPresContext::CSSPixelsToAppUnits(baseW * res), nsPresContext::CSSPixelsToAppUnits(baseH * res));
+  nsLayoutUtils::SetDisplayPortBase(content, base);
+  const ScreenMargin margins(aTop * res, aSide * res, aBottom * res, aSide * res);
   static int sLogged = 0;
-  if (sLogged++ < 6) {
-    JIHAD_GPU_LOG("[jihad-gpu] displayport: scroll port %.0fx%.0f CSS px, shown %.0fx%.0f, margins top %.0f right %.0f bottom %.0f left %.0f\n",
-            portW, portH, aVisW, aVisH, aTop, right, bottom, aSide);
+  if (sLogged++ < 12) {
+    JIHAD_GPU_LOG("[jihad-gpu] displayport: scroll port %.0fx%.0f CSS px, shown %.0fx%.0f at +%.0f,%.0f, resolution %.4f, "
+                  "margins %.0f up and down, %.0f sideways (CSS px)\n",
+            portW, portH, aVisW, aVisH, aShiftX, aShiftY, res, aTop, aSide);
   }
   if (!nsLayoutUtils::SetDisplayPortMargins(content, ps, margins, 0)) {
     return 4;
   }
   return 0;
+}
+
+int
+jihad_layout_set_displayport(nsIDocShell* aDocShell, float aVisW, float aVisH, float aSide, float aTop, float aBottom)
+{
+  return jihad_layout_set_displayport2(aDocShell, aVisW, aVisH, 0.0f, 0.0f, aSide, aTop, aBottom);
 }
