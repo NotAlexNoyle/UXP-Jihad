@@ -3455,16 +3455,23 @@ ScrollFrameHelper::BuildDisplayList(nsDisplayListBuilder*   aBuilder,
       clipRect.SizeTo(nsLayoutUtils::CalculateCompositionSizeForFrame(mOuter));
       if (mOuter->PresContext()->IsRootContentDocument()) {
         double res = mOuter->PresContext()->PresShell()->GetResolution();
-        clipRect.width = NSToCoordRound(clipRect.width / res);
-        clipRect.height = NSToCoordRound(clipRect.height / res);
-        // Jihad T-505: the GPU path's frame carries rows above and below what the card shows
         static const bool sJihadGpuOs = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
         if (sJihadGpuOs) {
+          // Jihad T-524 (2026-10-24): on the GPU path CalculateCompositionSizeForFrame answers the
+          // scroll port or what the card shows, in CSS px — not the widget's device px of Gecko's own
+          // branch — so the division by the resolution below made this clip 479 CSS px wide at a zoom
+          // of 2.33 (1116 / 2.33) and a tap on anything beyond it hit only <html> (desktop Wikipedia's
+          // infobox at x 660, the emulated finger). The card's view, wherever the compositor shifts it,
+          // stays inside the scroll port: the port is the clip.
+          // Jihad T-505: the GPU path's frame carries rows above and below what the card shows (CSS px)
           const nsMargin os = nsLayoutUtils::JihadOverscanFor(mOuter);
           if (os.top > 0 || os.bottom > 0) {
-            clipRect.y -= NSToCoordRound(os.top / res);
-            clipRect.height += NSToCoordRound((os.top + os.bottom) / res);
+            clipRect.y -= os.top;
+            clipRect.height += os.top + os.bottom;
           }
+        } else {
+          clipRect.width = NSToCoordRound(clipRect.width / res);
+          clipRect.height = NSToCoordRound(clipRect.height / res);
         }
       }
     }
