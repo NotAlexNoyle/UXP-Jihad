@@ -1034,6 +1034,19 @@ retryDueToTLSIntolerance(PRErrorCode err, nsNSSSocketInfo* socketInfo)
   // be used to conclude server is TLS intolerant.
   // Note this only happens during the initial SSL handshake.
 
+  // A certificate-verification failure is the server's CERTIFICATE, not its TLS
+  // version, so it must not be remembered as intolerance: against a TLS 1.3
+  // server the retry at TLS 1.2 trips the server's downgrade sentinel and NSS
+  // reports SSL_ERROR_RX_MALFORMED_SERVER_HELLO, which buries the real error
+  // (a revoked certificate shown as "malformed Server Hello"; measured on
+  // ssl.com's and DigiCert's revoked demo hosts, 2026-10-25). The same error at
+  // TLS 1.2, with no retry possible, reports SEC_ERROR_REVOKED_CERTIFICATE.
+  if ((err >= SEC_ERROR_BASE && err < SEC_ERROR_LIMIT) ||
+      (err >= mozilla::pkix::ERROR_BASE && err < mozilla::pkix::END_OF_LIST) ||
+      err == SSL_ERROR_BAD_CERT_DOMAIN) {
+    return false;
+  }
+
   SSLVersionRange range = socketInfo->GetTLSVersionRange();
   nsSSLIOLayerHelpers& helpers = socketInfo->SharedState().IOLayerHelpers();
 
