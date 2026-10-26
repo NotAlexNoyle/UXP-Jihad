@@ -460,6 +460,7 @@ private:
   LayoutDeviceIntRegion mDirtyRegion;
   bool mJihadDirty = false;   // sticky Invalidate() flag, drained by JihadTakeDirty()
   bool mJihadLayersPainted = false;   // T-527: JihadPaintLayers has painted this widget's layers once
+  float mJihadPaintedRes = 0.0f;      // T-527: the pres shell's resolution at that paint (a change repaints)
   bool mJihadCompositorTried = false;   // T-502: CreateCompositor attempted once per widget
   bool mJihadSharedLayerManager = false; // T-502: mLayerManager is the parent's (a child widget)
   float mJihadScale = 1.0f;              // T-502: the card's zoom, applied by the compositor
