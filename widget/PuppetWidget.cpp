@@ -1076,7 +1076,7 @@ PuppetWidget::JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight
 }
 
 int
-PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly)
+PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly, int aOutLen)
 {
   // T-515: the job list is shared with the express lane. Without a wait the whole poll holds the
   // list's lock: a forget from another thread between the find and the job's monitor would let the
@@ -1130,6 +1130,11 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
         aOut[6] = job->req.lo2; aOut[7] = job->req.hi2;
         aOut[8] = job->req.frameY; aOut[9] = job->req.frameYValid ? 1 : 0;
         if (job->req.colsKnown) { aOut[10] = job->req.invX0; aOut[11] = job->req.invX1; }   // T-511: twelve ints
+        if (aOutLen >= 12 + 1 + 16) {   // T-544: the stuck rects, a count and four ints each
+          aOut[12] = job->req.nStuck;
+          for (int k = 0; k < job->req.nStuck && k < 4; k++)
+            for (int c = 0; c < 4; c++) aOut[13 + 4 * k + c] = job->req.stuck[k][c];
+        }
       }
       if (aScrollOnly) *aScrollOnly = job->req.scrollOnly;
     } else if (!aWait && job->req.composed) {
@@ -1549,6 +1554,19 @@ jihad_offscreen_compose_poll(nsIWidget* aWidget, uint32_t aToken, int* aOut, int
   }
   bool scrollOnly = false;
   const int r = static_cast<PuppetWidget*>(aWidget)->JihadComposePoll(aToken, false, aOut, &scrollOnly);
+  if (aScrollOnly) *aScrollOnly = scrollOnly ? 1 : 0;
+  return r;
+}
+MOZ_EXPORT int
+jihad_offscreen_compose_poll2(nsIWidget* aWidget, uint32_t aToken, int* aOut, int aOutLen, int* aScrollOnly)
+{
+  // T-544: the poll with aOutLen ints: past the twelve above, the frame's fixed and stuck rects
+  // (aOut[12] of them, then x0, y0, x1, y1 each, frame px) when aOutLen holds 29
+  if (!aWidget || aOutLen < 12) {
+    return -1;
+  }
+  bool scrollOnly = false;
+  const int r = static_cast<PuppetWidget*>(aWidget)->JihadComposePoll(aToken, false, aOut, &scrollOnly, aOutLen);
   if (aScrollOnly) *aScrollOnly = scrollOnly ? 1 : 0;
   return r;
 }

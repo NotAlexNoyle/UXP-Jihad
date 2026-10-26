@@ -1348,6 +1348,18 @@ JihadFixedCols()
   return sOn;
 }
 
+// T-544: the frame's fixed and stuck rects (the last JihadUpdateLastFixed's) out to the daemon
+static void
+JihadStuckOut(JihadFrameRequest* aReq, const gfx::IntRect* aRects, int aN)
+{
+  aReq->nStuck = 0;
+  for (int k = 0; k < aN && aReq->nStuck < 4; k++) {
+    if (aRects[k].IsEmpty()) continue;
+    int* o = aReq->stuck[aReq->nStuck++];
+    o[0] = aRects[k].x; o[1] = aRects[k].y; o[2] = aRects[k].XMost(); o[3] = aRects[k].YMost();
+  }
+}
+
 // the rects as column reads: each widened by the shift (the base frame's fixed pixels land shift
 // rows above them on a scroll down, below on a scroll up), clipped to the frame; one a full-width
 // band already covers is left out
@@ -2169,6 +2181,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         });
         if (fHi > fLo) { mJihadLastFixedLo = fLo; mJihadLastFixedHi = fHi; } else { mJihadLastFixedLo = mJihadLastFixedHi = 0; }
         JihadUpdateLastFixed(aWidth, aHeight);   // rounds 138/141
+        JihadStuckOut(aReq, mJihadLastFixedRects, mJihadLastFixedN);
       } else if (diffFirst) {
         mJihadLastFixedLo = dfFixLo; mJihadLastFixedHi = dfFixHi;
       }
@@ -2294,6 +2307,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     const int lastN = mJihadLastFixedN;
     for (int k = 0; k < lastN; k++) lastR[k] = mJihadLastFixedRects[k];
     JihadUpdateLastFixed(aWidth, aHeight);   // prev = last, last = now
+    JihadStuckOut(aReq, mJihadLastFixedRects, mJihadLastFixedN);
     for (int k = 0; k < mJihadLastFixedN; k++) { colRects[colRectsN] = mJihadLastFixedRects[k]; colKeeps[colRectsN] = mJihadLastKeep[k]; colRectsN++; }
     for (int k = 0; k < lastN; k++) {
       bool same = false;
