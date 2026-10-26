@@ -3712,7 +3712,15 @@ ScrollFrameHelper::DecideScrollableLayer(nsDisplayListBuilder* aBuilder,
         displayportBase -= mScrollPort.TopLeft();
       }
 
-      nsLayoutUtils::SetDisplayPortBase(mOuter->GetContent(), displayportBase);
+      // Jihad T-527: on the GPU path the root's base is the daemon's (what the card shows, at the
+      // compositor's shift, in layout device px: jihad_layout_set_displayport2). Replaced here on
+      // every paint (nsLayoutUtils::PaintFrame asks the root with aAllowCreateDisplayPort), it was
+      // the composition size at the origin in CSS px, and a zoomed-in card's displayport covered
+      // only what the margins and the clamp into the scrollable rect happened to reach: with no
+      // margins, desktop Wikipedia at 2.33 painted 660 of the 861 CSS px the card showed.
+      if (!(mIsRoot && nsLayoutUtils::JihadKeepsDisplayPortBase(mOuter))) {
+        nsLayoutUtils::SetDisplayPortBase(mOuter->GetContent(), displayportBase);
+      }
     }
 
     // If we don't have aAllowCreateDisplayPort == true then should have already

@@ -2559,6 +2559,9 @@ public:
 
   // Jihad T-505: the GPU path's overscan of the root scroll frame (top and bottom, app units)
   static nsMargin JihadOverscanFor(nsIFrame* aFrame);
+  // Jihad T-527: on the GPU path the daemon sets the root scroll frame's displayport base itself
+  // (jihad_layout_set_displayport2): true when it has, and the paint must not replace it
+  static bool JihadKeepsDisplayPortBase(nsIFrame* aRootScrollFrame);
 
  /**
   * Calculate the composition size for the root scroll frame of the root
