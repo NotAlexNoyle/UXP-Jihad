@@ -1921,7 +1921,19 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         int dfNChunks = 0;
         dfSpan = JihadPackColumns(dfCols, dfNCols, total, ogl->JihadBandRows(), aWidth, dfChunks, &dfNChunks);   // round 142
       }
-      if (total > 0 && dfSpan >= 0 && total + dfSpan <= ogl->JihadBandRows()) {
+      // T-527: packed for the band surface first; a frame that does not fit it takes the tall one
+      bool dfFits = total > 0 && dfSpan >= 0 && total + dfSpan <= ogl->JihadBandRows();
+      const int dfTall = ogl->JihadBandTallRows();
+      if (!dfFits && dfTall > 0 && total > 0) {
+        int span2 = 0;
+        if (JihadFixedCols()) {
+          JihadChunk dfChunks2[12];
+          int dfNChunks2 = 0;
+          span2 = JihadPackColumns(dfCols, dfNCols, total, dfTall, aWidth, dfChunks2, &dfNChunks2);
+        }
+        if (span2 >= 0 && total + span2 <= dfTall) { dfSpan = span2; dfFits = true; }
+      }
+      if (dfFits) {
         aReq->lo = iv[0][0]; aReq->hi = iv[0][1];
         aReq->lo2 = n > 1 ? iv[1][0] : 0; aReq->hi2 = n > 1 ? iv[1][1] : 0;
         aReq->nCols = dfNCols;
@@ -1968,7 +1980,17 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     const int fullAsked = (b1 ? std::min(aHeight, aReq->hi) - std::max(0, aReq->lo) : 0) + (b2 ? std::min(aHeight, aReq->hi2) - std::max(0, aReq->lo2) : 0);
     JihadChunk chunks[12];
     int nChunks = 0;
-    const int chunkRows = JihadPackColumns(aReq->cols, aReq->nCols, fullAsked, ogl->JihadBandRows(), aWidth, chunks, &nChunks);
+    int chunkRows = JihadPackColumns(aReq->cols, aReq->nCols, fullAsked, ogl->JihadBandRows(), aWidth, chunks, &nChunks);
+    // T-527: packed for the band surface first; the tall one's rows only when that does not fit
+    if (!(chunkRows >= 0 && fullAsked + chunkRows <= ogl->JihadBandRows()) && ogl->JihadBandTallRows() > 0) {
+      JihadChunk chunks2[12];
+      int nChunks2 = 0;
+      const int cr2 = JihadPackColumns(aReq->cols, aReq->nCols, fullAsked, ogl->JihadBandTallRows(), aWidth, chunks2, &nChunks2);
+      if (cr2 >= 0 && fullAsked + cr2 <= ogl->JihadBandTallRows()) {
+        chunkRows = cr2; nChunks = nChunks2;
+        for (int c = 0; c < nChunks2; c++) chunks[c] = chunks2[c];
+      }
+    }
     // T-513 (review): the regions of one composite are at most 12, bands included: chunks past that
     // would be read without being composed, so such a frame does not fit
     const bool fits = chunkRows >= 0 && fullAsked + chunkRows <= bandMax && nChunks + (b1 ? 1 : 0) + (b2 ? 1 : 0) <= 12;
@@ -1985,7 +2007,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       // the band pass: its own small surface and target when available (round 106), else the
       // stack at the top of the frame-sized target (round 105)
       const TimeStamp tp0 = TimeStamp::Now();
-      const int passRows = (top > 0 && top <= ogl->JihadBandRows()) ? ogl->JihadBeginBandPass(aWidth) : 0;
+      const int passRows = top > 0 ? ogl->JihadBeginBandPass(aWidth, top) : 0;   // T-527: the band surface or the tall one
       if (!passRows) {
         // T-513 (review): stacked at the top of the frame-sized target, so the frame's own surface
         // current (a band frame before this one left the band pbuffer current, and on the Adreno 220

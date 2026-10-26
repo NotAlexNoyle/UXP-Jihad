@@ -261,8 +261,10 @@ GLContextEGL::~GLContextEGL()
 
     // Jihad (T-513 review): the frame-sized and the band pbuffers made for this context
     if (mJihadBandPb && mJihadBandPb != mSurface) DestroySurface(mJihadBandPb);
-    if (mJihadPbOverride && mJihadPbOverride != mSurface && mJihadPbOverride != mJihadBandPb) DestroySurface(mJihadPbOverride);
-    mJihadBandPb = mJihadPbOverride = nullptr;
+    if (mJihadBandPbTall && mJihadBandPbTall != mSurface) DestroySurface(mJihadBandPbTall);   // T-527
+    if (mJihadPbOverride && mJihadPbOverride != mSurface && mJihadPbOverride != mJihadBandPb &&
+        mJihadPbOverride != mJihadBandPbTall) DestroySurface(mJihadPbOverride);
+    mJihadBandPb = mJihadBandPbTall = mJihadPbOverride = nullptr;
     DestroySurface(mSurface);
 }
 
@@ -373,25 +375,28 @@ GLContextEGL::JihadUsePBufferOfSize(int aWidth, int aHeight)
 }
 
 bool
-GLContextEGL::JihadUseBandPBuffer(int aWidth, int aHeight)
+GLContextEGL::JihadUseBandPBuffer(int aWidth, int aHeight, bool aTall)
 {
-    if (!mJihadBandPb || mJihadBandPbW != aWidth || mJihadBandPbH != aHeight) {
-        if (mJihadBandPb) {
-            if (mSurfaceOverride == mJihadBandPb) JihadUseFramePBuffer();
-            sEGLLibrary.fDestroySurface(EGL_DISPLAY(), mJihadBandPb);
-            mJihadBandPb = nullptr;
+    EGLSurface& pb = aTall ? mJihadBandPbTall : mJihadBandPb;
+    int& pbW = aTall ? mJihadBandPbTallW : mJihadBandPbW;
+    int& pbH = aTall ? mJihadBandPbTallH : mJihadBandPbH;
+    if (!pb || pbW != aWidth || pbH != aHeight) {
+        if (pb) {
+            if (mSurfaceOverride == pb) JihadUseFramePBuffer();
+            sEGLLibrary.fDestroySurface(EGL_DISPLAY(), pb);
+            pb = nullptr;
         }
         const EGLint attrs[] = { LOCAL_EGL_WIDTH, aWidth, LOCAL_EGL_HEIGHT, aHeight, LOCAL_EGL_NONE };
-        mJihadBandPb = sEGLLibrary.fCreatePbufferSurface(EGL_DISPLAY(), mConfig, attrs);
-        if (!mJihadBandPb) {
+        pb = sEGLLibrary.fCreatePbufferSurface(EGL_DISPLAY(), mConfig, attrs);
+        if (!pb) {
             fprintf(stderr, "[jihad-gpu] a %dx%d band pbuffer could not be made (0x%x)\n", aWidth, aHeight, sEGLLibrary.fGetError());
             return false;
         }
-        mJihadBandPbW = aWidth; mJihadBandPbH = aHeight;
-        JIHAD_GPU_LOG("[jihad-gpu] band pbuffer %dx%d made\n", aWidth, aHeight);
+        pbW = aWidth; pbH = aHeight;
+        JIHAD_GPU_LOG("[jihad-gpu] band pbuffer %dx%d made%s\n", aWidth, aHeight, aTall ? " (the tall one)" : "");
     }
-    if (mSurfaceOverride != mJihadBandPb) {
-        mSurfaceOverride = mJihadBandPb;
+    if (mSurfaceOverride != pb) {
+        mSurfaceOverride = pb;
         MakeCurrent(true);
     }
     return true;

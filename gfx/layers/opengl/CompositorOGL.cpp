@@ -261,6 +261,9 @@ CompositorOGL::CleanupResources()
   if (mJihadBandFBO) mGLContext->fDeleteFramebuffers(1, &mJihadBandFBO);
   if (mJihadBandRB) mGLContext->fDeleteRenderbuffers(1, &mJihadBandRB);
   mJihadBandFBO = mJihadBandRB = 0;
+  if (mJihadBandTallFBO) mGLContext->fDeleteFramebuffers(1, &mJihadBandTallFBO);   // T-527
+  if (mJihadBandTallRB) mGLContext->fDeleteRenderbuffers(1, &mJihadBandTallRB);
+  mJihadBandTallFBO = mJihadBandTallRB = 0;
   if (mJihadReadFBO) mGLContext->fDeleteFramebuffers(1, &mJihadReadFBO);
   if (mJihadReadRB) mGLContext->fDeleteRenderbuffers(1, &mJihadReadRB);
   mJihadReadFBO = mJihadReadRB = 0;
@@ -2329,35 +2332,44 @@ CompositorOGL::JihadEnsureTargetSize(int aWidth, int aHeight)
 }
 
 int
-CompositorOGL::JihadBeginBandPass(int aWidth)
+CompositorOGL::JihadBeginBandPass(int aWidth, int aRows)
 {
   static const bool sOff = getenv("JIHAD_GPU_BAND_SURFACE") && !strcmp(getenv("JIHAD_GPU_BAND_SURFACE"), "0");
   if (sOff || aWidth <= 0 || mGLContext->GetContextType() != GLContextType::EGL) {
     return 0;
   }
-  GLContextEGL* egl = static_cast<GLContextEGL*>(mGLContext.get());
-  if (!egl->JihadUseBandPBuffer(aWidth, JihadBandRows())) {
+  // T-527: the band surface, or the tall one when the pass needs more rows than the band surface has
+  const bool tall = aRows > JihadBandRows();
+  const int rows = tall ? JihadBandTallRows() : JihadBandRows();
+  if (rows <= 0 || aRows > rows) {
     return 0;
   }
-  if (!mJihadBandFBO || mJihadBandW != aWidth) {
-    if (!mJihadBandRB) mGLContext->fGenRenderbuffers(1, &mJihadBandRB);
-    mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, mJihadBandRB);
-    mGLContext->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */, aWidth, JihadBandRows());
+  GLuint& rb = tall ? mJihadBandTallRB : mJihadBandRB;
+  GLuint& fbo = tall ? mJihadBandTallFBO : mJihadBandFBO;
+  int& w = tall ? mJihadBandTallW : mJihadBandW;
+  GLContextEGL* egl = static_cast<GLContextEGL*>(mGLContext.get());
+  if (!egl->JihadUseBandPBuffer(aWidth, rows, tall)) {
+    return 0;
+  }
+  if (!fbo || w != aWidth) {
+    if (!rb) mGLContext->fGenRenderbuffers(1, &rb);
+    mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, rb);
+    mGLContext->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, 0x8058 /* GL_RGBA8_OES */, aWidth, rows);
     mGLContext->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, 0);
-    if (!mJihadBandFBO) mGLContext->fGenFramebuffers(1, &mJihadBandFBO);
-    mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadBandFBO);
-    mGLContext->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, mJihadBandRB);
+    if (!fbo) mGLContext->fGenFramebuffers(1, &fbo);
+    mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, fbo);
+    mGLContext->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, rb);
     const GLenum st = mGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
     if (st != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
-      fprintf(stderr, "[jihad-gpu] band target %dx%d incomplete (0x%x)\n", aWidth, JihadBandRows(), st);
+      fprintf(stderr, "[jihad-gpu] band target %dx%d incomplete (0x%x)\n", aWidth, rows, st);
       egl->JihadUseFramePBuffer();
       return 0;
     }
-    mJihadBandW = aWidth;
-    JIHAD_GPU_LOG("[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer\n", aWidth, JihadBandRows(), mJihadBandFBO);
+    w = aWidth;
+    JIHAD_GPU_LOG("[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer%s\n", aWidth, rows, fbo, tall ? " (the tall one)" : "");
   }
-  mJihadWindowFBO = mJihadBandFBO;
-  return JihadBandRows();
+  mJihadWindowFBO = fbo;
+  return rows;
 }
 
 void
