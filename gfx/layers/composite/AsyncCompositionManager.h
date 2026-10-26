@@ -127,6 +127,12 @@ public:
     return false;
   }
   void JihadClearStuck() { mJihadStuck.clear(); }
+  // T-504: the sticky probe's state, kept across a verify composite (the daemon's overview windows sit a frame of
+  // rows from the card's scroll, and their step would leave a probe of up to 1024 px for the next real frame), and
+  // a fixed probe for the overview's composites (every window lists the same sticky layers)
+  void JihadProbeState(float* aPrevY, float* aProbe) const { *aPrevY = mJihadPrevScrollY; *aProbe = mJihadProbe; }
+  void JihadSetProbeState(float aPrevY, float aProbe) { mJihadPrevScrollY = aPrevY; mJihadProbe = aProbe; }
+  void JihadSetProbeOverride(float aProbe) { mJihadProbeOverride = aProbe; }
 
   // GetFrameUniformity will return the frame uniformity for each layer attached to an APZ
   // from the recorded data in RecordShadowTransform
@@ -241,6 +247,7 @@ private:
   bool mJihadScrollValid = false;
   float mJihadPrevScrollY = 0.0f;   // T-513: the card's scroll at the composite before
   float mJihadProbe = 64.0f;        // T-513: how far a sticky layer is probed for sticking (layer px)
+  float mJihadProbeOverride = 0.0f; // T-504: this composite's probe (0: from the scroll step)
   std::vector<Layer*> mJihadStuck;   // round 127 (raw: valid until the next composite)
 
   // This flag is set during a layers update, so that the first composition

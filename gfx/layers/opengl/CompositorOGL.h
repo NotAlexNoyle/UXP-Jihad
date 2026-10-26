@@ -167,6 +167,11 @@ struct JihadFrameRequest {
   bool windowMoved = false;            // T-517 (flag 8): the daemon moved the frame's window by the shift
                                        //   instead: the rows are in place, only the kept rects are copied
   bool bandsOnly = false;              // T-516 (flag 16): read the bands asked for, not the rows the tree changed
+  bool overview = false;               // T-504 (flag 32): a window of the daemon's overview: the scrolled content
+                                       //   alone (fixed and stuck layers not drawn), cleared transparent so the
+                                       //   rows no layer drew read alpha 0; read with its alpha kept
+  bool overviewParts = false;          // T-504 (flag 64): the fixed and stuck layers alone, cleared transparent,
+                                       //   read with their alpha (drawn over the daemon's overview)
   int fixedLo = 0, fixedHi = 0;        // out: the rows fixed and sticky layers cover (0,0 = none)
   int cols[4][4] = {};                 // round 138: column reads after the bands (x0, x1, y0, y1 on the
   int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift
@@ -222,6 +227,9 @@ public:
   // from a texture-backed one on the Adreno 220); JihadReadFrame reads the frame's top-left
   // aWidth x aHeight into aDest as B8G8R8A8 (RGBA read, swizzled in place).
   GLuint JihadWindowFBO() const { return mJihadWindowFBO; }
+  // T-504: the window frame cleared transparent instead of white (an overview window: rows no layer drew
+  // read alpha 0), for the composite between the calls
+  void JihadSetClearTransparent(bool aOn) { mJihadClearTransparent = aOn; }
   bool JihadIsWindowTarget() const;
   // rows [aRowLo, aRowHi) of the frame, top-down; (0, 0) = every row
   bool JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeight, int aRowLo = 0, int aRowHi = 0);
@@ -434,6 +442,8 @@ private:
   /** Widget associated with this compositor */
   LayoutDeviceIntSize mWidgetSize;
   GLuint mJihadWindowFBO = 0;      // Jihad T-502: the target the frame draws into (one of the two below, or the texture's)
+  bool mJihadClearTransparent = false;   // T-504: JihadSetClearTransparent
+  bool mJihadKeepAlpha = false;          // T-504: JihadReadFrame keeps the alpha byte (an overview's read)
   GLuint mJihadWindowTex = 0;      // the texture window target the swizzle pass samples (JIHAD_GPU_PASS)
   gfx::IntSize mJihadPbSize;
   // The default path: two renderbuffer window targets, used in turn, read back by a thread of

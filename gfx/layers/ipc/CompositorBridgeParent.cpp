@@ -23,6 +23,8 @@
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
 namespace mozilla { namespace layers { extern double gJihadPhase[12]; } }   // LayerManagerComposite.cpp (round 139)
 static bool sJihadInCompose = false;   // Jihad T-502 diagnostic: inside JihadComposeAndRead's composite
+static int sJihadOverview = 0;         // Jihad T-504: that composite is an overview window (1: fixed and stuck layers not
+                                       // drawn) or the overview's parts (2: only fixed and stuck layers drawn)
 #include <cmath>                       // Jihad T-502: floor, ceil
 #ifdef MOZ_WIDGET_GTK
 #include "gfxPlatformGtk.h"             // for gfxPlatform
@@ -1212,6 +1214,24 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   const TimeStamp jihadT0 = sJihadPhases ? TimeStamp::Now() : TimeStamp();
   bool requestNextFrame = mCompositionManager->TransformShadowTree(time, mVsyncRate);
   if (sJihadPhases) gJihadPhase[7] += (TimeStamp::Now() - jihadT0).ToMilliseconds();
+  // Jihad T-504: an overview window is the scrolled content alone: the daemon stitches windows composed at
+  // other scrolls into one picture, where fixed and stuck layers would sit once per window. Their shadow
+  // opacity (set again from the layer at every composite) is 0 for this one. The overview's parts are the
+  // other way round: every leaf layer outside a fixed or stuck one at 0, so they come back with their alpha
+  if (sJihadOverview && sJihadInCompose && mLayerManager->GetRoot()) {
+    auto fixedOrStuck = [&](Layer* l) {
+      return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager->JihadIsStuck(l));
+    };
+    ForEachNode<ForwardIterator>(mLayerManager->GetRoot(), [&](Layer* l) {
+      if (sJihadOverview == 1) {
+        if (fixedOrStuck(l)) l->AsLayerComposite()->SetShadowOpacity(0.0f);
+        return;
+      }
+      if (l->GetFirstChild()) return;
+      for (Layer* c = l; c; c = c->GetParent()) if (fixedOrStuck(c)) return;
+      l->AsLayerComposite()->SetShadowOpacity(0.0f);
+    });
+  }
   if (requestNextFrame) {
     ScheduleComposition();
 #if defined(XP_WIN) || defined(MOZ_WIDGET_GTK)
@@ -1760,8 +1780,10 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     CompositorBridgeParent* b; bool on;
     gfx::Matrix4x4 world; float sx, sy; bool sv; uint32_t seq; bool seqKnown; gfx::IntSize size; bool worldKnown;
     int fixLo, fixHi, fixN, prevN; gfx::IntRect rects[4], keeps[4], prev[4];
+    float probePrevY = 0.0f, probe = 0.0f;   // T-504 (review): the sticky probe the next real frame starts from
     JihadVerifyGuard(CompositorBridgeParent* aB, bool aOn) : b(aB), on(aOn) {
       if (!on) return;
+      if (b->mCompositionManager) b->mCompositionManager->JihadProbeState(&probePrevY, &probe);
       world = b->mJihadLastWorld; sx = b->mJihadLastScrollX; sy = b->mJihadLastScrollY; sv = b->mJihadLastScrollValid;
       seq = b->mJihadSeqAtLast; seqKnown = b->mJihadSeqKnown; size = b->mJihadLastSize; worldKnown = b->mJihadWorldKnown;
       fixLo = b->mJihadLastFixedLo; fixHi = b->mJihadLastFixedHi; fixN = b->mJihadLastFixedN; prevN = b->mJihadPrevKeepN;
@@ -1770,6 +1792,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     }
     ~JihadVerifyGuard() {
       if (!on) return;
+      if (b->mCompositionManager) b->mCompositionManager->JihadSetProbeState(probePrevY, probe);
       b->mJihadLastWorld = world; b->mJihadLastScrollX = sx; b->mJihadLastScrollY = sy; b->mJihadLastScrollValid = sv;
       b->mJihadSeqAtLast = seq; b->mJihadSeqKnown = seqKnown; b->mJihadLastSize = size; b->mJihadWorldKnown = worldKnown;
       b->mJihadLastFixedLo = fixLo; b->mJihadLastFixedHi = fixHi; b->mJihadLastFixedN = fixN; b->mJihadPrevKeepN = prevN;
@@ -2228,7 +2251,13 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   mLayerManager->JihadCompensateScroll(!diffTaken && aReq->src != nullptr && aReq->engineShift);   // round 115
   TimeStamp t0 = TimeStamp::Now();
   sJihadInCompose = true;
+  sJihadOverview = aReq->overview ? 1 : (aReq->overviewParts ? 2 : 0);   // T-504
+  ogl->JihadSetClearTransparent(sJihadOverview != 0);
+  if (sJihadOverview && mCompositionManager) mCompositionManager->JihadSetProbeOverride(1024.0f);   // every window the same
   ForceComposeToTarget(nullptr, nullptr);
+  if (mCompositionManager) mCompositionManager->JihadSetProbeOverride(0.0f);
+  ogl->JihadSetClearTransparent(false);
+  sJihadOverview = 0;
   sJihadInCompose = false;
   TimeStamp t1 = TimeStamp::Now();
   mLayerManager->JihadIgnoreDiff(false);

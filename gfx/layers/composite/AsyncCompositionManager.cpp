@@ -873,6 +873,7 @@ AsyncCompositionManager::ApplyAsyncContentTransformToTree(Layer *aLayer,
       mJihadProbe = std::max(64.0f, std::min(2.0f * step, 1024.0f));
       mJihadPrevScrollY = mJihadScrollY;
     }
+    if (mJihadProbeOverride > 0.0f) mJihadProbe = mJihadProbeOverride;   // T-504: an overview composite
   }
   bool appliedTransform = false;
   std::stack<Maybe<ParentLayerIntRect>> stackDeferredClips;
