@@ -172,6 +172,11 @@ struct JihadFrameRequest {
                                        //   rows no layer drew read alpha 0; read with its alpha kept
   bool overviewParts = false;          // T-504 (flag 64): the fixed and stuck layers alone, cleared transparent,
                                        //   read with their alpha (drawn over the daemon's overview)
+  bool contentOnly = false;            // T-505 (flag 128): the frame without its parts: every fixed and every sticky
+                                       //   layer at opacity 0 (stuck or not), no fixed rows, keeps or columns; the
+                                       //   parts' rects still reported (the daemon draws them on the CPU). With flag
+                                       //   64, the parts alone with the same rule
+  uint32_t partsGen = 0;               // T-505, out: the count of updates to layers under a fixed or sticky one
   int fixedLo = 0, fixedHi = 0;        // out: the rows fixed and sticky layers cover (0,0 = none)
   int cols[4][4] = {};                 // round 138: column reads after the bands (x0, x1, y0, y1 on the
   int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift

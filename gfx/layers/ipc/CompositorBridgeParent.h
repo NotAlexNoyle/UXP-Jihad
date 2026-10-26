@@ -545,6 +545,7 @@ public:
   // of the composite before the last (a keep must have held still)
   gfx::IntRect mJihadLastKeep[4], mJihadPrevKeep[4];
   int mJihadPrevKeepN = 0;
+  void JihadHideForJob();   // Jihad T-504/T-505: the overview's and a content-only frame's layers hidden
   int JihadFixedRectsNow(int aWidth, int aHeight, gfx::IntRect* aOut, gfx::IntRect* aKeep);
   void JihadUpdateLastFixed(int aWidth, int aHeight);
   bool mJihadSeqKnown = false;

@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "CompositableTransactionParent.h"
+#include <atomic>   // Jihad T-505
 #include "CompositableHost.h"           // for CompositableParent, etc
 #include "CompositorBridgeParent.h"     // for CompositorBridgeParent
 #include "GLContext.h"                  // for GLContext
@@ -28,6 +29,9 @@
 
 namespace mozilla {
 namespace layers {
+
+extern std::atomic<uint32_t> gJihadPartsGen;   // Jihad T-505, CompositorBridgeParent.cpp
+void JihadReqNote(const char* aSrc);           // Jihad T-505 diagnostic, CompositorBridgeParent.cpp
 
 class ClientTiledLayerBuffer;
 class Compositor;
@@ -54,6 +58,7 @@ ScheduleComposition(CompositableHost* aCompositable)
   if (!cp) {
     return false;
   }
+  JihadReqNote("a compositable's update");
   cp->ScheduleComposition();
   return true;
 }
@@ -67,6 +72,11 @@ CompositableParentManager::ReceiveCompositableUpdate(const CompositableOperation
   CompositableHost* compositable = CompositableHost::FromIPDLActor(aEdit.compositableParent());
   if (compositable->GetCompositor() && !compositable->GetCompositor()->IsValid()) {
     return true;
+  }
+  // Jihad T-505: an update to a layer under a fixed or sticky one moves the parts' generation (the daemon composes
+  // the page's fixed and sticky parts alone again when it moves: they changed)
+  for (Layer* l = compositable->GetLayer(); l; l = l->GetParent()) {
+    if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) { ++gJihadPartsGen; break; }
   }
 
   switch (aEdit.detail().type()) {
