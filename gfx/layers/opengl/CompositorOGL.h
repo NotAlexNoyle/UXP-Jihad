@@ -242,12 +242,13 @@ public:
   // A separate band-sized FBO broke on the Adreno 220: the driver bins an FBO render by the EGL
   // surface's size, so any target or viewport smaller than the surface lost rows (round 104).
   // 0 rows when off (JIHAD_GPU_NO_BAND_TARGET=1).
-  int JihadBandMaxRows() const { static const bool sOff = getenv("JIHAD_GPU_NO_BAND_TARGET") != nullptr; return sOff ? 0 : (JihadBandRows() > 320 ? JihadBandRows() : 320); }
+  int JihadBandMaxRows() const { static const bool sOff = getenv("JIHAD_GPU_NO_BAND_TARGET") != nullptr; const int m = JihadBandRows() > JihadBandTallRows() ? JihadBandRows() : JihadBandTallRows(); return sOff ? 0 : (m > 320 ? m : 320); }
   // Round 106: the band pass on its own surface (JIHAD_GPU_BAND_SURFACE=0 keeps the stack in the
   // frame-sized target): a 256-row pbuffer and an FBO of the same size are made current, so the
   // composite costs the band, not the frame; JihadEndBandPass puts the frame's surface and
   // target back. Returns the band target's rows, 0 when the band pass is not available.
-  int JihadBeginBandPass(int aWidth);
+  // T-527: aRows the pass needs: the band surface when they fit it, else the tall one when they fit that
+  int JihadBeginBandPass(int aWidth, int aRows);
   void JihadEndBandPass();
   void JihadUseFrameSurface();   // the frame's pbuffer current again (before a whole composite)
   // T-513 (review): the reads that follow belong to a request the daemon may give up while the GPU
@@ -255,12 +256,26 @@ public:
   void JihadSetCancel(const mozilla::Atomic<bool>* aCancel) { mJihadCancel = aCancel; }
   GLuint mJihadBandRB = 0, mJihadBandFBO = 0;
   int mJihadBandW = 0;
+  GLuint mJihadBandTallRB = 0, mJihadBandTallFBO = 0;   // T-527: the tall band surface's target
+  int mJihadBandTallW = 0;
   // the band surface's rows: JIHAD_GPU_BAND_ROWS (64..942, default 256; round 137)
   static int JihadBandRows() {
     static const int sRows = [] {
       const char* e = getenv("JIHAD_GPU_BAND_ROWS");
       const int r = e ? atoi(e) : 256;
       return r < 64 ? 64 : (r > 942 ? 942 : r);
+    }();
+    return sRows;
+  }
+  // T-527: a second, taller band surface for a frame whose change does not fit the band surface (a
+  // 480 px WebGL canvas changes 354-482 rows a frame and took the whole frame-sized target, 768x1224
+  // cleared, drawn and resolved every frame): JIHAD_GPU_BAND_TALL (default 512, 0 off). Frames are
+  // packed for the band surface first, so a frame that fits it never pays the tall one.
+  static int JihadBandTallRows() {
+    static const int sRows = [] {
+      const char* e = getenv("JIHAD_GPU_BAND_TALL");
+      const int r = e ? atoi(e) : 512;
+      return r <= JihadBandRows() ? 0 : (r > 942 ? 942 : r);
     }();
     return sRows;
   }

@@ -96,10 +96,14 @@ public:
     EGLSurface mJihadPbOverride = nullptr;
     // Round 106: a band-sized pbuffer made current for the band composites of a scroll-only
     // frame, then the frame's pbuffer again. false when the band pbuffer cannot be made.
-    bool JihadUseBandPBuffer(int aWidth, int aHeight);
+    // T-527: aTall picks a second pbuffer of its own (the tall band surface), so a frame that needs
+    // the tall one and the next that needs the short one do not remake either
+    bool JihadUseBandPBuffer(int aWidth, int aHeight, bool aTall = false);
     void JihadUseFramePBuffer();
     EGLSurface mJihadBandPb = nullptr;
     int mJihadBandPbW = 0, mJihadBandPbH = 0;
+    EGLSurface mJihadBandPbTall = nullptr;
+    int mJihadBandPbTallW = 0, mJihadBandPbTallH = 0;
 
     virtual bool MakeCurrentImpl(bool aForce) override;
 
