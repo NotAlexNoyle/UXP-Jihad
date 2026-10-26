@@ -977,7 +977,16 @@ PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
     static const bool sAlways = getenv("JIHAD_GPU_PAINT_ALWAYS") != nullptr;
     nsPresContext* pc = presShell->GetPresContext();
     nsRefreshDriver* rd = pc ? pc->RefreshDriver() : nullptr;
-    if (!sAlways && mJihadLayersPainted && mDirtyRegion.IsEmpty() && !mPaintTask.IsPending() && rd &&
+    // the invalidations land on the child widget (Invalidate forwards to mChild): the whole chain is
+    // asked, as JihadTakeDirty drains it (review 2026-10-26)
+    bool pending = false;
+    for (PuppetWidget* w = this; w && !pending; w = w->mChild.get()) {
+      pending = !w->mDirtyRegion.IsEmpty() || w->mPaintTask.IsPending();
+    }
+    // a new resolution schedules no paint by itself (SetResolution): on a page with no root scroll frame
+    // (about:addons) nothing else does, and a zoom across 1.1 stayed painted at the old one (review 2026-10-26)
+    const float res = presShell->GetResolution();
+    if (!sAlways && mJihadLayersPainted && !pending && res == mJihadPaintedRes && rd &&
         !rd->ViewManagerFlushIsPending()) {
       static uint32_t sSkipped = 0;
       if ((++sSkipped % 100) == 1) {
@@ -987,6 +996,7 @@ PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
     }
   }
   mJihadLayersPainted = true;
+  mJihadPaintedRes = presShell->GetResolution();
   mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
   nsRegion dirty(root->GetDimensions());
   presShell->Paint(root, dirty, nsIPresShell::PAINT_LAYERS);

@@ -2348,14 +2348,16 @@ CompositorOGL::JihadBeginBandPass(int aWidth, int aRows)
   GLuint& fbo = tall ? mJihadBandTallFBO : mJihadBandFBO;
   int& w = tall ? mJihadBandTallW : mJihadBandW;
   // a surface that could not be made at this width is not made again every band frame (a line each,
-  // ~25 a second, into the device's small /var): the frame's own surface does the pass
+  // ~25 a second, into the device's small /var): the frame's own surface does the pass, and the surface
+  // is tried again 30 s later (the failure may have been another app holding the GPU's memory)
   int& failW = mJihadBandFailW[tall ? 1 : 0];
-  if (failW == aWidth) {
+  TimeStamp& failT = mJihadBandFailT[tall ? 1 : 0];
+  if (failW == aWidth && !failT.IsNull() && (TimeStamp::Now() - failT).ToSeconds() < 30.0) {
     return 0;
   }
   GLContextEGL* egl = static_cast<GLContextEGL*>(mGLContext.get());
   if (!egl->JihadUseBandPBuffer(aWidth, rows, tall)) {
-    failW = aWidth;
+    failW = aWidth; failT = TimeStamp::Now();
     return 0;
   }
   if (!fbo || w != aWidth) {
@@ -2368,9 +2370,9 @@ CompositorOGL::JihadBeginBandPass(int aWidth, int aRows)
     mGLContext->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, rb);
     const GLenum st = mGLContext->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
     if (st != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
-      fprintf(stderr, "[jihad-gpu] band target %dx%d incomplete (0x%x): not tried again at this width\n", aWidth, rows, st);
+      fprintf(stderr, "[jihad-gpu] band target %dx%d incomplete (0x%x): tried again in 30 s\n", aWidth, rows, st);
       egl->JihadUseFramePBuffer();
-      failW = aWidth;
+      failW = aWidth; failT = TimeStamp::Now();
       return 0;
     }
     w = aWidth;
