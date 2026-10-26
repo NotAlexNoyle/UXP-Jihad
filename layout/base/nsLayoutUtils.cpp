@@ -8174,6 +8174,13 @@ nsLayoutUtils::JihadOverscanFor(nsIFrame* aFrame)
   return nsMargin();
 }
 
+/* static */ bool
+nsLayoutUtils::JihadKeepsDisplayPortBase(nsIFrame* aRootScrollFrame)
+{
+  static const bool sJihadGpu = getenv("JIHAD_GPU_COMPOSITOR") != nullptr;
+  return sJihadGpu && aRootScrollFrame && aRootScrollFrame->GetProperty(JihadShownSizeProperty());
+}
+
 /* static */ nsSize
 nsLayoutUtils::CalculateCompositionSizeForFrame(nsIFrame* aFrame, bool aSubtractScrollbars)
 {
