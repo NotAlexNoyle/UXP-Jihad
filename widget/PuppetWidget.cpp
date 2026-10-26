@@ -848,6 +848,7 @@ struct JihadReadJob {
   bool verify = false;   // T-503
   bool colsKnown = false; int colX0 = 0, colX1 = 0;   // T-511: the bands' stale columns (flag 4)
   bool windowMoved = false;   // T-517 (flag 8): the shift is the daemon's window move, the rows in place
+  bool bandsOnly = false;     // T-516 (flag 16): only the bands asked for are read
   int invLo, invHi;      // the rows the composite changed
   float scrollX = 0.0f, scrollY = 0.0f; bool scrollValid = false;   // the card's scroll for the compositor
   uint32_t token;
@@ -895,6 +896,7 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   job->req.shift = job->shift; job->req.src = job->src; job->req.srcY = job->srcY; job->req.engineShift = job->engineShift; job->req.verify = job->verify;
   job->req.colsKnown = job->colsKnown; job->req.colX0 = job->colX0; job->req.colX1 = job->colX1;
   job->req.windowMoved = job->windowMoved;
+  job->req.bandsOnly = job->bandsOnly;
   job->req.scrollX = job->scrollX; job->req.scrollY = job->scrollY; job->req.scrollValid = job->scrollValid;
   job->req.done = &JihadJobDone; job->req.cookie = job;
   // Once done() has run the daemon may forget (delete) the job at any moment (round 108's wake
@@ -1051,6 +1053,7 @@ PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, in
   job->engineShift = (aFlags & 1) != 0; job->verify = (aFlags & 2) != 0;
   job->colsKnown = (aFlags & 4) != 0;   // T-511: the column arguments are given (else garbage from an older daemon)
   job->windowMoved = (aFlags & 8) != 0;   // T-517
+  job->bandsOnly = (aFlags & 16) != 0;    // T-516
   if (job->colsKnown) {
     job->colX0 = std::max(0, std::min(aColX0, aWidth)); job->colX1 = std::max(0, std::min(aColX1, aWidth));
   }

@@ -2310,7 +2310,9 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     const int eLo = haveEngineShift && engineShiftRows > 0 ? aHeight - engineShiftRows : 0;
     const int eHi = haveEngineShift ? (engineShiftRows > 0 ? aHeight : -engineShiftRows) : 0;
     const bool fx = !JihadFixedCols() && haveEngineShift && engineShiftRows != 0 && aReq->fixedHi > aReq->fixedLo;   // round 138: else columns
-    int a[9][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2}, {invLo, invHi}, {eLo, eHi},
+    // T-516: a frame that asks for its bands only (the first frame at a new zoom: the card's view) reads them
+    // alone; the change is still reported (the daemon's records)
+    int a[9][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2}, {aReq->bandsOnly ? 0 : invLo, aReq->bandsOnly ? 0 : invHi}, {eLo, eHi},
                     {fx ? aReq->fixedLo - std::max(engineShiftRows, 0) : 0, fx ? aReq->fixedHi + std::max(-engineShiftRows, 0) : 0} };
     // round 141: the kept rects' uncovered rows (a[5..8]); the rest are columns below
     int nA = 5;
@@ -2366,7 +2368,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   aReq->invX0 = invX0; aReq->invX1 = invX1;
   {
     int cx0 = 0, cx1 = 0;   // T-511: the bands read as one column (JihadReadAsync)
-    if (JihadColumnRead(aReq, invX0, invX1, invLo, invHi, aWidth, &cx0, &cx1)) { aReq->readX0 = cx0; aReq->readX1 = cx1; }
+    if (!aReq->bandsOnly && JihadColumnRead(aReq, invX0, invX1, invLo, invHi, aWidth, &cx0, &cx1)) { aReq->readX0 = cx0; aReq->readX1 = cx1; }
   }
   // the log's values now: once the read hands the frame over, aReq belongs to the daemon
   const int logLo2 = aReq->lo2, logHi2 = aReq->hi2, logFixedLo = aReq->fixedLo, logFixedHi = aReq->fixedHi, logCols = aReq->nCols, logKeep = aReq->nKeep;
