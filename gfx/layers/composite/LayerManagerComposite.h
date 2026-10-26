@@ -146,6 +146,9 @@ public:
   // round 119: the tree diff now, without a render (the stored tree refreshed as a composite
   // would), in frame pixels; the caller has begun a transaction and applied the async transforms
   nsIntRegion JihadDiffOnly();
+  // T-505: the visible regions and effective transforms as a composite would make them, without the diff (the
+  // stored tree untouched); the caller has begun a transaction and applied the async transforms
+  void JihadPrepareOnly();
   void JihadEndTransactionNoComposite() { mInTransaction = false; }
   bool JihadPartial() const { return mJihadPartialOn; }
 

@@ -176,7 +176,19 @@ struct JihadFrameRequest {
                                        //   layer at opacity 0 (stuck or not), no fixed rows, keeps or columns; the
                                        //   parts' rects still reported (the daemon draws them on the CPU). With flag
                                        //   64, the parts alone with the same rule
-  uint32_t partsGen = 0;               // T-505, out: the count of updates to layers under a fixed or sticky one
+  uint32_t partsGen = 0;               // T-505, out: the parts' signature (the poll's thirtieth int; see partsHave)
+  // T-505 (E2, the inspector's design): a frame without its parts reads the parts' picture in its own job when their
+  // signature (their layers' content, attributes, structure and sizes) is not the one the daemon holds a picture of:
+  // the parts alone, cleared transparent, packed on the band surface and read with their alpha into partsDest (each
+  // rect of stuck[] in turn, its rows one after the other, B8G8R8A8 premultiplied), from the same tree state as the
+  // frame. stuck[] is then the parts' list (every fixed and sticky layer), hold[] the card's (fixed and stuck ones)
+  uint8_t* partsDest = nullptr;
+  int partsCap = 0;
+  uint32_t partsHave = 0;
+  int partsBytes = 0;                  // out: the bytes the job's parts pass wrote (0: no pass)
+  int partsFlags = 0;                  // out: 1 a content layer above a part (the frame cannot be dressed), 2 too big
+  int hold[4][4] = {};                 // out: the card's hold set (x0, y0, x1, y1) of a frame without its parts
+  int nHold = 0;
   int fixedLo = 0, fixedHi = 0;        // out: the rows fixed and sticky layers cover (0,0 = none)
   int cols[4][4] = {};                 // round 138: column reads after the bands (x0, x1, y0, y1 on the
   int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift
@@ -242,6 +254,9 @@ public:
   // target aSurfaceH rows tall) into the frame's rows aDestRowLo.. at the same columns
   bool JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int aX0, int aX1, int aSrcRowLo, int aRows, int aDestRowLo,
                         int aDestX = -1);   // round 142: the frame's column when packed elsewhere on the target
+  // T-505: aW columns from aX0 of the target's rows aSrcRowLo.. (aRows, top-down, on a target aSurfaceH rows tall)
+  // into aDest (aDestStride a row), the alpha kept
+  bool JihadReadPacked(uint8_t* aDest, int aDestStride, int aSurfaceH, int aX0, int aW, int aSrcRowLo, int aRows);
   // The asynchronous frame: SelectTarget before the compose picks the free window target,
   // ReadAsync after it fences the compose and hands the target to the read thread, which reads
   // rows [lo, hi) into dest and calls done (on the read thread). When no read thread could be

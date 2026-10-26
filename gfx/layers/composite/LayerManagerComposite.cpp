@@ -417,6 +417,18 @@ LayerManagerComposite::EndTransaction(const TimeStamp& aTimeStamp,
 #endif
 }
 
+void
+LayerManagerComposite::JihadPrepareOnly()
+{
+  if (!mRoot) {
+    return;
+  }
+  nsIntRegion opaque;
+  LayerIntRegion visible;
+  PostProcessLayers(mRoot, opaque, visible, Nothing());
+  mRoot->ComputeEffectiveTransforms(getenv("JIHAD_GPU_NO_WORLD_ENGINE") ? gfx::Matrix4x4() : mJihadWorld);
+}
+
 nsIntRegion
 LayerManagerComposite::JihadDiffOnly()
 {

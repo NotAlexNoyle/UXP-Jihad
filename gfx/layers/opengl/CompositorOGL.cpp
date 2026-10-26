@@ -2760,6 +2760,39 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
 }
 
 bool
+CompositorOGL::JihadReadPacked(uint8_t* aDest, int aDestStride, int aSurfaceH, int aX0, int aW, int aSrcRowLo, int aRows)
+{
+  if (!mGLContext || !aDest || aW <= 0 || aRows <= 0 || aSrcRowLo < 0 || aSrcRowLo + aRows > aSurfaceH || aX0 < 0 ||
+      aDestStride < aW * 4) {
+    return false;
+  }
+  static uint8_t* sBuf = nullptr;
+  static size_t sCap = 0;
+  const size_t bytes = (size_t)aW * 4 * aRows;
+  if (sCap < bytes) {
+    free(sBuf);
+    sBuf = (uint8_t*)malloc(bytes);
+    sCap = sBuf ? bytes : 0;
+    if (!sBuf) return false;
+  }
+  mGLContext->MakeCurrent();
+  mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  {
+    ScopedPackState safePackState(mGLContext);
+    mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
+    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), aW, aRows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, sBuf);
+  }
+  if (mJihadCancel && *mJihadCancel) {
+    return false;
+  }
+  JihadSwizzleAndFlipRows(sBuf, aW * 4, aW, aRows, false);   // the parts keep their alpha
+  for (int r = 0; r < aRows; r++) {
+    memcpy(aDest + (size_t)r * aDestStride, sBuf + (size_t)r * aW * 4, (size_t)aW * 4);
+  }
+  return true;
+}
+
+bool
 CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int aX0, int aX1, int aSrcRowLo, int aRows, int aDestRowLo,
                                 int aDestX)
 {
