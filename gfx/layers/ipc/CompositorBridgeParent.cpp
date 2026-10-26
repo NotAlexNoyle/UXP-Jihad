@@ -1875,6 +1875,19 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   }
   const bool scrollChanged = aReq->scrollValid != mJihadLastScrollValid ||
                              aReq->scrollX != mJihadLastScrollX || aReq->scrollY != mJihadLastScrollY;
+  // T-505: a frame with no base to copy (its slot's own frame, its window moved or its rows shifted in place, or
+  // none) has the diff leave out the card's scroll too, as one copied from the newest frame does: a layer
+  // transaction during a pan was the whole frame changed for it (the content's translation), and a whole read
+  // with the other two slots' frames made stale whole. Only the card's scroll: the shift the diff measured must
+  // be the card's since the last composite (a scroll the page made itself is then the whole frame changed)
+  const bool ownComp = aReq->src == nullptr && aReq->scrollValid && mJihadLastScrollValid &&
+                       aReq->scrollX == mJihadLastScrollX;
+  const float ownExpectRows = (aReq->scrollY - mJihadLastScrollY) * (aScale > 0.0f ? aScale : 1.0f);
+  auto ownShiftOk = [&]() {
+    float sdx = 0.0f, sdy = 0.0f;
+    if (!JihadDiffScrollShift(&sdx, &sdy)) return true;   // nothing was left out
+    return fabsf(-sdy * (aScale > 0.0f ? aScale : 1.0f) - ownExpectRows) < 0.5f;
+  };
   mJihadLastScrollX = aReq->scrollX; mJihadLastScrollY = aReq->scrollY; mJihadLastScrollValid = aReq->scrollValid;
   const bool viewChanged = !mJihadWorldKnown || !(world == mJihadLastWorld) ||
                            mJihadLastSize != gfx::IntSize(aWidth, aHeight);
@@ -1906,9 +1919,10 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     if (!aReq->verify && treeChanged && !viewChanged && !sNoDiffFirst && ogl->JihadBandMaxRows() > 0 && aReq->dest &&
         aReq->stride == aWidth * 4 && !getenv("JIHAD_GPU_READ_THREAD") && mCompositionManager &&
         mLayerManager->GetRoot()) {
-      mLayerManager->JihadCompensateScroll(aReq->src != nullptr && aReq->engineShift);
-      const nsIntRegion dfRegion = JihadDiffNow();
+      mLayerManager->JihadCompensateScroll((aReq->src != nullptr && aReq->engineShift) || ownComp);
+      nsIntRegion dfRegion = JihadDiffNow();
       mLayerManager->JihadCompensateScroll(false);
+      if (ownComp && !ownShiftOk()) dfRegion = nsIntRegion(gfx::IntRect(0, 0, aWidth, aHeight));   // T-505
       diffTaken = true;
       nsIntRegion dfOnFrame;
       dfOnFrame.And(dfRegion, whole);   // round 124: clipped to the frame before the bounds
@@ -2291,7 +2305,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
                               aReq->hi2 > aReq->lo2 ? gfx::IntRect(0, aReq->lo2, aWidth, aReq->hi2 - aReq->lo2) : gfx::IntRect(),
                               colBand);
   ogl->JihadSelectTarget();
-  mLayerManager->JihadCompensateScroll(!diffTaken && aReq->src != nullptr && aReq->engineShift);   // round 115
+  mLayerManager->JihadCompensateScroll(!diffTaken && ((aReq->src != nullptr && aReq->engineShift) || ownComp));   // round 115, T-505
   TimeStamp t0 = TimeStamp::Now();
   sJihadInCompose = true;
   sJihadOverview = aReq->overview ? 1 : (aReq->overviewParts ? 2 : 0);   // T-504
@@ -2324,7 +2338,8 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       }
     }
   }
-  const gfx::IntRect changed = mLayerManager->JihadLastChanged();   // what the tree changed
+  gfx::IntRect changed = mLayerManager->JihadLastChanged();   // what the tree changed
+  if (!diffTaken && ownComp && !ownShiftOk()) changed = gfx::IntRect(0, 0, aWidth, aHeight);   // T-505 (above)
   int invLo = 0, invHi = 0, invX0 = 0, invX1 = 0;
   if (!changed.IsEmpty()) {
     invLo = std::max(0, changed.y);
