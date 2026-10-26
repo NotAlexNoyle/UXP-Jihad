@@ -18,6 +18,7 @@
 #include "gfxContext.h"                 // for gfxContext
 #include "gfxPlatform.h"                // for gfxPlatform
 #include "TreeTraversal.h"              // for ForEachNode
+#include <atomic>                       // Jihad T-505
 #include "LayerTreeInvalidation.h"   // Jihad T-502: JihadDiffScrollShift
 
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
@@ -25,6 +26,11 @@ namespace mozilla { namespace layers { extern double gJihadPhase[12]; } }   // L
 static bool sJihadInCompose = false;   // Jihad T-502 diagnostic: inside JihadComposeAndRead's composite
 static int sJihadOverview = 0;         // Jihad T-504: that composite is an overview window (1: fixed and stuck layers not
                                        // drawn) or the overview's parts (2: only fixed and stuck layers drawn)
+static bool sJihadContentOnly = false; // Jihad T-505: the job is a frame without its parts (flag 128): every fixed and every
+                                       // sticky layer counts as a part, none of the fixed rows' handling applies
+namespace mozilla { namespace layers {
+std::atomic<uint32_t> gJihadPartsGen(0);   // Jihad T-505: updates to layers under a fixed or sticky one
+} }                                        // (CompositableTransactionParent.cpp)
 #include <cmath>                       // Jihad T-502: floor, ceil
 #ifdef MOZ_WIDGET_GTK
 #include "gfxPlatformGtk.h"             // for gfxPlatform
@@ -369,6 +375,14 @@ CompositorVsyncScheduler::PostCompositeTask(TimeStamp aCompositeTimestamp)
     mCurrentCompositeTask = task;
     ScheduleTask(task.forget(), 0);
   }
+}
+
+// Jihad T-505 diagnostic (JIHAD_GPU_REQLOG=1): where the composite requests (the daemon's "tree changed") come from
+void
+JihadReqNote(const char* aSrc)
+{
+  static const bool sOn = getenv("JIHAD_GPU_REQLOG") != nullptr;
+  if (sOn) JIHAD_GPU_LOG("[jihad-gpu] composite request: %s\n", aSrc);
 }
 
 void
@@ -1083,6 +1097,7 @@ CompositorBridgeParent::NotifyShadowTreeTransaction(uint64_t aId, bool aIsFirstP
     mLayerManager->NotifyShadowTreeTransaction();
   }
   if (aScheduleComposite) {
+    JihadReqNote("a shadow tree transaction");
     ScheduleComposition();
   }
 }
@@ -1125,6 +1140,31 @@ CompositorBridgeParent::SetShadowProperties(Layer* aLayer)
         layerComposite->SetShadowOpacitySetByAnimation(false);
       }
     );
+}
+
+// Jihad T-504/T-505: the overview's windows and a frame without its parts (flag 128, sJihadContentOnly) are the
+// scrolled content alone: their fixed and stuck layers at shadow opacity 0 (set again from the layer at every
+// composite); the overview's parts are the other way round, every leaf layer outside one at 0. A part is a fixed
+// layer or a stuck sticky one (the probe); with flag 128 every sticky layer, stuck or not, so no layer turns from
+// content into a part between two frames of a pan. After TransformShadowTree (the stuck set is this composite's)
+void
+CompositorBridgeParent::JihadHideForJob()
+{
+  Layer* root = mLayerManager ? mLayerManager->GetRoot() : nullptr;
+  if (!root || !mCompositionManager) return;
+  auto part = [&](Layer* l) {
+    return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && (sJihadContentOnly || mCompositionManager->JihadIsStuck(l)));
+  };
+  const bool partsAlone = sJihadOverview == 2;
+  ForEachNode<ForwardIterator>(root, [&](Layer* l) {
+    if (!partsAlone) {
+      if (part(l)) l->AsLayerComposite()->SetShadowOpacity(0.0f);
+      return;
+    }
+    if (l->GetFirstChild()) return;
+    for (Layer* c = l; c; c = c->GetParent()) if (part(c)) return;
+    l->AsLayerComposite()->SetShadowOpacity(0.0f);
+  });
 }
 
 void
@@ -1218,21 +1258,10 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   // other scrolls into one picture, where fixed and stuck layers would sit once per window. Their shadow
   // opacity (set again from the layer at every composite) is 0 for this one. The overview's parts are the
   // other way round: every leaf layer outside a fixed or stuck one at 0, so they come back with their alpha
-  if (sJihadOverview && sJihadInCompose && mLayerManager->GetRoot()) {
-    auto fixedOrStuck = [&](Layer* l) {
-      return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager->JihadIsStuck(l));
-    };
-    ForEachNode<ForwardIterator>(mLayerManager->GetRoot(), [&](Layer* l) {
-      if (sJihadOverview == 1) {
-        if (fixedOrStuck(l)) l->AsLayerComposite()->SetShadowOpacity(0.0f);
-        return;
-      }
-      if (l->GetFirstChild()) return;
-      for (Layer* c = l; c; c = c->GetParent()) if (fixedOrStuck(c)) return;
-      l->AsLayerComposite()->SetShadowOpacity(0.0f);
-    });
-  }
+  if ((sJihadOverview || sJihadContentOnly) && sJihadInCompose) JihadHideForJob();
   if (requestNextFrame) {
+    JihadReqNote(sJihadContentOnly ? "the next frame asked (an animation), a job without its parts"
+                                   : (sJihadOverview ? "the next frame asked (an animation), an overview job" : "the next frame asked (an animation)"));
     ScheduleComposition();
 #if defined(XP_WIN) || defined(MOZ_WIDGET_GTK)
     // If we have visible windowed plugins then we need to wait for content (and
@@ -1295,6 +1324,7 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   // we do "composite until" rather than "composite again at".
   if (!mCompositor->GetCompositeUntilTime().IsNull() ||
       mLayerManager->DebugOverlayWantsNextFrame()) {
+    JihadReqNote(sJihadContentOnly ? "composite until, a job without its parts" : "composite until");
     ScheduleComposition();
   }
 
@@ -1365,7 +1395,7 @@ static bool
 JihadFixedCols()
 {
   static const bool sOn = !getenv("JIHAD_GPU_NO_FIXED_COLS") && !getenv("JIHAD_GPU_READ_THREAD");
-  return sOn;
+  return sOn && !sJihadContentOnly;   // T-505: a frame without its parts has no fixed pixels to keep or read
 }
 
 // T-544: the frame's fixed and stuck rects (the last JihadUpdateLastFixed's) out to the daemon
@@ -1507,7 +1537,7 @@ CompositorBridgeParent::JihadFixedRectsNow(int aWidth, int aHeight, gfx::IntRect
   int n = 0, fixedDepth = 0, outerLo = 0, outerHi = 0;
   const gfx::IntRect frame(0, 0, aWidth, aHeight);
   auto isFixed = [&](Layer* l) {
-    return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l));
+    return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && (sJihadContentOnly || (mCompositionManager && mCompositionManager->JihadIsStuck(l))));
   };
   // a layer's visible region on the frame, as the pixels its quads cover; false unless its
   // transform keeps rects axis-aligned
@@ -1574,7 +1604,9 @@ CompositorBridgeParent::JihadFixedRectsNow(int aWidth, int aHeight, gfx::IntRect
             // or its opaque children cover them) is its own pixels whatever scrolls beneath
             gfx::IntRect keep;
             nsIntRegion vis, opaque;
-            if (!sNoKeep && fixedDepth == 0 && l->GetEffectiveOpacity() >= 0.999f && !l->GetMaskLayer() &&
+            // T-505: a job without its parts keeps nothing; each part is its layer's whole rect, the same whether the
+            // job hid the parts (a frame: their opacity 0 here) or showed them alone (the parts' picture)
+            if (!sNoKeep && !sJihadContentOnly && fixedDepth == 0 && l->GetEffectiveOpacity() >= 0.999f && !l->GetMaskLayer() &&
                 l->GetAncestorMaskLayerCount() == 0 && addCovered(l, vis)) {
               bool ok = true;
               if (l->GetContentFlags() & Layer::CONTENT_OPAQUE) {
@@ -1800,6 +1832,12 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       if (b->mLayerManager) b->mLayerManager->JihadHoldBaseline(false);
     }
   } jihadVerifyGuard(this, aReq && aReq->verify);
+  // T-505: a frame without its parts (flag 128), for this job's whole run
+  struct JihadContentOnlyScope {
+    explicit JihadContentOnlyScope(bool aOn) { sJihadContentOnly = aOn; }
+    ~JihadContentOnlyScope() { sJihadContentOnly = false; }
+  } jihadContentOnlyScope(aReq && aReq->contentOnly);
+  if (aReq) aReq->partsGen = gJihadPartsGen;
   MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
   if (!aReq || !mCompositor || !mLayerManager) {
     return false;
@@ -1889,7 +1927,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       {
         int fLo = aHeight, fHi = 0;
         ForEachNode<ForwardIterator>(mLayerManager->GetRoot(), [&](Layer* l) {
-          if (!(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
+          if (sJihadContentOnly || !(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
           const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
           if (vb.IsEmpty()) return;
           const gfx::Rect r = l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height));
@@ -2188,7 +2226,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         static uint32_t sFixN = 0;
         const bool logThis = sFixLog && (sFixN++ % 20) == 0;
         ForEachNode<ForwardIterator>(root, [&](Layer* l) {
-          if (!(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
+          if (sJihadContentOnly || !(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
           const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
           if (vb.IsEmpty()) return;
           const gfx::Rect r = l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height));
@@ -2203,8 +2241,13 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
           if (b > a) { fLo = std::min(fLo, a); fHi = std::max(fHi, b); }
         });
         if (fHi > fLo) { mJihadLastFixedLo = fLo; mJihadLastFixedHi = fHi; } else { mJihadLastFixedLo = mJihadLastFixedHi = 0; }
-        JihadUpdateLastFixed(aWidth, aHeight);   // rounds 138/141
-        JihadStuckOut(aReq, mJihadLastFixedRects, mJihadLastFixedN);
+        if (sJihadContentOnly) {
+          gfx::IntRect pr[4], pk[4];   // T-505: where the parts are, for the daemon to draw them
+          JihadStuckOut(aReq, pr, JihadFixedRectsNow(aWidth, aHeight, pr, pk));
+        } else {
+          JihadUpdateLastFixed(aWidth, aHeight);   // rounds 138/141
+          JihadStuckOut(aReq, mJihadLastFixedRects, mJihadLastFixedN);
+        }
       } else if (diffFirst) {
         mJihadLastFixedLo = dfFixLo; mJihadLastFixedHi = dfFixHi;
       }
@@ -2299,7 +2342,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       static uint32_t sFixNW = 0;
       const bool logThisW = sFixLogW && (sFixNW++ % 20) == 0;
       ForEachNode<ForwardIterator>(root, [&](Layer* l) {
-        if (!(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
+        if (sJihadContentOnly || !(l->GetIsFixedPosition() || (l->GetIsStickyPosition() && mCompositionManager && mCompositionManager->JihadIsStuck(l)))) return;
         const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
         if (vb.IsEmpty()) return;
         if (logThisW) {
@@ -2331,6 +2374,10 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   // layers were then (round 141: this composite's keeps, held still since the last, stay put)
   gfx::IntRect colRects[8], colKeeps[8];
   int colRectsN = 0;
+  if (sJihadContentOnly) {
+    gfx::IntRect pr[4], pk[4];   // T-505: where the parts are, for the daemon to draw them
+    JihadStuckOut(aReq, pr, JihadFixedRectsNow(aWidth, aHeight, pr, pk));
+  }
   if (JihadFixedCols()) {
     gfx::IntRect lastR[4];
     const int lastN = mJihadLastFixedN;
@@ -2440,6 +2487,7 @@ CompositorBridgeParent::JihadDiffNow()
   mCompositionManager->ComputeRotation();
   TimeStamp time = mIsTesting ? mTestTime : mCompositorScheduler->GetLastComposeTime();
   mCompositionManager->TransformShadowTree(time, mVsyncRate);
+  if (sJihadContentOnly) JihadHideForJob();   // T-505: as the frame will be composed
   nsIntRegion changed = mLayerManager->JihadDiffOnly();
   mLayerManager->JihadEndTransactionNoComposite();
   return changed;
@@ -2583,6 +2631,7 @@ CompositorBridgeParent::ShadowLayersUpdated(LayerTransactionParent* aLayerTree,
     SetShadowProperties(root);
   }
   if (aScheduleComposite) {
+    JihadReqNote("layers updated");
     ScheduleComposition();
     if (mPaused) {
       TimeStamp now = TimeStamp::Now();

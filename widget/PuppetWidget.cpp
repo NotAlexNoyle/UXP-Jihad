@@ -851,6 +851,7 @@ struct JihadReadJob {
   bool bandsOnly = false;     // T-516 (flag 16): only the bands asked for are read
   bool overview = false;      // T-504 (flag 32): a window of the daemon's overview
   bool overviewParts = false; // T-504 (flag 64): the overview's fixed and stuck parts alone
+  bool contentOnly = false;   // T-505 (flag 128): the frame without its fixed and sticky parts
   int invLo, invHi;      // the rows the composite changed
   float scrollX = 0.0f, scrollY = 0.0f; bool scrollValid = false;   // the card's scroll for the compositor
   uint32_t token;
@@ -901,6 +902,7 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   job->req.bandsOnly = job->bandsOnly;
   job->req.overview = job->overview;
   job->req.overviewParts = job->overviewParts;
+  job->req.contentOnly = job->contentOnly;
   job->req.scrollX = job->scrollX; job->req.scrollY = job->scrollY; job->req.scrollValid = job->scrollValid;
   job->req.done = &JihadJobDone; job->req.cookie = job;
   // Once done() has run the daemon may forget (delete) the job at any moment (round 108's wake
@@ -1060,6 +1062,7 @@ PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, in
   job->bandsOnly = (aFlags & 16) != 0;    // T-516
   job->overview = (aFlags & 32) != 0;     // T-504
   job->overviewParts = (aFlags & 64) != 0;
+  job->contentOnly = (aFlags & 128) != 0;   // T-505
   if (job->colsKnown) {
     job->colX0 = std::max(0, std::min(aColX0, aWidth)); job->colX1 = std::max(0, std::min(aColX1, aWidth));
   }
@@ -1141,6 +1144,7 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
           for (int k = 0; k < job->req.nStuck && k < 4; k++)
             for (int c = 0; c < 4; c++) aOut[13 + 4 * k + c] = job->req.stuck[k][c];
         }
+        if (aOutLen >= 30) aOut[29] = (int)job->req.partsGen;   // T-505
       }
       if (aScrollOnly) *aScrollOnly = job->req.scrollOnly;
     } else if (!aWait && job->req.composed) {
@@ -1518,7 +1522,7 @@ MOZ_EXPORT int
 jihad_offscreen_overview_ok()
 {
   static const bool sPass = getenv("JIHAD_GPU_PASS") != nullptr;
-  return sPass ? 0 : 1;
+  return sPass ? 0 : 2;   // 2 (T-505): flag 128 too, and the poll's 30th int (the parts' generation)
 }
 MOZ_EXPORT int
 jihad_offscreen_compose_peek(nsIWidget* aWidget, uint32_t aToken)
