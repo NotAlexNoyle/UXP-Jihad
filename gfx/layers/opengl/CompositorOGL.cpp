@@ -857,7 +857,9 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
     // A partial composite (a clip rect given) clears only inside it.
     // JIHAD_GPU_CLEAR_MAGENTA=1 (round 104 diagnostic): magenta, so rows no draw reached show as such
     static const bool sMagenta = getenv("JIHAD_GPU_CLEAR_MAGENTA") != nullptr;
-    if (sMagenta) mGLContext->fClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+    // T-504: an overview window clears transparent: the rows no layer drew read alpha 0
+    if (mJihadClearTransparent) mGLContext->fClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    else if (sMagenta) mGLContext->fClearColor(1.0f, 0.0f, 1.0f, 1.0f);
     else mGLContext->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
     if (aClipRectIn) {
       mGLContext->fEnable(LOCAL_GL_SCISSOR_TEST);
@@ -2426,8 +2428,9 @@ CompositorOGL::JihadReadAsync(JihadFrameRequest* aReq)
   }
   aReq->composed = true;
   if (!JihadEnsureReadThread()) {
-    struct CancelScope { CompositorOGL* c; ~CancelScope() { c->JihadSetCancel(nullptr); } } cancelScope{this};
+    struct CancelScope { CompositorOGL* c; ~CancelScope() { c->JihadSetCancel(nullptr); c->mJihadKeepAlpha = false; } } cancelScope{this};
     JihadSetCancel(&aReq->cancelled);   // T-513 (review)
+    mJihadKeepAlpha = aReq->overview || aReq->overviewParts;   // T-504
     const TimeStamp t0 = TimeStamp::Now();
     if (aReq->shift || aReq->src) mGLContext->fFlush();   // the GPU starts the composite while the rows are copied
     JihadShiftRows(aReq);
@@ -2567,7 +2570,7 @@ CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
         break;
       }
       t2 = TimeStamp::Now();
-      JihadSwizzleAndFlipRows(band, aReq->stride, w, rows, true);
+      JihadSwizzleAndFlipRows(band, aReq->stride, w, rows, !(aReq->overview || aReq->overviewParts));   // T-504: its alpha kept
       static int sTimed = 0;
       if (sTimed++ < 12 || (sTimed % 100) == 0) {
         JIHAD_GPU_LOG("[jihad-gpu] read thread: fence wait %.1f ms (%.1f ms of CPU), glReadPixels %d rows %.1f ms, swizzle+flip %.1f ms\n",
@@ -2713,7 +2716,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     return false;
   }
   TimeStamp t1 = TimeStamp::Now();
-  JihadSwizzleAndFlipRows(band, aStride, w, rows, true);
+  JihadSwizzleAndFlipRows(band, aStride, w, rows, !mJihadKeepAlpha);   // T-504: an overview's read keeps its alpha
   {
     static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
     if (sDrawStats && lo == 0 && hi == h && h > 700) {
