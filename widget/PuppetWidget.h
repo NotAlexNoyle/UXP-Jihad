@@ -296,7 +296,7 @@ public:
   // aOut (10 ints, may be null): the rows the tree changed, the rows fixed layers cover, the two
   // bands read, the frame's position and its valid flag; 12 for a job posted with flag 4 (T-511):
   // the columns the composite changed; aScrollOnly: the composite's only change was the card's scroll
-  int JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly = nullptr);
+  int JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aScrollOnly = nullptr, int aOutLen = 12);
   // T-515: the frame's two halves on their own. PaintLayers (the main thread) flushes and paints the
   // layers, as Start does first; Post (any thread: the express lane while the main thread runs the
   // page's script) composes the layer tree as it stands and reads it, at the view given (aView:

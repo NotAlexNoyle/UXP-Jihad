@@ -172,6 +172,8 @@ struct JihadFrameRequest {
   int nCols = 0;                       //   frame): the fixed and stuck layers' rects, widened by the shift
   int keep[4][4] = {};                 // round 141: rects (x0, x1, y0, y1) the shift leaves where they are:
   int nKeep = 0;                       //   opaque stuck layers that held still, copied unshifted from the base
+  int stuck[4][4] = {};                // T-544, out: the fixed and stuck layers' rects (x0, y0, x1, y1) on the
+  int nStuck = 0;                      //   frame as composed: the card holds them still while it moves the frame
   bool scrollOnly = false;             // out: the composite's only change was the card's scroll
   int target = 0;                      // which window target holds the frame (the compositor fills it)
   int invLo = 0, invHi = 0;            // the rows the composite changed (the compositor fills them)
