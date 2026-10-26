@@ -50,6 +50,7 @@ namespace mozilla { namespace layers { extern std::atomic<uint32_t> gJihadLateWr
 // jihad_offscreen_composite_popups at the bottom of this file):
 #include "nsXULPopupManager.h"
 #include "nsLayoutUtils.h"
+#include "nsRefreshDriver.h"       // T-527: a paint already scheduled (JihadPaintLayers)
 #include "nsRenderingContext.h"
 #include "nsMenuPopupFrame.h"
 #include "nsMenuFrame.h"
@@ -967,6 +968,25 @@ PuppetWidget::JihadPaintLayers(nsIDocShell* aDocShell)
   if (!mozilla::layers::CompositorThreadHolder::Loop()) {
     return false;
   }
+  // T-527: nothing to paint — no invalidation waiting (the widget's region, its paint task), no paint
+  // the refresh driver has scheduled, the layers painted before: the layer tree is current, and a paint
+  // would only build the whole display list again (desktop Wikipedia: 16-90 ms of the main thread; the
+  // daemon asks for a layer paint every 40 ms during a pan and right after the refresh driver's own
+  // paint of a zoom). JIHAD_GPU_PAINT_ALWAYS=1 paints every time, as before.
+  {
+    static const bool sAlways = getenv("JIHAD_GPU_PAINT_ALWAYS") != nullptr;
+    nsPresContext* pc = presShell->GetPresContext();
+    nsRefreshDriver* rd = pc ? pc->RefreshDriver() : nullptr;
+    if (!sAlways && mJihadLayersPainted && mDirtyRegion.IsEmpty() && !mPaintTask.IsPending() && rd &&
+        !rd->ViewManagerFlushIsPending()) {
+      static uint32_t sSkipped = 0;
+      if ((++sSkipped % 100) == 1) {
+        JIHAD_GPU_LOG("[jihad-gpu] layer paint skipped: nothing pending (%u so far)\n", sSkipped);
+      }
+      return true;
+    }
+  }
+  mJihadLayersPainted = true;
   mozilla::TimeStamp t0 = mozilla::TimeStamp::Now();
   nsRegion dirty(root->GetDimensions());
   presShell->Paint(root, dirty, nsIPresShell::PAINT_LAYERS);

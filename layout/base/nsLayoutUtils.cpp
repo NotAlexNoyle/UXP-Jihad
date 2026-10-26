@@ -9484,7 +9484,14 @@ jihad_layout_set_displayport2(nsIDocShell* aDocShell, float aVisW, float aVisH, 
   const float baseH = std::max(aVisH, aShiftY > 0.0f ? 0.0f : portH);
   const nsRect base(nsPresContext::CSSPixelsToAppUnits(aShiftX * res), nsPresContext::CSSPixelsToAppUnits(aShiftY * res),
                     nsPresContext::CSSPixelsToAppUnits(baseW * res), nsPresContext::CSSPixelsToAppUnits(baseH * res));
+  // T-527: a new base is a new displayport even when the margins are the same (SetDisplayPortMargins
+  // compares the displayport computed with the new base on both sides and schedules no paint)
+  const nsRect* oldBase = static_cast<nsRect*>(content->GetProperty(nsGkAtoms::DisplayPortBase));
+  const bool baseMoved = !oldBase || !oldBase->IsEqualEdges(base);
   nsLayoutUtils::SetDisplayPortBase(content, base);
+  if (baseMoved) {
+    rsf->SchedulePaint();
+  }
   const ScreenMargin margins(aTop * res, aSide * res, aBottom * res, aSide * res);
   static int sLogged = 0;
   if (sLogged++ < 12) {
