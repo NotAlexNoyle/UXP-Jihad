@@ -258,6 +258,7 @@ public:
   int mJihadBandW = 0;
   GLuint mJihadBandTallRB = 0, mJihadBandTallFBO = 0;   // T-527: the tall band surface's target
   int mJihadBandTallW = 0;
+  int mJihadBandFailW[2] = { 0, 0 };   // T-527: the width a band surface (0) or the tall one (1) failed at: not tried again
   // the band surface's rows: JIHAD_GPU_BAND_ROWS (64..942, default 256; round 137)
   static int JihadBandRows() {
     static const int sRows = [] {
