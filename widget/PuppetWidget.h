@@ -293,7 +293,8 @@ public:
                              int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo = 0, int aRow2Hi = 0, int aShift = 0,
                              const void* aSrc = nullptr, int aSrcY = 0, int aFlags = 0,   // aFlags: 1 engine shift, 2 verify, 4 columns
                              int aColX0 = 0, int aColX1 = 0,   // T-511: the bands' stale columns (flag 4)
-                             void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0);   // T-505 (E2)
+                             void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0,   // T-505 (E2)
+                             const uint32_t* aPartsHaveList = nullptr, int aNPartsHave = -1);   // T-505 (per part)
   // aOut (10 ints, may be null): the rows the tree changed, the rows fixed layers cover, the two
   // bands read, the frame's position and its valid flag; 12 for a job posted with flag 4 (T-511):
   // the columns the composite changed; aScrollOnly: the composite's only change was the card's scroll
@@ -307,7 +308,8 @@ public:
   uint32_t JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi,
                             int aRow2Lo, int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
                             const float* aView, bool aScrollValid, int aColX0 = 0, int aColX1 = 0,
-                            void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0);   // T-505 (E2)
+                            void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0,   // T-505 (E2)
+                            const uint32_t* aPartsHaveList = nullptr, int aNPartsHave = -1);   // T-505 (per part)
   void JihadComposeForget(uint32_t aToken);
   // T-515: a job's state without taking its result: 1 done, 2 composed (being read), 0 pending, -1 unknown
   int JihadComposePeek(uint32_t aToken);
@@ -471,7 +473,8 @@ private:
   uint32_t JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo,
                         int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
                         const float* aView = nullptr, bool aScrollValid = false, int aColX0 = 0, int aColX1 = 0,
-                        void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0);
+                        void* aPartsDest = nullptr, int aPartsCap = 0, uint32_t aPartsHave = 0,
+                        const uint32_t* aPartsHaveList = nullptr, int aNPartsHave = -1);   // T-505 (per part)
   uint32_t mJihadNextToken = 1;
   float mJihadScrollX = 0.0f, mJihadScrollY = 0.0f;   // T-502: the card's scroll for the compositor
   bool mJihadScrollValid = false;

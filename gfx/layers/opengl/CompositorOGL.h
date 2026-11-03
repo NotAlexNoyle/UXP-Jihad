@@ -185,6 +185,13 @@ struct JihadFrameRequest {
   uint8_t* partsDest = nullptr;
   int partsCap = 0;
   uint32_t partsHave = 0;
+  // T-505 (per part, 2026-11-03): each rect of stuck[] has a signature of its own (partsSig[k]: the parts it holds,
+  // their paints and its size). A job posted with the list of signatures the daemon holds pictures of (partsHaveList,
+  // nPartsHave >= 0: compose_post3/start3) reads only the rects whose signature is not in it, packed in rect order;
+  // partsRead says which (bit k). One posted with the one signature (post2/start2, nPartsHave -1) reads every rect
+  // when the whole differs, as before
+  uint32_t partsHaveList[16] = {}; int nPartsHave = -1;
+  uint32_t partsSig[4] = {}; int partsRead = 0;   // out
   int partsBytes = 0;                  // out: the bytes the job's parts pass wrote (0: no pass)
   int partsFlags = 0;                  // out: 1 a content layer above a part (the frame cannot be dressed), 2 too big
   int hold[4][4] = {};                 // out: the card's hold set (x0, y0, x1, y1) of a frame without its parts

@@ -31,6 +31,7 @@ namespace mozilla {
 namespace layers {
 
 extern std::atomic<uint32_t> gJihadPartsGen;   // Jihad T-505, CompositorBridgeParent.cpp
+void JihadNotePartPaint(Layer* aLayer);        // Jihad T-505 (per part): that layer painted (its paint stamp)
 void JihadReqNote(const char* aSrc);           // Jihad T-505 diagnostic, CompositorBridgeParent.cpp
 
 class ClientTiledLayerBuffer;
@@ -75,8 +76,13 @@ CompositableParentManager::ReceiveCompositableUpdate(const CompositableOperation
   }
   // Jihad T-505: an update to a layer under a fixed or sticky one moves the parts' generation (the daemon composes
   // the page's fixed and sticky parts alone again when it moves: they changed)
-  for (Layer* l = compositable->GetLayer(); l; l = l->GetParent()) {
-    if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) { ++gJihadPartsGen; break; }
+  {
+    // (per part, review F2) every layer's paint is stamped, part or not: a layer that becomes a part later carries it
+    Layer* painted = compositable->GetLayer();
+    if (painted) JihadNotePartPaint(painted);
+    for (Layer* l = painted; l; l = l->GetParent()) {
+      if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) { ++gJihadPartsGen; break; }
+    }
   }
 
   switch (aEdit.detail().type()) {

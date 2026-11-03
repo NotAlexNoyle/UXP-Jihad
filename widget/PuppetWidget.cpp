@@ -853,6 +853,7 @@ struct JihadReadJob {
   bool overviewParts = false; // T-504 (flag 64): the overview's fixed and stuck parts alone
   bool contentOnly = false;   // T-505 (flag 128): the frame without its fixed and sticky parts
   uint8_t* partsDest = nullptr; int partsCap = 0; uint32_t partsHave = 0;   // T-505 (E2): its parts pass
+  uint32_t partsHaveList[16] = {}; int nPartsHave = -1;   // T-505 (per part): the signatures the daemon holds (post3/start3)
   int invLo, invHi;      // the rows the composite changed
   float scrollX = 0.0f, scrollY = 0.0f; bool scrollValid = false;   // the card's scroll for the compositor
   uint32_t token;
@@ -905,6 +906,8 @@ void JihadReadOnCompositorThread(JihadReadJob* job)
   job->req.overviewParts = job->overviewParts;
   job->req.contentOnly = job->contentOnly;
   job->req.partsDest = job->partsDest; job->req.partsCap = job->partsCap; job->req.partsHave = job->partsHave;
+  job->req.nPartsHave = job->nPartsHave;
+  for (int i = 0; i < 16; i++) job->req.partsHaveList[i] = job->partsHaveList[i];
   job->req.scrollX = job->scrollX; job->req.scrollY = job->scrollY; job->req.scrollValid = job->scrollValid;
   job->req.done = &JihadJobDone; job->req.cookie = job;
   // Once done() has run the daemon may forget (delete) the job at any moment (round 108's wake
@@ -941,7 +944,8 @@ uint32_t
 PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride,
                                 int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo, int aRow2Hi, int aShift,
                                 const void* aSrc, int aSrcY, int aFlags, int aColX0, int aColX1,
-                                void* aPartsDest, int aPartsCap, uint32_t aPartsHave)
+                                void* aPartsDest, int aPartsCap, uint32_t aPartsHave,
+                                const uint32_t* aPartsHaveList, int aNPartsHave)
 {
   if (!aDocShell || !aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
     return 0;
@@ -950,7 +954,7 @@ PuppetWidget::JihadComposeStart(nsIDocShell* aDocShell, void* aDest, int aStride
     return 0;
   }
   return JihadPostJob(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags,
-                      nullptr, false, aColX0, aColX1, aPartsDest, aPartsCap, aPartsHave);
+                      nullptr, false, aColX0, aColX1, aPartsDest, aPartsCap, aPartsHave, aPartsHaveList, aNPartsHave);
 }
 
 bool
@@ -1042,7 +1046,8 @@ uint32_t
 PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo,
                            int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
                            const float* aView, bool aScrollValid, int aColX0, int aColX1,
-                           void* aPartsDest, int aPartsCap, uint32_t aPartsHave)
+                           void* aPartsDest, int aPartsCap, uint32_t aPartsHave,
+                           const uint32_t* aPartsHaveList, int aNPartsHave)
 {
   mozilla::layers::CompositorBridgeParent* bridge = JihadBridge();
   MessageLoop* loop = mozilla::layers::CompositorThreadHolder::Loop();
@@ -1069,6 +1074,10 @@ PuppetWidget::JihadPostJob(void* aDest, int aStride, int aWidth, int aHeight, in
   job->contentOnly = (aFlags & 128) != 0;   // T-505
   if (job->contentOnly && aPartsDest && aPartsCap > 0) {   // T-505 (E2)
     job->partsDest = static_cast<uint8_t*>(aPartsDest); job->partsCap = aPartsCap; job->partsHave = aPartsHave;
+    if (aPartsHaveList && aNPartsHave >= 0) {   // (per part) the signatures the daemon holds pictures of
+      job->nPartsHave = std::min(aNPartsHave, 16);
+      for (int i = 0; i < job->nPartsHave; i++) job->partsHaveList[i] = aPartsHaveList[i];
+    }
   }
   if (job->colsKnown) {
     job->colX0 = std::max(0, std::min(aColX0, aWidth)); job->colX1 = std::max(0, std::min(aColX1, aWidth));
@@ -1083,13 +1092,14 @@ uint32_t
 PuppetWidget::JihadComposePost(void* aDest, int aStride, int aWidth, int aHeight, int aRowLo, int aRowHi,
                                int aRow2Lo, int aRow2Hi, int aShift, const void* aSrc, int aSrcY, int aFlags,
                                const float* aView, bool aScrollValid, int aColX0, int aColX1,
-                               void* aPartsDest, int aPartsCap, uint32_t aPartsHave)
+                               void* aPartsDest, int aPartsCap, uint32_t aPartsHave,
+                               const uint32_t* aPartsHaveList, int aNPartsHave)
 {
   if (!aDest || aWidth <= 0 || aHeight <= 0 || aStride < aWidth * 4) {
     return 0;
   }
   return JihadPostJob(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags,
-                      aView, aScrollValid, aColX0, aColX1, aPartsDest, aPartsCap, aPartsHave);
+                      aView, aScrollValid, aColX0, aColX1, aPartsDest, aPartsCap, aPartsHave, aPartsHaveList, aNPartsHave);
 }
 
 int
@@ -1157,6 +1167,10 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
           aOut[30] = job->req.partsBytes; aOut[31] = job->req.partsFlags; aOut[32] = job->req.nHold;
           for (int k = 0; k < 4; k++)
             for (int c = 0; c < 4; c++) aOut[33 + 4 * k + c] = k < job->req.nHold ? job->req.hold[k][c] : 0;
+        }
+        if (aOutLen >= 54) {   // T-505 (per part): each rect's signature, and the rects the pass read (bit k)
+          for (int k = 0; k < 4; k++) aOut[49 + k] = (int)job->req.partsSig[k];
+          aOut[53] = job->req.partsRead;
         }
       }
       if (aScrollOnly) *aScrollOnly = job->req.scrollOnly;
@@ -1535,8 +1549,9 @@ MOZ_EXPORT int
 jihad_offscreen_overview_ok()
 {
   static const bool sPass = getenv("JIHAD_GPU_PASS") != nullptr;
-  return sPass ? 0 : 3;   // 2 (T-505): flag 128 too, and the poll's 30th int; 3 (E2): compose_post2/start2's parts
-                          // pass and the poll's 49 ints
+  return sPass ? 0 : 4;   // 2 (T-505): flag 128 too, and the poll's 30th int; 3 (E2): compose_post2/start2's parts
+                          // pass and the poll's 49 ints; 4 (per part): post3/start3 with the signatures the daemon
+                          // holds, the poll's 54 ints (each rect's signature, the rects read)
 }
 MOZ_EXPORT int
 jihad_offscreen_compose_peek(nsIWidget* aWidget, uint32_t aToken)
@@ -1607,6 +1622,38 @@ jihad_offscreen_compose_start2(nsIWidget* aWidget, nsIDocShell* aDocShell, void*
   return static_cast<PuppetWidget*>(aWidget)->JihadComposeStart(aDocShell, aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aEngineShift,
                                                                 (aEngineShift & 4) ? aColX0 : 0, (aEngineShift & 4) ? aColX1 : 0,
                                                                 aPartsDest, aPartsCap, aPartsHave);
+}
+// T-505 (per part): post and start with the list of signatures the daemon holds part pictures of (aNHave of them, 16 at
+// most; 0 is a list: every part read): the pass reads only the rects whose signature is not in it
+MOZ_EXPORT uint32_t
+jihad_offscreen_compose_post3(nsIWidget* aWidget, void* aDest, int aStride, int aWidth, int aHeight,
+                              int aRowLo, int aRowHi, int aRow2Lo, int aRow2Hi, int aShift,
+                              const void* aSrc, int aSrcY, int aFlags, int aUseView, double aScale,
+                              double aOffX, double aOffY, double aScrollX, double aScrollY, int aScrollValid,
+                              int aColX0, int aColX1, void* aPartsDest, int aPartsCap, const uint32_t* aHave, int aNHave)
+{
+  if (!aWidget) {
+    return 0;
+  }
+  const float view[5] = { (float)aScale, (float)aOffX, (float)aOffY, (float)aScrollX, (float)aScrollY };
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposePost(aDest, aStride, aWidth, aHeight, aRowLo, aRowHi,
+                                                               aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aFlags,
+                                                               aUseView ? view : nullptr, aScrollValid != 0,
+                                                               (aFlags & 4) ? aColX0 : 0, (aFlags & 4) ? aColX1 : 0,
+                                                               aPartsDest, aPartsCap, 0, aHave, aHave ? std::max(aNHave, 0) : -1);
+}
+MOZ_EXPORT uint32_t
+jihad_offscreen_compose_start3(nsIWidget* aWidget, nsIDocShell* aDocShell, void* aDest, int aStride,
+                               int aWidth, int aHeight, int aRowLo, int aRowHi, int aRow2Lo, int aRow2Hi, int aShift,
+                               const void* aSrc, int aSrcY, int aEngineShift, int aColX0, int aColX1,
+                               void* aPartsDest, int aPartsCap, const uint32_t* aHave, int aNHave)
+{
+  if (!aWidget) {
+    return 0;
+  }
+  return static_cast<PuppetWidget*>(aWidget)->JihadComposeStart(aDocShell, aDest, aStride, aWidth, aHeight, aRowLo, aRowHi, aRow2Lo, aRow2Hi, aShift, aSrc, aSrcY, aEngineShift,
+                                                                (aEngineShift & 4) ? aColX0 : 0, (aEngineShift & 4) ? aColX1 : 0,
+                                                                aPartsDest, aPartsCap, 0, aHave, aHave ? std::max(aNHave, 0) : -1);
 }
 MOZ_EXPORT int
 jihad_offscreen_compose_poll(nsIWidget* aWidget, uint32_t aToken, int* aOut, int* aScrollOnly)

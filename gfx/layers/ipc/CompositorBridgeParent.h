@@ -546,9 +546,10 @@ public:
   gfx::IntRect mJihadLastKeep[4], mJihadPrevKeep[4];
   int mJihadPrevKeepN = 0;
   void JihadHideForJob();   // Jihad T-504/T-505: the overview's and a content-only frame's layers hidden
-  // Jihad T-505 (E2): the parts' signature (their layers, content, attributes and sizes); *aCovered when a content
-  // layer is drawn above a part (the daemon cannot draw that part over the frame)
-  uint32_t JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight);
+  // Jihad T-505 (E2): the parts' signature (their layers, content, attributes and sizes), and each rect's own
+  // (aRectSig, aN of them: per part); *aCovered when a content layer is drawn above a part (the daemon cannot draw
+  // that part over the frame)
+  uint32_t JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight, uint32_t* aRectSig);
   int JihadFixedRectsNow(int aWidth, int aHeight, gfx::IntRect* aOut, gfx::IntRect* aKeep);
   void JihadUpdateLastFixed(int aWidth, int aHeight);
   bool mJihadSeqKnown = false;

@@ -8,6 +8,7 @@
 #include <unistd.h>                     // Jihad T-509: sleep() for JIHAD_GPU_TEST_STALL
 #include <stdint.h>                     // for uint64_t
 #include <map>                          // for _Rb_tree_iterator, etc
+#include <mutex>                        // Jihad T-505 (per part): sJihadPartPaintLock
 #include <utility>                      // for pair
 #include "LayerTransactionParent.h"     // for LayerTransactionParent
 #include "RenderTrace.h"                // for RenderTraceLayers
@@ -30,6 +31,20 @@ static bool sJihadContentOnly = false; // Jihad T-505: the job is a frame withou
                                        // sticky layer counts as a part, none of the fixed rows' handling applies
 namespace mozilla { namespace layers {
 std::atomic<uint32_t> gJihadPartsGen(0);   // Jihad T-505: updates to layers under a fixed or sticky one
+// Jihad T-505 (per part): every layer's last paint, as the stamp of ONE counter that only goes up (review F2: a count
+// per part that started again after a clear could return to a value a held picture was signed with; a layer painted
+// while it was no part keeps its stamp for when it becomes one). CompositableTransactionParent notes each update; an
+// ImageBridge update may come on its own thread. Past 4096 layers the map is cleared: the stamps lost make every
+// part's signature differ once (a pass), and the next paints take new stamps, so a lost stamp never matches
+static std::mutex sJihadPaintStampLock;
+static uint32_t sJihadPaintStamp = 0;
+static std::map<Layer*, uint32_t> sJihadLayerPaint;
+void JihadNotePartPaint(Layer* aLayer)
+{
+  std::lock_guard<std::mutex> g(sJihadPaintStampLock);
+  if (sJihadLayerPaint.size() > 4096) sJihadLayerPaint.clear();
+  sJihadLayerPaint[aLayer] = ++sJihadPaintStamp;
+}
 } }                                        // (CompositableTransactionParent.cpp)
 #include <cmath>                       // Jihad T-502: floor, ceil
 #ifdef MOZ_WIDGET_GTK
@@ -1167,87 +1182,152 @@ CompositorBridgeParent::JihadHideForJob()
   });
 }
 
-// T-505 (E2): FNV-1a over what makes the parts' pixels: each layer in a fixed or sticky subtree (its identity and
-// type, opacity, content flags, mask, visible region; inside a part its transform and clip too, so an inner scroll or a
-// move inside the part counts; a colour layer's colour; an animation: every composite), the paints of layers under a
-// part (gJihadPartsGen) and the parts' sizes on the frame (a part crossing the frame's edge is new pixels). A content
-// leaf drawn after a part (above it, in paint order) whose pixels meet it is a cover: a popup over a fixed bar, a page
-// over a fixed background
+// T-505 (E2, per part): FNV-1a per outermost fixed or sticky layer over what makes its pixels: each layer of its subtree
+// (identity and type, opacity, content flags, mask, visible region; inside the part its transform and clip too, so an
+// inner scroll or a move inside the part counts; a colour layer's colour; an animation: every composite), the paints
+// under it (sJihadPartPaint) and, cut by the frame's top or bottom edge, the slice shown. Each rect of aRects takes the
+// signatures of the parts whose rects meet it and its own size (aRectSig; a rect no part's rect meets, a nested
+// part's own, takes every part's). The whole is the rects' signatures, their count and the global paint count
+// (gJihadPartsGen: a daemon with the one signature reads every part when any paint happened under one, as before).
+// A content leaf drawn after a part (above it, in paint order) whose pixels meet it is a cover: a popup over a fixed
+// bar, a page over a fixed background
 uint32_t
-CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight)
+CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight, uint32_t* aRectSig)
 {
-  uint32_t h = 2166136261u;
+  const uint32_t kBasis = 2166136261u;
+  uint32_t h = kBasis;   // the part being walked
   auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619u; };
   auto mixf = [&](float f) { uint32_t u; memcpy(&u, &f, sizeof u); mix(u); };
   auto mixr = [&](const gfx::IntRect& r) { mix(r.x); mix(r.y); mix(r.width); mix(r.height); };
-  mix((uint32_t)gJihadPartsGen);
-  for (int i = 0; i < aN; i++) { mix(aRects[i].width); mix(aRects[i].height); }
+  struct TopPart { uint32_t sig; gfx::IntRect ir; gfx::IntRect tb; };   // tb: its bounds on the frame, not inflated
+  TopPart tops[32];
+  int nTop = 0;
+  gfx::IntRect topIr, topTb;
+  std::map<Layer*, uint32_t> stamps;   // the layers' paint stamps, taken once under the lock
+  {
+    std::lock_guard<std::mutex> g(sJihadPaintStampLock);
+    stamps = sJihadLayerPaint;
+  }
+  auto stamp = [&](Layer* l) { auto it = stamps.find(l); return it != stamps.end() ? it->second : 0u; };
+  const gfx::IntRect frame(0, 0, aWidth, aHeight);
   *aCovered = false;
   Layer* root = mLayerManager ? mLayerManager->GetRoot() : nullptr;
-  if (!root) return h;
-  static uint32_t sAnimTick = 0;
-  static uint32_t sCoverLog = 0;
-  int depth = 0;
-  nsIntRegion partsSoFar;
-  auto onFrame = [&](Layer* x, nsIntRegion& aOut) {
-    gfx::Matrix m;
-    if (!x->GetEffectiveTransform().Is2D(&m) || !m.PreservesAxisAlignedRectangles()) {
-      const gfx::IntRect vb = x->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
-      aOut.OrWith(gfx::RoundedOut(x->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height))));
-      return;
-    }
-    const nsIntRegion visible = x->GetLocalVisibleRegion().ToUnknownRegion();
-    for (auto it = visible.RectIter(); !it.Done(); it.Next()) {
-      const gfx::IntRect& q = it.Get();
-      aOut.OrWith(gfx::RoundedOut(x->GetEffectiveTransform().TransformBounds(gfx::Rect(q.x, q.y, q.width, q.height))));
-    }
-  };
-  ForEachNode<ForwardIterator>(root,
-    [&](Layer* l) {
-      const bool part = l->GetIsFixedPosition() || l->GetIsStickyPosition();
-      if (part || depth > 0) {
-        mix((uint32_t)(uintptr_t)l); mix((uint32_t)l->GetType()); mixf(l->GetOpacity());
-        mix(l->GetContentFlags());
-        if (Layer* mk = l->GetMaskLayer()) { mix((uint32_t)(uintptr_t)mk); mixr(mk->GetVisibleRegion().GetBounds().ToUnknownRect()); }   // (review F5)
-        mixr(l->GetVisibleRegion().GetBounds().ToUnknownRect());
-        if (l->GetClipRect()) mixr(l->GetClipRect()->ToUnknownRect());   // (review F5) a top-level part's clip too
-        if (depth > 0) {
-          const gfx::Matrix4x4 m = l->GetBaseTransform();
-          for (int k = 0; k < 16; k++) mixf(m.components[k]);
-        }
-        if (l->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) *aCovered = true;   // (review F5) not drawable by "over" on the CPU
-        if (part && depth == 0) {
-          // (review F5) a part cut by the frame's top or bottom edge: its rect keeps its size while the slice shown
-          // moves with it (a sticky element not yet stuck, taller than the frame or half off it): where it starts
-          const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
-          const gfx::IntRect tb = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
-          if (tb.y < 0 || tb.YMost() > aHeight) mix((uint32_t)tb.y);
-        }
-        if (l->GetType() == Layer::TYPE_COLOR) {
-          const gfx::Color c = static_cast<ColorLayer*>(l)->GetColor();
-          mixf(c.r); mixf(c.g); mixf(c.b); mixf(c.a);
-        }
-        if (!l->GetAnimations().IsEmpty()) mix(++sAnimTick);
-        if (part && depth == 0) onFrame(l, partsSoFar);
-      } else if (!l->GetFirstChild() && !partsSoFar.IsEmpty() && l->GetEffectiveOpacity() > 0.0f) {
-        const Layer::LayerType t = l->GetType();
-        if (t == Layer::TYPE_PAINTED || t == Layer::TYPE_COLOR || t == Layer::TYPE_IMAGE || t == Layer::TYPE_CANVAS) {
-          nsIntRegion mine;
-          onFrame(l, mine);
-          mine.AndWith(partsSoFar);
-          if (!mine.IsEmpty()) {
-            if (!*aCovered && sCoverLog++ < 20) {
-              const gfx::IntRect b = mine.GetBounds();
-              JIHAD_GPU_LOG("[jihad-gpu] parts: layer %p (type %d) drawn above a part at %d,%d %dx%d\n", l, (int)t, b.x, b.y, b.width, b.height);
+  if (root) {
+    static uint32_t sAnimTick = 0;
+    static uint32_t sCoverLog = 0;
+    int depth = 0;
+    nsIntRegion partsSoFar;
+    auto onFrame = [&](Layer* x, nsIntRegion& aOut) {
+      gfx::Matrix m;
+      if (!x->GetEffectiveTransform().Is2D(&m) || !m.PreservesAxisAlignedRectangles()) {
+        const gfx::IntRect vb = x->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+        aOut.OrWith(gfx::RoundedOut(x->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height))));
+        return;
+      }
+      const nsIntRegion visible = x->GetLocalVisibleRegion().ToUnknownRegion();
+      for (auto it = visible.RectIter(); !it.Done(); it.Next()) {
+        const gfx::IntRect& q = it.Get();
+        aOut.OrWith(gfx::RoundedOut(x->GetEffectiveTransform().TransformBounds(gfx::Rect(q.x, q.y, q.width, q.height))));
+      }
+    };
+    ForEachNode<ForwardIterator>(root,
+      [&](Layer* l) {
+        const bool part = l->GetIsFixedPosition() || l->GetIsStickyPosition();
+        if (part || depth > 0) {
+          if (part && depth == 0) {
+            // a new part: its own hash; its rect on the frame as JihadFixedRectsNow makes it, and its bounds; (review F3)
+            // its scale and the sub-pixel phase of its position (a quarter pixel): a picture made at another zoom
+            // or phase is other pixels
+            h = kBasis;
+            topIr = topTb = gfx::IntRect();
+            const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+            if (!vb.IsEmpty()) {
+              topTb = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+              topIr = topTb;
+              topIr.Inflate(1);
+              topIr = topIr.Intersect(frame);
             }
-            *aCovered = true;
+            gfx::Matrix m2;
+            if (l->GetEffectiveTransform().Is2D(&m2)) {
+              mixf(m2._11); mixf(m2._22); mixf(m2._12); mixf(m2._21);
+              mix((uint32_t)lroundf((m2._31 - floorf(m2._31)) * 4.0f)); mix((uint32_t)lroundf((m2._32 - floorf(m2._32)) * 4.0f));
+            } else {
+              mix(0x3d3d3d3du);
+            }
+          }
+          mix((uint32_t)(uintptr_t)l); mix((uint32_t)l->GetType()); mixf(l->GetOpacity());
+          mix(stamp(l));   // its last paint (every layer of the subtree: review F2)
+          mix(l->GetContentFlags());
+          if (Layer* mk = l->GetMaskLayer()) { mix((uint32_t)(uintptr_t)mk); mixr(mk->GetVisibleRegion().GetBounds().ToUnknownRect()); }   // (review F5)
+          mixr(l->GetVisibleRegion().GetBounds().ToUnknownRect());
+          if (l->GetClipRect()) mixr(l->GetClipRect()->ToUnknownRect());   // (review F5) a top-level part's clip too
+          if (depth > 0) {
+            const gfx::Matrix4x4 m = l->GetBaseTransform();
+            for (int k = 0; k < 16; k++) mixf(m.components[k]);
+          }
+          if (l->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) *aCovered = true;   // (review F5) not drawable by "over" on the CPU
+          if (part && depth == 0) {
+            // (review F5) a part cut by the frame's top or bottom edge: its rect keeps its size while the slice shown
+            // moves with it (a sticky element not yet stuck, taller than the frame or half off it): where it starts
+            const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+            const gfx::IntRect tb = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+            if (tb.y < 0 || tb.YMost() > aHeight) mix((uint32_t)tb.y);
+          }
+          if (l->GetType() == Layer::TYPE_COLOR) {
+            const gfx::Color c = static_cast<ColorLayer*>(l)->GetColor();
+            mixf(c.r); mixf(c.g); mixf(c.b); mixf(c.a);
+          }
+          if (!l->GetAnimations().IsEmpty()) mix(++sAnimTick);
+          if (part && depth == 0) onFrame(l, partsSoFar);
+        } else if (!l->GetFirstChild() && !partsSoFar.IsEmpty() && l->GetEffectiveOpacity() > 0.0f) {
+          const Layer::LayerType t = l->GetType();
+          if (t == Layer::TYPE_PAINTED || t == Layer::TYPE_COLOR || t == Layer::TYPE_IMAGE || t == Layer::TYPE_CANVAS) {
+            nsIntRegion mine;
+            onFrame(l, mine);
+            mine.AndWith(partsSoFar);
+            if (!mine.IsEmpty()) {
+              if (!*aCovered && sCoverLog++ < 20) {
+                const gfx::IntRect b = mine.GetBounds();
+                JIHAD_GPU_LOG("[jihad-gpu] parts: layer %p (type %d) drawn above a part at %d,%d %dx%d\n", l, (int)t, b.x, b.y, b.width, b.height);
+              }
+              *aCovered = true;
+            }
           }
         }
-      }
-      if (part) depth++;
-    },
-    [&](Layer* l) { if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) depth--; });
-  return h;
+        if (part) depth++;
+      },
+      [&](Layer* l) {
+        if (!(l->GetIsFixedPosition() || l->GetIsStickyPosition())) return;
+        if (--depth > 0) return;
+        // the part walked: its signature, rect and bounds kept (past 32 parts, folded into the last)
+        if (nTop < 32) { tops[nTop].sig = h; tops[nTop].ir = topIr; tops[nTop].tb = topTb; nTop++; }
+        else { tops[31].sig = (tops[31].sig ^ h) * 16777619u; tops[31].ir = tops[31].ir.Union(topIr); tops[31].tb = tops[31].tb.Union(topTb); }
+      });
+  }
+  // each rect's signature, and the whole
+  uint32_t whole = kBasis;
+  auto mixw = [&](uint32_t v) { whole = (whole ^ v) * 16777619u; };
+  mixw((uint32_t)gJihadPartsGen); mixw((uint32_t)aN);
+  for (int k = 0; k < aN; k++) {
+    h = kBasis;
+    mix((uint32_t)aRects[k].width); mix((uint32_t)aRects[k].height);
+    bool any = false;
+    for (int i = 0; i < nTop; i++) {
+      if (tops[i].ir.IsEmpty() || !aRects[k].Intersects(tops[i].ir)) continue;
+      mix(tops[i].sig); any = true;
+      // (review F3) where the part sits inside the rect, and its size: a part wider than the frame moving sideways
+      // under a cut rect, a part moving inside a merged rect, keep the rect's size and would keep its picture
+      mix((uint32_t)(tops[i].tb.x - aRects[k].x)); mix((uint32_t)(tops[i].tb.y - aRects[k].y));
+      mix((uint32_t)tops[i].tb.width); mix((uint32_t)tops[i].tb.height);
+    }
+    if (!any) {   // (review F6) a rect no part's rect meets: every part's, and its own index and place
+      for (int i = 0; i < nTop; i++) mix(tops[i].sig);
+      mix((uint32_t)k); mix((uint32_t)aRects[k].x); mix((uint32_t)aRects[k].y);
+    }
+    if (aRectSig) aRectSig[k] = h;
+    mixw(h);
+  }
+  return whole;
 }
 
 void
@@ -1483,11 +1563,12 @@ JihadFixedCols()
 
 // T-544: the frame's fixed and stuck rects (the last JihadUpdateLastFixed's) out to the daemon
 static void
-JihadStuckOut(JihadFrameRequest* aReq, const gfx::IntRect* aRects, int aN)
+JihadStuckOut(JihadFrameRequest* aReq, const gfx::IntRect* aRects, int aN, const uint32_t* aSig = nullptr)
 {
   aReq->nStuck = 0;
   for (int k = 0; k < aN && aReq->nStuck < 4; k++) {
     if (aRects[k].IsEmpty()) continue;
+    aReq->partsSig[aReq->nStuck] = aSig ? aSig[k] : 0;   // T-505 (per part): the rect's own signature
     int* o = aReq->stuck[aReq->nStuck++];
     o[0] = aRects[k].x; o[1] = aRects[k].y; o[2] = aRects[k].XMost(); o[3] = aRects[k].YMost();
   }
@@ -2032,7 +2113,8 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     mLayerManager->JihadPrepareOnly();
     const int partN = JihadFixedRectsNow(aWidth, aHeight, parts, pk);   // every fixed and sticky layer, whole rects
     bool covered = false;
-    aReq->partsGen = JihadPartsSig(parts, partN, &covered, aWidth, aHeight);
+    uint32_t rectSig[16] = {};
+    aReq->partsGen = JihadPartsSig(parts, partN, &covered, aWidth, aHeight, rectSig);
     if (covered) aReq->partsFlags |= 1;
     {
       sJihadContentOnly = false;   // the card's hold set keeps T-544's meaning: fixed layers and stuck ones
@@ -2047,11 +2129,25 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       }
     }
     mLayerManager->JihadEndTransactionNoComposite();
-    JihadStuckOut(aReq, parts, partN);
-    if (!covered && aReq->partsDest && aReq->nStuck > 0 && aReq->partsGen != aReq->partsHave) {
+    JihadStuckOut(aReq, parts, partN, rectSig);
+    // T-505 (per part): the rects to read — with the list of signatures the daemon holds, the ones not in it; with
+    // the one signature, every rect when the whole differs
+    int want = 0;
+    if (!covered && aReq->partsDest && aReq->nStuck > 0) {
+      if (aReq->nPartsHave >= 0) {
+        for (int k = 0; k < aReq->nStuck; k++) {
+          bool have = false;
+          for (int j = 0; j < aReq->nPartsHave && j < 16 && !have; j++) have = aReq->partsHaveList[j] == aReq->partsSig[k];
+          if (!have) want |= 1 << k;
+        }
+      } else if (aReq->partsGen != aReq->partsHave) {
+        want = (1 << aReq->nStuck) - 1;
+      }
+    }
+    if (want) {
       size_t need = 0;
       for (int k = 0; k < aReq->nStuck; k++)
-        need += (size_t)(aReq->stuck[k][2] - aReq->stuck[k][0]) * (aReq->stuck[k][3] - aReq->stuck[k][1]) * 4;
+        if (want & (1 << k)) need += (size_t)(aReq->stuck[k][2] - aReq->stuck[k][0]) * (aReq->stuck[k][3] - aReq->stuck[k][1]) * 4;
       // the rects cut into pieces no taller than the surface, on shelves across its width (12 regions at most)
       struct Piece { int k, x, y, w, h, atX, atY; } pieces[12];
       int np = 0, used = 0;
@@ -2059,6 +2155,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         np = 0; used = 0;
         int shelfY = 0, shelfH = 0, cursorX = 0;
         for (int k = 0; k < aReq->nStuck; k++) {
+          if (!(want & (1 << k))) continue;   // a rect the daemon has
           const int x0 = aReq->stuck[k][0], w = aReq->stuck[k][2] - x0;
           for (int y = aReq->stuck[k][1]; y < aReq->stuck[k][3];) {
             const int hgt = std::min(aCap, aReq->stuck[k][3] - y);
@@ -2105,9 +2202,11 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
           mLayerManager->JihadSetRegions(nullptr, nullptr, 0);
           const TimeStamp pr0 = TimeStamp::Now();
           bool ok = true;
-          size_t off[4] = {};
-          for (int k = 1; k < aReq->nStuck; k++)
-            off[k] = off[k - 1] + (size_t)(aReq->stuck[k - 1][2] - aReq->stuck[k - 1][0]) * (aReq->stuck[k - 1][3] - aReq->stuck[k - 1][1]) * 4;
+          size_t off[4] = {};   // each read rect's place in the buffer: the read ones packed in rect order
+          for (int k = 0, o = 0; k < aReq->nStuck; k++) {
+            off[k] = (size_t)o;
+            if (want & (1 << k)) o += (aReq->stuck[k][2] - aReq->stuck[k][0]) * (aReq->stuck[k][3] - aReq->stuck[k][1]) * 4;
+          }
           for (int i = 0; i < np && ok; i++) {
             if (aReq->cancelled) { ok = false; break; }   // (review F6)
             const int k = pieces[i].k, rw = aReq->stuck[k][2] - aReq->stuck[k][0];
@@ -2117,12 +2216,15 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
           ogl->JihadEndBandPass();
           ogl->JihadSetClearTransparent(false);
           sJihadOverview = 0;
-          if (ok) aReq->partsBytes = (int)need;
+          if (ok) { aReq->partsBytes = (int)need; aReq->partsRead = want; }
           static uint32_t sPassLog = 0;
-          if (sPassLog++ < 20 || (sPassLog % 50) == 0)
-            JIHAD_GPU_LOG("[jihad-gpu] parts pass: %d parts, %d pieces on %d rows, %zu KB: compose %.1f ms, read %.1f ms%s\n",
-                          aReq->nStuck, np, used, need / 1024, (pr0 - pc0).ToMilliseconds(), (TimeStamp::Now() - pr0).ToMilliseconds(),
+          if (sPassLog++ < 20 || (sPassLog % 50) == 0) {
+            int nRead = 0;
+            for (int k = 0; k < aReq->nStuck; k++) if (want & (1 << k)) nRead++;
+            JIHAD_GPU_LOG("[jihad-gpu] parts pass: %d of %d parts (mask %x), %d pieces on %d rows, %zu KB: compose %.1f ms, read %.1f ms%s\n",
+                          nRead, aReq->nStuck, want, np, used, need / 1024, (pr0 - pc0).ToMilliseconds(), (TimeStamp::Now() - pr0).ToMilliseconds(),
                           ok ? "" : " (failed)");
+          }
         }
         mLayerManager->JihadIgnoreDiff(false);
         mLayerManager->JihadSetWorldTransform(world);
