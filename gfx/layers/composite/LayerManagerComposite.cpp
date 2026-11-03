@@ -564,6 +564,16 @@ LayerManagerComposite::UpdateAndRender()
     mJihadPartialOn = true;
   } else if (!mTarget && !mJihadLastChanged.IsEmpty() && mClonedLayerTreeProperties &&
              !invalid.Contains(mRenderBounds)) {
+    if (mJihadWholeRows) {
+      // T-505: a frame without its parts reads the changed rows whole (no column read, review D4): the
+      // composite covers them whole too, or the columns beside the change keep what the target held
+      // from its last composite (a frame with its parts: their pixels then pass for the page beneath
+      // them, and a later shift shows them; found 2026-11-02 on the long page's first shifted frame)
+      const gfx::IntRect b = invalid.GetBounds();
+      const gfx::IntRect rows = gfx::IntRect(mRenderBounds.x, b.y, mRenderBounds.width, b.height).Intersect(mRenderBounds);
+      invalid = nsIntRegion(rows);
+      mJihadLastChanged = rows;
+    }
     mJihadPartialOn = true;   // only what changed, when that is less than the frame
   }
   if (invalid.IsEmpty() && !mWindowOverlayChanged) {

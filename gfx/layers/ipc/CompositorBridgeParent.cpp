@@ -1174,7 +1174,7 @@ CompositorBridgeParent::JihadHideForJob()
 // leaf drawn after a part (above it, in paint order) whose pixels meet it is a cover: a popup over a fixed bar, a page
 // over a fixed background
 uint32_t
-CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered)
+CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight)
 {
   uint32_t h = 2166136261u;
   auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619u; };
@@ -1207,12 +1207,21 @@ CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* 
       const bool part = l->GetIsFixedPosition() || l->GetIsStickyPosition();
       if (part || depth > 0) {
         mix((uint32_t)(uintptr_t)l); mix((uint32_t)l->GetType()); mixf(l->GetOpacity());
-        mix(l->GetContentFlags()); mix(l->GetMaskLayer() ? 1u : 0u);
+        mix(l->GetContentFlags());
+        if (Layer* mk = l->GetMaskLayer()) { mix((uint32_t)(uintptr_t)mk); mixr(mk->GetVisibleRegion().GetBounds().ToUnknownRect()); }   // (review F5)
         mixr(l->GetVisibleRegion().GetBounds().ToUnknownRect());
+        if (l->GetClipRect()) mixr(l->GetClipRect()->ToUnknownRect());   // (review F5) a top-level part's clip too
         if (depth > 0) {
           const gfx::Matrix4x4 m = l->GetBaseTransform();
           for (int k = 0; k < 16; k++) mixf(m.components[k]);
-          if (l->GetClipRect()) mixr(l->GetClipRect()->ToUnknownRect());
+        }
+        if (l->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) *aCovered = true;   // (review F5) not drawable by "over" on the CPU
+        if (part && depth == 0) {
+          // (review F5) a part cut by the frame's top or bottom edge: its rect keeps its size while the slice shown
+          // moves with it (a sticky element not yet stuck, taller than the frame or half off it): where it starts
+          const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+          const gfx::IntRect tb = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+          if (tb.y < 0 || tb.YMost() > aHeight) mix((uint32_t)tb.y);
         }
         if (l->GetType() == Layer::TYPE_COLOR) {
           const gfx::Color c = static_cast<ColorLayer*>(l)->GetColor();
@@ -1556,6 +1565,19 @@ JihadMergeFixed(gfx::IntRect* aR, gfx::IntRect* aK, int aN, int aMax)
     }
     aR[bi] = aR[bi].Union(aR[bj]); aK[bi] = gfx::IntRect();
     remove(bj);
+    // (review F3) the union may now overlap a third rect: joined again, so no two rects overlap (the daemon's
+    // beneath records and restores take each rect's pixels once)
+    for (bool merged = true; merged && aN > 1;) {
+      merged = false;
+      for (int p = 0; p < aN && !merged; p++) {
+        for (int q = p + 1; q < aN && !merged; q++) {
+          if (!aK[p].IsEmpty() || !aK[q].IsEmpty()) continue;
+          gfx::IntRect a = aR[p];
+          a.Inflate(1);
+          if (a.Intersects(aR[q])) { aR[p] = aR[p].Union(aR[q]); remove(q); merged = true; }
+        }
+      }
+    }
   }
   return aN;
 }
@@ -1906,11 +1928,22 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       if (b->mLayerManager) b->mLayerManager->JihadHoldBaseline(false);
     }
   } jihadVerifyGuard(this, aReq && aReq->verify);
-  // T-505: a frame without its parts (flag 128), for this job's whole run
+  // T-505: a frame without its parts (flag 128), for this job's whole run; its reads are whole rows, so
+  // a partial composite of a change is whole rows too (LayerManagerComposite::JihadWholeRows)
   struct JihadContentOnlyScope {
-    explicit JihadContentOnlyScope(bool aOn) { sJihadContentOnly = aOn; }
-    ~JihadContentOnlyScope() { sJihadContentOnly = false; }
-  } jihadContentOnlyScope(aReq && aReq->contentOnly);
+    LayerManagerComposite* m;
+    JihadContentOnlyScope(LayerManagerComposite* aM, bool aOn) : m(aM) { sJihadContentOnly = aOn; if (m) m->JihadWholeRows(aOn); }
+    ~JihadContentOnlyScope() { sJihadContentOnly = false; if (m) m->JihadWholeRows(false); }
+  } jihadContentOnlyScope(mLayerManager, aReq && aReq->contentOnly);
+  // (review F2) one sample time for the job's prep, its parts pass and its frame: an animated part is measured,
+  // pictured and composed at the same instant (mTestTime is the mechanism the test API uses; restored after)
+  struct JihadJobTimeScope {
+    CompositorBridgeParent* b; bool was; TimeStamp wasTime;
+    JihadJobTimeScope(CompositorBridgeParent* aB, bool aOn) : b(aB), was(aB->mIsTesting), wasTime(aB->mTestTime) {
+      if (aOn && !was) { b->mIsTesting = true; b->mTestTime = TimeStamp::Now(); }
+    }
+    ~JihadJobTimeScope() { if (!was) { b->mIsTesting = false; b->mTestTime = wasTime; } }
+  } jihadJobTimeScope(this, aReq && aReq->contentOnly);
   if (aReq) aReq->partsGen = gJihadPartsGen;
   MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
   if (!aReq || !mCompositor || !mLayerManager) {
@@ -1999,7 +2032,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
     mLayerManager->JihadPrepareOnly();
     const int partN = JihadFixedRectsNow(aWidth, aHeight, parts, pk);   // every fixed and sticky layer, whole rects
     bool covered = false;
-    aReq->partsGen = JihadPartsSig(parts, partN, &covered);
+    aReq->partsGen = JihadPartsSig(parts, partN, &covered, aWidth, aHeight);
     if (covered) aReq->partsFlags |= 1;
     {
       sJihadContentOnly = false;   // the card's hold set keeps T-544's meaning: fixed layers and stuck ones
@@ -2044,6 +2077,8 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         aReq->partsFlags |= 2;
       } else {
         JihadVerifyGuard partsGuard(this, true);   // the baseline, the probe, the last scroll and view held
+        struct PartsCancelScope { CompositorOGL* o; ~PartsCancelScope() { o->JihadSetCancel(nullptr); } } partsCancelScope{ogl};
+        ogl->JihadSetCancel(&aReq->cancelled);   // (review F6) a job given up writes no more of its buffer
         const int passRows = ogl->JihadBeginBandPass(aWidth, used);
         if (!passRows) {
           aReq->partsFlags |= 2;
@@ -2074,6 +2109,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
           for (int k = 1; k < aReq->nStuck; k++)
             off[k] = off[k - 1] + (size_t)(aReq->stuck[k - 1][2] - aReq->stuck[k - 1][0]) * (aReq->stuck[k - 1][3] - aReq->stuck[k - 1][1]) * 4;
           for (int i = 0; i < np && ok; i++) {
+            if (aReq->cancelled) { ok = false; break; }   // (review F6)
             const int k = pieces[i].k, rw = aReq->stuck[k][2] - aReq->stuck[k][0];
             uint8_t* d = aReq->partsDest + off[k] + (size_t)(pieces[i].y - aReq->stuck[k][1]) * rw * 4;
             ok = ogl->JihadReadPacked(d, rw * 4, passRows, pieces[i].atX, pieces[i].w, pieces[i].atY, pieces[i].h);

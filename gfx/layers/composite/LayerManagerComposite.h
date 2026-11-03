@@ -141,6 +141,9 @@ public:
   // the layer diff reports as the content's whole bounds): the diff is dropped, the bands asked
   // for are composed and read
   void JihadIgnoreDiff(bool aOn) { mJihadIgnoreDiff = aOn; }
+  // T-505: a frame without its parts is read back in whole rows (no column read): a partial composite
+  // of what the tree changed covers those rows across the frame's width, not the change's columns
+  void JihadWholeRows(bool aOn) { mJihadWholeRows = aOn; }
   // round 115: the next diff treats the root-content layer's scroll as a shift (LayerTreeInvalidation.h)
   void JihadCompensateScroll(bool aOn) { mJihadCompensateScroll = aOn; }
   // round 119: the tree diff now, without a render (the stored tree refreshed as a composite
@@ -398,6 +401,7 @@ private:
   gfx::IntRect mJihadRegionRect[12];
   int mJihadRegionN = 0;
   bool mJihadIgnoreDiff = false;
+  bool mJihadWholeRows = false;   // T-505: the rows read back are whole rows
   bool mJihadCompensateScroll = false;
   bool mJihadPartialOn = false;                  // this Render is a partial composite
   UniquePtr<LayerProperties> mClonedLayerTreeProperties;
