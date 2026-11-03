@@ -9,6 +9,7 @@
 #include <stdint.h>                     // for uint64_t
 #include <map>                          // for _Rb_tree_iterator, etc
 #include <mutex>                        // Jihad T-505 (per part): sJihadPartPaintLock
+#include "CompositableHost.h"           // Jihad T-505 item 4: the census of tiled layers under the bands
 #include <utility>                      // for pair
 #include "LayerTransactionParent.h"     // for LayerTransactionParent
 #include "RenderTrace.h"                // for RenderTraceLayers
@@ -1561,6 +1562,63 @@ JihadFixedCols()
   return sOn && !sJihadContentOnly;   // T-505: a frame without its parts has no fixed pixels to keep or read
 }
 
+// T-505 item 4 (a measurement, 2026-11-03; nothing composed differently): of the band frames of a frame without its
+// parts, how many could be composed on the CPU from the tiles — every leaf under the band rows a tiled painted layer
+// (its compositable CONTENT_TILED) or a colour layer, drawn with "over", no mask, a 2D axis-aligned transform — and
+// how many of those sit at a scale of 1 (a copy; at another scale the tiles would be scaled on the CPU). A line
+// every 20 band frames under JIHAD_GPU_LOG
+static void
+JihadCpuBandCensus(Layer* aRoot, const int aBands[2][2], int aWidth, int aHeight)
+{
+  static uint32_t sFrames = 0, sQualify = 0, sAtOne = 0, sScaled = 0, sOther = 0, sMasked = 0, sBlend = 0, s3d = 0, sTransl = 0, sNone = 0;
+  if (!aRoot) return;
+  bool ok = true, atOne = true, any = false, scaled = false, other = false, masked = false, blend = false, is3d = false, transl = false;
+  int depth = 0;   // inside a fixed or sticky part: hidden in a frame without its parts
+  ForEachNode<ForwardIterator>(aRoot,
+    [&](Layer* l) {
+      if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) depth++;
+      if (depth > 0 || l->GetFirstChild()) return;
+      if (l->GetEffectiveOpacity() <= 0.0f) return;
+      const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+      if (vb.IsEmpty()) return;
+      gfx::Matrix m;
+      const bool is2d = l->GetEffectiveTransform().Is2D(&m) && m.PreservesAxisAlignedRectangles();
+      const gfx::IntRect ob = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+      bool meets = false;
+      for (int b = 0; b < 2; b++) {
+        const int lo = std::max(0, aBands[b][0]), hi = std::min(aHeight, aBands[b][1]);
+        if (hi > lo && ob.y < hi && ob.YMost() > lo && ob.x < aWidth && ob.XMost() > 0) meets = true;
+      }
+      if (!meets) return;
+      any = true;
+      const Layer::LayerType t = l->GetType();
+      bool tiled = false;
+      if (t == Layer::TYPE_PAINTED) {
+        CompositableHost* h = l->AsLayerComposite() ? l->AsLayerComposite()->GetCompositableHost() : nullptr;
+        tiled = h && h->GetType() == CompositableType::CONTENT_TILED;
+      }
+      if (!(tiled || t == Layer::TYPE_COLOR)) { other = true; ok = false; }
+      if (!is2d) { is3d = true; ok = false; }
+      else if (fabsf(m._11 - 1.0f) > 1e-3f || fabsf(m._22 - 1.0f) > 1e-3f) { scaled = true; atOne = false; }
+      if (l->GetMaskLayer() || l->GetAncestorMaskLayerCount() > 0) { masked = true; ok = false; }
+      if (l->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) { blend = true; ok = false; }
+      if (l->GetEffectiveOpacity() < 0.999f) transl = true;
+    },
+    [&](Layer* l) { if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) depth--; });
+  sFrames++;
+  if (!any) sNone++;
+  if (ok && any) { sQualify++; if (atOne) sAtOne++; }
+  if (scaled) sScaled++;
+  if (other) sOther++;
+  if (masked) sMasked++;
+  if (blend) sBlend++;
+  if (is3d) s3d++;
+  if (transl) sTransl++;
+  if ((sFrames % 20) == 0)
+    JIHAD_GPU_LOG("[jihad-gpu] cpu bands census: %u band frames, %u could be composed from the tiles on the CPU (%u at scale 1); scaled %u, not tiled or colour %u, masked %u, blend %u, 3d %u, translucent %u, no layer %u\n",
+                  sFrames, sQualify, sAtOne, sScaled, sOther, sMasked, sBlend, s3d, sTransl, sNone);
+}
+
 // T-544: the frame's fixed and stuck rects (the last JihadUpdateLastFixed's) out to the daemon
 static void
 JihadStuckOut(JihadFrameRequest* aReq, const gfx::IntRect* aRects, int aN, const uint32_t* aSig = nullptr)
@@ -2414,6 +2472,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       // other, read ONCE into the compositor's scratch rows and split from there: a glReadPixels
       // call costs ~4 ms of its own on this driver, whatever the rows.
       const int bands[2][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2} };
+      if (jPartsPrepped) JihadCpuBandCensus(mLayerManager->GetRoot(), bands, aWidth, aHeight);   // T-505 item 4: a count
       int hs[2] = {0, 0}, top = 0;
       for (int b = 0; b < 2; b++) { const int lo = std::max(0, bands[b][0]), hi = std::min(aHeight, bands[b][1]); hs[b] = hi > lo ? hi - lo : 0; top += hs[b]; }
       const int fullRows = hs[0] + hs[1];   // read whole; the chunks under them only in their columns
