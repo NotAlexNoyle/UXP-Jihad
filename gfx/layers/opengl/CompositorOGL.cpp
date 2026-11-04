@@ -1947,6 +1947,65 @@ JihadSwizzleAndFlipRows(uint8_t* aData, int aStride, int aW, int aH, bool aForce
   }
 }
 
+// Jihad T-567 (2026-11-03): the rows as a BGRA read wrote them (GL row 0 at the bottom) -> row 0 at the
+// top, in place; aForceAlpha writes 0xFF into the alpha byte. The swizzle above cost 24 ms a whole frame
+// of 1110 rows on the compositor thread (1.2 s of a 35 s round) when the driver can hand the rows over in
+// the adapter's byte order itself (GL_EXT_read_format_bgra, or its implementation read format).
+static void
+JihadFlipRows(uint8_t* aData, int aStride, int aW, int aH, bool aForceAlpha)
+{
+  uint8_t stackRow[16384];
+  uint8_t* tmp = (size_t)aStride <= sizeof stackRow ? stackRow : (uint8_t*)malloc((size_t)aStride);
+  if (!tmp) return;
+  const size_t rowBytes = (size_t)aW * 4;
+  for (int y = 0; y < aH / 2; y++) {
+    uint8_t* a = aData + (size_t)y * aStride;
+    uint8_t* b = aData + (size_t)(aH - 1 - y) * aStride;
+    memcpy(tmp, a, rowBytes); memcpy(a, b, rowBytes); memcpy(b, tmp, rowBytes);
+  }
+  if (tmp != stackRow) free(tmp);
+  if (aForceAlpha) {
+    for (int y = 0; y < aH; y++) {
+      uint32_t* p = (uint32_t*)(aData + (size_t)y * aStride);
+      int x = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+      const uint32x4_t m = vdupq_n_u32(0xff000000u);
+      for (; x + 4 <= aW; x += 4) vst1q_u32(p + x, vorrq_u32(vld1q_u32(p + x), m));
+#endif
+      for (; x < aW; x++) p[x] |= 0xff000000u;
+    }
+  }
+}
+
+// T-567: the format the frame rows are read in. JIHAD_GPU_READ_BGRA=1 asks for BGRA where the driver
+// offers it (the extension, or the implementation's own read format); else RGBA and the CPU swizzle.
+// Decided at the first read (with a target bound) and kept; said once in the log.
+static GLenum
+JihadReadFormat(GLContext* aGL)
+{
+  static GLenum sFmt = 0;
+  if (sFmt) return sFmt;
+  GLint implFmt = 0, implType = 0;
+  aGL->fGetIntegerv(LOCAL_GL_IMPLEMENTATION_COLOR_READ_FORMAT, &implFmt);
+  aGL->fGetIntegerv(LOCAL_GL_IMPLEMENTATION_COLOR_READ_TYPE, &implType);
+  const bool ext = aGL->IsExtensionSupported(GLContext::EXT_read_format_bgra);
+  const char* e = getenv("JIHAD_GPU_READ_BGRA");
+  const bool want = e && strcmp(e, "0") != 0;
+  const bool can = ext || (implFmt == LOCAL_GL_BGRA && implType == LOCAL_GL_UNSIGNED_BYTE);
+  sFmt = (want && can) ? LOCAL_GL_BGRA : LOCAL_GL_RGBA;
+  fprintf(stderr, "[jihad-gpu] read format: the implementation's 0x%x/0x%x, EXT_read_format_bgra %d, asked %d: reading %s\n",
+          (unsigned)implFmt, (unsigned)implType, (int)ext, (int)want, sFmt == LOCAL_GL_BGRA ? "BGRA (the flip only)" : "RGBA (the swizzle and flip)");
+  return sFmt;
+}
+
+// T-567: the read rows into the adapter's order, by the format they were read in
+static void
+JihadReadDone(uint8_t* aData, int aStride, int aW, int aH, bool aForceAlpha, GLenum aFmt)
+{
+  if (aFmt == LOCAL_GL_BGRA) JihadFlipRows(aData, aStride, aW, aH, aForceAlpha);
+  else JihadSwizzleAndFlipRows(aData, aStride, aW, aH, aForceAlpha);
+}
+
 static GLuint
 JihadCompileShader(GLContext* aGL, GLenum aType, const char* aSrc)
 {
@@ -2563,14 +2622,14 @@ CompositorOGL::JihadReadOnReadThread(JihadFrameRequest* aReq)
         // the flipped window view: frame row r is GL row h-1-r (see JihadReadFrame)
         ScopedPackState safePackState(gl);
         gl->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
-        gl->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+        gl->fReadPixels(0, h - hi, w, rows, JihadReadFormat(gl), LOCAL_GL_UNSIGNED_BYTE, band);   // T-567: BGRA where offered
       }
       if (aReq->cancelled) {   // given up during the read: it wrote into the slot (counted, as on the compositor thread)
         ++gJihadLateWrites;
         break;
       }
       t2 = TimeStamp::Now();
-      JihadSwizzleAndFlipRows(band, aReq->stride, w, rows, !(aReq->overview || aReq->overviewParts));   // T-504: its alpha kept
+      JihadReadDone(band, aReq->stride, w, rows, !(aReq->overview || aReq->overviewParts), JihadReadFormat(gl));   // T-504: its alpha kept
       static int sTimed = 0;
       if (sTimed++ < 12 || (sTimed % 100) == 0) {
         JIHAD_GPU_LOG("[jihad-gpu] read thread: fence wait %.1f ms (%.1f ms of CPU), glReadPixels %d rows %.1f ms, swizzle+flip %.1f ms\n",
@@ -2670,7 +2729,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
     if (sScratch) {
       uint8_t* tmp = JihadBandScratch((size_t)aStride * rows);
-      mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, tmp);
+      mGLContext->fReadPixels(0, h - hi, w, rows, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, tmp);
       if (mJihadCancel && *mJihadCancel) {
         return false;   // T-513 (Codex): given up while the GPU was read; the slot is not touched
       }
@@ -2678,10 +2737,10 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     } else if (sChunk > 0) {
       for (int done = 0; done < rows; done += sChunk) {
         const int n = std::min(sChunk, rows - done);
-        mGLContext->fReadPixels(0, h - hi + done, w, n, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band + (size_t)done * aStride);
+        mGLContext->fReadPixels(0, h - hi + done, w, n, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, band + (size_t)done * aStride);
       }
     } else {
-      mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, band);
+      mGLContext->fReadPixels(0, h - hi, w, rows, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, band);   // T-567: BGRA where offered
     }
     // JIHAD_GPU_READ_VERIFY=1: when frame row 700 (GL row h-1-700) of a whole read is white,
     // read the region again into private memory and say what the second read holds there
@@ -2699,7 +2758,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
         ++sWhite;
         uint8_t* again = (uint8_t*)malloc((size_t)aStride * rows);
         if (again) {
-          mGLContext->fReadPixels(0, h - hi, w, rows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, again);
+          mGLContext->fReadPixels(0, h - hi, w, rows, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, again);
           const bool secondWhite = whiteAt(again, h - 1 - 700);
           if (!secondWhite) ++sSecondGood;
           JIHAD_GPU_LOG("[jihad-gpu] read verify: first read white from GL row 0 for %d rows; second read (private memory) %s, white for %d rows (white firsts %u of %u checked, second good %u)\n",
@@ -2716,7 +2775,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     return false;
   }
   TimeStamp t1 = TimeStamp::Now();
-  JihadSwizzleAndFlipRows(band, aStride, w, rows, !mJihadKeepAlpha);   // T-504: an overview's read keeps its alpha
+  JihadReadDone(band, aStride, w, rows, !mJihadKeepAlpha, JihadReadFormat(mGLContext));   // T-504: an overview's read keeps its alpha
   {
     static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
     if (sDrawStats && lo == 0 && hi == h && h > 700) {
@@ -2780,12 +2839,12 @@ CompositorOGL::JihadReadPacked(uint8_t* aDest, int aDestStride, int aSurfaceH, i
   {
     ScopedPackState safePackState(mGLContext);
     mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
-    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), aW, aRows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, sBuf);
+    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), aW, aRows, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, sBuf);
   }
   if (mJihadCancel && *mJihadCancel) {
     return false;
   }
-  JihadSwizzleAndFlipRows(sBuf, aW * 4, aW, aRows, false);   // the parts keep their alpha
+  JihadReadDone(sBuf, aW * 4, aW, aRows, false, JihadReadFormat(mGLContext));   // the parts keep their alpha
   for (int r = 0; r < aRows; r++) {
     memcpy(aDest + (size_t)r * aDestStride, sBuf + (size_t)r * aW * 4, (size_t)aW * 4);
   }
@@ -2822,13 +2881,13 @@ CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int 
   {
     ScopedPackState safePackState(mGLContext);
     mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 4);
-    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), w, aRows, LOCAL_GL_RGBA, LOCAL_GL_UNSIGNED_BYTE, sBuf);
+    mGLContext->fReadPixels(aX0, aSurfaceH - (aSrcRowLo + aRows), w, aRows, JihadReadFormat(mGLContext), LOCAL_GL_UNSIGNED_BYTE, sBuf);
   }
   const TimeStamp t1 = TimeStamp::Now();
   if (mJihadCancel && *mJihadCancel) {
     return false;   // T-513 (review): given up while the GPU was read; the frame is not touched
   }
-  JihadSwizzleAndFlipRows(sBuf, w * 4, w, aRows, true);
+  JihadReadDone(sBuf, w * 4, w, aRows, true, JihadReadFormat(mGLContext));
   for (int r = 0; r < aRows; r++) {
     memcpy(aDest + (size_t)(aDestRowLo + r) * aStride + (size_t)destX * 4, sBuf + (size_t)r * w * 4, (size_t)w * 4);
   }
