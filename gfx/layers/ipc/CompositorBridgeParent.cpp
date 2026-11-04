@@ -1564,7 +1564,8 @@ JihadFixedCols()
   return sOn && !sJihadContentOnly;   // T-505: a frame without its parts has no fixed pixels to keep or read
 }
 
-// T-505 item 4 (2026-11-04): the band frames composed on the CPU from the tiles. JIHAD_GPU_CPU_BANDS=1: a band frame
+// T-505 item 4 (2026-11-04): the band frames composed on the CPU from the tiles — the GPU path's default (the
+// Deciding Vote of 2026-11-04, Codex, on the rounds' numbers; JIHAD_GPU_CPU_BANDS=0 turns it off): a band frame
 // (a scroll-only frame, or one whose change fits the band pass) whose band rows are covered by tiled painted layers
 // and colour layers only — each drawn "over" at full opacity, no mask, under a translation of whole frame pixels at
 // a scale of 1 (the layers painted at the card's zoom's resolution: the daemon's JIHAD_GPU_RES_ZOOM) — is composed
@@ -1581,7 +1582,8 @@ JihadFixedCols()
 static bool
 JihadCpuBandsWanted()
 {
-  static const bool sOn = getenv("JIHAD_GPU_CPU_BANDS") && atoi(getenv("JIHAD_GPU_CPU_BANDS")) != 0;
+  static const bool sOn = getenv("JIHAD_GPU_COMPOSITOR") != nullptr &&
+                          !(getenv("JIHAD_GPU_CPU_BANDS") && atoi(getenv("JIHAD_GPU_CPU_BANDS")) == 0);
   return sOn;
 }
 
@@ -2731,7 +2733,7 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       // JihadSetRegions); JIHAD_GPU_PASS_PER_REGION=1 composes each on its own, as before
       static const bool sPassPerRegion = getenv("JIHAD_GPU_PASS_PER_REGION") != nullptr;
       // T-505 item 4: the bands composed on the CPU from the tiles when every layer under them allows it
-      // (JIHAD_GPU_CPU_BANDS=1, JihadCpuBands above: a frame of full-width bands alone, no column chunks); the GPU
+      // (the GPU path's default, JihadCpuBands above: a frame of full-width bands alone, no column chunks); the GPU
       // band pass otherwise, as before
       bool cpuDone = false;
       double msCpuPrep = 0, msCpuDraw = 0;

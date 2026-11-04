@@ -847,12 +847,14 @@ BufferTextureHost::MaybeUpload(nsIntRegion *aRegion)
   if (mHasIntermediateBuffer) {
     // We just did the texture upload, the content side can now freely write
     // into the shared buffer.
-    // Jihad T-505 item 4 (JIHAD_GPU_CPU_BANDS=1): not while the band frames are composed on the CPU from these
+    // Jihad T-505 item 4 (the GPU path's default; JIHAD_GPU_CPU_BANDS=0 turns it off): not while the band frames
+    // are composed on the CPU from these
     // buffers (CompositorBridgeParent's JihadCpuBands reads them under the tile host): the content side would
     // paint the tile's next content into the same front buffer (TileClient::GetBackBuffer reuses an unlocked
     // front buffer) while the compositor thread copies it. The lock stays until the tile is dropped
     // (UnbindTextureSource, or the host's end); the content side double-buffers the tile meanwhile.
-    static const bool sJihadKeep = getenv("JIHAD_GPU_CPU_BANDS") && atoi(getenv("JIHAD_GPU_CPU_BANDS")) != 0;
+    static const bool sJihadKeep = getenv("JIHAD_GPU_COMPOSITOR") != nullptr &&
+                                   !(getenv("JIHAD_GPU_CPU_BANDS") && atoi(getenv("JIHAD_GPU_CPU_BANDS")) == 0);
     if (!sJihadKeep) ReadUnlock();
   }
 
