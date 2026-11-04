@@ -9,7 +9,9 @@
 #include <stdint.h>                     // for uint64_t
 #include <map>                          // for _Rb_tree_iterator, etc
 #include <mutex>                        // Jihad T-505 (per part): sJihadPartPaintLock
-#include "CompositableHost.h"           // Jihad T-505 item 4: the census of tiled layers under the bands
+#include "CompositableHost.h"           // Jihad T-505 item 4: the tiled layers under the bands
+#include "mozilla/layers/TiledContentHost.h"   // Jihad T-505 item 4: the tiles' buffers (JihadCpuBands)
+#include "mozilla/layers/ImageDataSerializer.h"   // Jihad T-505 item 4: a tile buffer's stride
 #include <utility>                      // for pair
 #include "LayerTransactionParent.h"     // for LayerTransactionParent
 #include "RenderTrace.h"                // for RenderTraceLayers
@@ -1562,61 +1564,306 @@ JihadFixedCols()
   return sOn && !sJihadContentOnly;   // T-505: a frame without its parts has no fixed pixels to keep or read
 }
 
-// T-505 item 4 (a measurement, 2026-11-03; nothing composed differently): of the band frames of a frame without its
-// parts, how many could be composed on the CPU from the tiles — every leaf under the band rows a tiled painted layer
-// (its compositable CONTENT_TILED) or a colour layer, drawn with "over", no mask, a 2D axis-aligned transform — and
-// how many of those sit at a scale of 1 (a copy; at another scale the tiles would be scaled on the CPU). A line
-// every 20 band frames under JIHAD_GPU_LOG
-static void
-JihadCpuBandCensus(Layer* aRoot, const int aBands[2][2], int aWidth, int aHeight)
+// T-505 item 4 (2026-11-04): the band frames composed on the CPU from the tiles. JIHAD_GPU_CPU_BANDS=1: a band frame
+// (a scroll-only frame, or one whose change fits the band pass) whose band rows are covered by tiled painted layers
+// and colour layers only — each drawn "over" at full opacity, no mask, under a translation of whole frame pixels at
+// a scale of 1 (the layers painted at the card's zoom's resolution: the daemon's JIHAD_GPU_RES_ZOOM) — is composed
+// by the compositor thread copying the tiles' pixels (BufferTextureHost::GetBuffer: the shared memory the content
+// side painted, read-locked while its tile is held) into the slot's band rows: no GL composite, no glReadPixels
+// (90 us a row on the Adreno 220, T-567), no texture upload for those tiles. The frame's bookkeeping is a
+// composite's (the shadow properties and the async transforms at this frame's scroll, DidComposite to the content
+// side). Anything else under a band (a scaled or fractional transform, a mask, a blend mode, a group composed apart,
+// a canvas, an image, a component-alpha tile, a low-precision buffer) sends the frame to the GPU band pass as
+// before; the reasons are counted and logged every 20 band frames (the census of engine 0074, now the switch's own
+// count). The measurement of 2026-11-03 (the census, by finger): the long page 420 of 420 band frames could be
+// composed this way at scale 1; desktop Wikipedia 291 of 360, none at scale 1 with the tiles painted at 1 under a
+// fit zoom of 0.69 (hence the resolution switch), the rest a masked translucent layer in the first drags.
+static bool
+JihadCpuBandsWanted()
 {
-  static uint32_t sFrames = 0, sQualify = 0, sAtOne = 0, sScaled = 0, sOther = 0, sMasked = 0, sBlend = 0, s3d = 0, sTransl = 0, sNone = 0;
-  if (!aRoot) return;
-  bool ok = true, atOne = true, any = false, scaled = false, other = false, masked = false, blend = false, is3d = false, transl = false;
-  int depth = 0;   // inside a fixed or sticky part: hidden in a frame without its parts
-  ForEachNode<ForwardIterator>(aRoot,
-    [&](Layer* l) {
-      if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) depth++;
-      if (depth > 0 || l->GetFirstChild()) return;
-      if (l->GetEffectiveOpacity() <= 0.0f) return;
-      const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
-      if (vb.IsEmpty()) return;
-      gfx::Matrix m;
-      const bool is2d = l->GetEffectiveTransform().Is2D(&m) && m.PreservesAxisAlignedRectangles();
-      const gfx::IntRect ob = gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
-      bool meets = false;
+  static const bool sOn = getenv("JIHAD_GPU_CPU_BANDS") && atoi(getenv("JIHAD_GPU_CPU_BANDS")) != 0;
+  return sOn;
+}
+
+struct JihadCpuLeaf {
+  Layer* layer;
+  gfx::IntRect clip;   // the layer's scissor on the frame (ContainerPrepare's CalculateScissorRect chain)
+  int tx, ty;          // its effective transform: a translation of whole frame pixels
+};
+
+struct JihadCpuCount {   // the band frames' census (a line every 20 band frames), and this frame's own counts
+  uint32_t frames = 0, cpu = 0, could = 0, scaled = 0, fractional = 0, other = 0, masked = 0, blend = 0, group = 0,
+           is3d = 0, transl = 0, lowres = 0, tile = 0, none = 0;
+  int leaves = 0, tiled = 0, colour = 0, tiles = 0, rects = 0;
+};
+static JihadCpuCount sJihadCpu;
+
+static void
+JihadCpuLog()
+{
+  if ((sJihadCpu.frames % 20) != 0) return;
+  JIHAD_GPU_LOG("[jihad-gpu] cpu bands: %u band frames, %u composed on the CPU (%u could be); not: scaled %u, fractional %u, not tiled or colour %u, masked %u, blend %u, group %u, 3d %u, translucent %u, low-res or resolution %u, tile format %u; no layer %u\n",
+                sJihadCpu.frames, sJihadCpu.cpu, sJihadCpu.could, sJihadCpu.scaled, sJihadCpu.fractional, sJihadCpu.other,
+                sJihadCpu.masked, sJihadCpu.blend, sJihadCpu.group, sJihadCpu.is3d, sJihadCpu.transl, sJihadCpu.lowres,
+                sJihadCpu.tile, sJihadCpu.none);
+}
+
+// a rect on the frame meets one of the band rows
+static bool
+JihadCpuMeets(const gfx::IntRect& aOb, const int aBands[2][2], int aW, int aH)
+{
+  for (int b = 0; b < 2; b++) {
+    const int lo = std::max(0, aBands[b][0]), hi = std::min(aH, aBands[b][1]);
+    if (hi > lo && aOb.y < hi && aOb.YMost() > lo && aOb.x < aW && aOb.XMost() > 0) return true;
+  }
+  return false;
+}
+
+// the leaves under the band rows in paint order (the siblings' order: no 3D context), each with its scissor, when
+// every one of them can be composed on the CPU; false, the reason counted, when one cannot
+static bool
+JihadCpuCollect(Layer* aLayer, const RenderTargetIntRect& aParentClip, bool aRoot, const int aBands[2][2],
+                int aW, int aH, nsTArray<JihadCpuLeaf>& aLeaves, JihadCpuCount& aN)
+{
+  if (!aRoot && aLayer->IsBackfaceHidden()) return true;
+  if (aLayer->GetEffectiveOpacity() <= 0.0f) return true;   // drawn invisible (a part hidden for a frame without its parts)
+  // the root's scissor is the frame within its own clip (LayerManagerComposite::Render's), a child's its
+  // CalculateScissorRect from its container's
+  RenderTargetIntRect clip = aRoot ? aParentClip : aLayer->CalculateScissorRect(aParentClip);
+  if (aRoot && aLayer->GetLocalClipRect()) {
+    const ParentLayerIntRect& rc = *aLayer->GetLocalClipRect();
+    clip = clip.Intersect(RenderTargetIntRect(rc.x, rc.y, rc.width, rc.height));
+  }
+  const gfx::IntRect clipRect(clip.x, clip.y, clip.width, clip.height);
+  if (ContainerLayer* c = aLayer->AsContainerLayer()) {
+    // a container composed apart — an intermediate surface (a group under an opacity or a mask), a blend mode, a
+    // 3D context, an isolated group — is not a stack of leaves drawn "over", and its leaves' effective transforms
+    // and scissors are the surface's, not the frame's (review 2026-11-04, F2): when its own bounds meet a band the
+    // frame goes to the GPU; else its subtree is not under the bands
+    if (c->UseIntermediateSurface() || c->GetMaskLayer() || c->GetMixBlendMode() != gfx::CompositionOp::OP_OVER ||
+        c->Extend3DContext() || c->GetForceIsolatedGroup()) {
+      const gfx::IntRect vb = c->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+      gfx::IntRect ob = gfx::RoundedOut(c->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+      ob = ob.Intersect(clipRect);
+      if (JihadCpuMeets(ob, aBands, aW, aH)) { aN.group++; return false; }
+      return true;
+    }
+    for (Layer* ch = c->GetFirstChild(); ch; ch = ch->GetNextSibling()) {
+      if (!JihadCpuCollect(ch, clip, false, aBands, aW, aH, aLeaves, aN)) return false;
+    }
+    return true;
+  }
+  const Layer::LayerType t = aLayer->GetType();
+  // an image or a canvas layer anywhere in the tree: a composite's traversal keeps their timed frames and
+  // notifications going even off the bands (review F10); such a tree stays on the GPU
+  if (t == Layer::TYPE_IMAGE || t == Layer::TYPE_CANVAS) { aN.other++; return false; }
+  if (!aLayer->IsVisible() || clip.IsEmpty()) return true;
+  const gfx::IntRect vb = aLayer->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+  gfx::Matrix m;
+  const bool is2d = aLayer->GetEffectiveTransform().Is2D(&m);
+  gfx::IntRect ob = gfx::RoundedOut(aLayer->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+  ob = ob.Intersect(clipRect);
+  if (!JihadCpuMeets(ob, aBands, aW, aH)) return true;
+  if (!is2d) { aN.is3d++; return false; }
+  // a scale of 1 within float noise (a scale of 1.0009 over 1024 px is a pixel at the edge, review F7) and a
+  // translation of whole pixels (SnapTransformTranslation's)
+  if (fabsf(m._11 - 1.0f) > 2e-5f || fabsf(m._22 - 1.0f) > 2e-5f || fabsf(m._12) > 2e-5f || fabsf(m._21) > 2e-5f) { aN.scaled++; return false; }
+  const int itx = (int)lroundf(m._31), ity = (int)lroundf(m._32);
+  if (fabsf(m._31 - (float)itx) > 0.01f || fabsf(m._32 - (float)ity) > 0.01f) { aN.fractional++; return false; }
+  if (aLayer->GetMaskLayer() || aLayer->GetAncestorMaskLayerCount() > 0) { aN.masked++; return false; }
+  if (aLayer->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) { aN.blend++; return false; }
+  if (aLayer->GetEffectiveOpacity() < 0.999f) { aN.transl++; return false; }
+  if (t == Layer::TYPE_COLOR) {
+    aN.colour++;
+  } else if (t == Layer::TYPE_PAINTED) {
+    CompositableHost* h = aLayer->AsLayerComposite() ? aLayer->AsLayerComposite()->GetCompositableHost() : nullptr;
+    TiledContentHost* th = h ? h->AsTiledContentHost() : nullptr;
+    if (!th) { aN.other++; return false; }
+    TiledLayerBufferComposite& tb = th->JihadTiles();
+    // the tiles at the layer's own pixels (the high-precision buffer's resolution exactly 1), no low-precision
+    // buffer drawn under them, no fade-in
+    if (th->JihadLowResTiles().GetTileCount() > 0 || gfxPrefs::LayerTileFadeInEnabled() || tb.GetResolution() != 1.0f) {
+      aN.lowres++; return false;
+    }
+    // every tile under the band rows a shared-memory buffer of B8G8R8A8 or B8G8R8X8, no component alpha, its read
+    // lock still held (the content side cannot be painting it: TextureHost.cpp's MaybeUpload keeps the lock under
+    // this switch; a tile without one is not read)
+    const gfx::IntSize ts = tb.GetTileSize();
+    for (size_t i = 0; i < tb.GetTileCount(); i++) {
+      TileHost& tile = tb.GetTile(i);
+      if (tile.IsPlaceholderTile()) continue;
+      const gfx::IntPoint off = tb.GetTileOffset(tb.GetPlacement().TilePosition(i));
+      const int ty0 = off.y + ity, ty1 = ty0 + ts.height;
+      bool under = false;
       for (int b = 0; b < 2; b++) {
-        const int lo = std::max(0, aBands[b][0]), hi = std::min(aHeight, aBands[b][1]);
-        if (hi > lo && ob.y < hi && ob.YMost() > lo && ob.x < aWidth && ob.XMost() > 0) meets = true;
+        const int lo = std::max(0, aBands[b][0]), hi = std::min(aH, aBands[b][1]);
+        if (hi > lo && ty0 < hi && ty1 > lo) under = true;
       }
-      if (!meets) return;
-      any = true;
-      const Layer::LayerType t = l->GetType();
-      bool tiled = false;
-      if (t == Layer::TYPE_PAINTED) {
-        CompositableHost* h = l->AsLayerComposite() ? l->AsLayerComposite()->GetCompositableHost() : nullptr;
-        tiled = h && h->GetType() == CompositableType::CONTENT_TILED;
+      if (!under) continue;
+      BufferTextureHost* bh = tile.mTextureHost->AsBufferTextureHost();
+      if (!bh || tile.mTextureHostOnWhite || bh->GetBufferDescriptor().type() != BufferDescriptor::TRGBDescriptor || !bh->GetBuffer() ||
+          !tile.mTextureHost->GetReadLock()) {
+        aN.tile++; return false;
       }
-      if (!(tiled || t == Layer::TYPE_COLOR)) { other = true; ok = false; }
-      if (!is2d) { is3d = true; ok = false; }
-      else if (fabsf(m._11 - 1.0f) > 1e-3f || fabsf(m._22 - 1.0f) > 1e-3f) { scaled = true; atOne = false; }
-      if (l->GetMaskLayer() || l->GetAncestorMaskLayerCount() > 0) { masked = true; ok = false; }
-      if (l->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) { blend = true; ok = false; }
-      if (l->GetEffectiveOpacity() < 0.999f) transl = true;
-    },
-    [&](Layer* l) { if (l->GetIsFixedPosition() || l->GetIsStickyPosition()) depth--; });
-  sFrames++;
-  if (!any) sNone++;
-  if (ok && any) { sQualify++; if (atOne) sAtOne++; }
-  if (scaled) sScaled++;
-  if (other) sOther++;
-  if (masked) sMasked++;
-  if (blend) sBlend++;
-  if (is3d) s3d++;
-  if (transl) sTransl++;
-  if ((sFrames % 20) == 0)
-    JIHAD_GPU_LOG("[jihad-gpu] cpu bands census: %u band frames, %u could be composed from the tiles on the CPU (%u at scale 1); scaled %u, not tiled or colour %u, masked %u, blend %u, 3d %u, translucent %u, no layer %u\n",
-                  sFrames, sQualify, sAtOne, sScaled, sOther, sMasked, sBlend, s3d, sTransl, sNone);
+      const RGBDescriptor& rgb = bh->GetBufferDescriptor().get_RGBDescriptor();
+      if ((rgb.format() != gfx::SurfaceFormat::B8G8R8A8 && rgb.format() != gfx::SurfaceFormat::B8G8R8X8) ||
+          rgb.size().width < ts.width || rgb.size().height < ts.height) {
+        aN.tile++; return false;
+      }
+    }
+    aN.tiled++;
+  } else {
+    aN.other++; return false;
+  }
+  JihadCpuLeaf leaf;
+  leaf.layer = aLayer;
+  leaf.clip = gfx::IntRect(clip.x, clip.y, clip.width, clip.height);
+  leaf.tx = itx; leaf.ty = ity;
+  aLeaves.AppendElement(leaf);
+  aN.leaves++;
+  return true;
+}
+
+// premultiplied "over" of n pixels (B8G8R8A8), as the compositor's blend (ONE, ONE_MINUS_SRC_ALPHA)
+static inline void
+JihadCpuOver(uint8_t* d, const uint8_t* s, int n)
+{
+  for (int x = 0; x < n; x++, d += 4, s += 4) {
+    const unsigned a = s[3];
+    if (a == 255) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3]; continue; }
+    if (!a) continue;
+    const unsigned k = 255 - a;
+    d[0] = (uint8_t)(s[0] + (d[0] * k + 127) / 255);
+    d[1] = (uint8_t)(s[1] + (d[1] * k + 127) / 255);
+    d[2] = (uint8_t)(s[2] + (d[2] * k + 127) / 255);
+    d[3] = (uint8_t)(s[3] + (d[3] * k + 127) / 255);
+  }
+}
+
+// the bands drawn into the slot: cleared opaque white as BeginFrame clears the window target (the blank frame the
+// daemon knows, CompositorOGL.cpp), each leaf "over" in paint order (a tile's rows copied, blended when its format
+// carries alpha; a colour layer's bounds filled), the alpha byte then 0xFF as the read forces it (the adapter
+// blits the words raw)
+static void
+JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, const int aBands[2][2], int aW, int aH, JihadCpuCount& aN)
+{
+  uint8_t* dest = aReq->dest;
+  const int stride = aReq->stride;
+  for (int b = 0; b < 2; b++) {
+    const int lo = std::max(0, aBands[b][0]), hi = std::min(aH, aBands[b][1]);
+    if (hi <= lo) continue;
+    const gfx::IntRect band(0, lo, aW, hi - lo);
+    memset(dest + (size_t)lo * stride, 0xFF, (size_t)(hi - lo) * stride);
+    for (size_t k = 0; k < aLeaves.Length(); k++) {
+      const JihadCpuLeaf& lf = aLeaves[k];
+      Layer* l = lf.layer;
+      if (l->GetType() == Layer::TYPE_COLOR) {
+        ColorLayer* cl = l->AsColorLayer();
+        gfx::IntRect r = cl->GetBounds();
+        r.MoveBy(lf.tx, lf.ty);
+        r = r.Intersect(lf.clip).Intersect(band);
+        if (r.IsEmpty()) continue;
+        const gfx::Color c = cl->GetColor();
+        const float a = std::max(0.0f, std::min(1.0f, c.a * l->GetEffectiveOpacity()));
+        uint8_t px[4] = { (uint8_t)lroundf(std::max(0.0f, std::min(1.0f, c.b)) * a * 255.0f),
+                          (uint8_t)lroundf(std::max(0.0f, std::min(1.0f, c.g)) * a * 255.0f),
+                          (uint8_t)lroundf(std::max(0.0f, std::min(1.0f, c.r)) * a * 255.0f),
+                          (uint8_t)lroundf(a * 255.0f) };
+        for (int y = r.y; y < r.YMost(); y++) {
+          uint8_t* d = dest + (size_t)y * stride + (size_t)r.x * 4;
+          if (px[3] == 255) {
+            for (int x = 0; x < r.width; x++, d += 4) { d[0] = px[0]; d[1] = px[1]; d[2] = px[2]; d[3] = px[3]; }
+          } else {
+            for (int x = 0; x < r.width; x++, d += 4) JihadCpuOver(d, px, 1);
+          }
+        }
+        aN.rects++;
+        continue;
+      }
+      TiledContentHost* th = l->AsLayerComposite()->GetCompositableHost()->AsTiledContentHost();
+      TiledLayerBufferComposite& tb = th->JihadTiles();
+      // the region drawn: the valid tiles within the visible region (its bounds when the paint resamples, as
+      // PaintedLayerComposite::RenderLayer decides it from the layer at every composite), as
+      // TiledContentHost::RenderLayerBuffer takes it
+      nsIntRegion region = tb.GetValidRegion();
+      if (l->MayResample()) region.AndWith(l->GetLocalVisibleRegion().GetBounds().ToUnknownRect());
+      else region.AndWith(l->GetLocalVisibleRegion().ToUnknownRegion());
+      // only the tiles under this band are touched (the rest were not checked, review F9)
+      {
+        gfx::IntRect bandLayer = band;
+        bandLayer.MoveBy(-lf.tx, -lf.ty);
+        region.AndWith(bandLayer);
+      }
+      const gfx::IntSize ts = tb.GetTileSize();
+      for (size_t i = 0; i < tb.GetTileCount(); i++) {
+        TileHost& tile = tb.GetTile(i);
+        if (tile.IsPlaceholderTile()) continue;
+        const gfx::IntPoint off = tb.GetTileOffset(tb.GetPlacement().TilePosition(i));
+        nsIntRegion tr(gfx::IntRect(off, tb.GetScaledTileSize()));
+        tr.AndWith(region);
+        if (tr.IsEmpty()) continue;
+        BufferTextureHost* bh = tile.mTextureHost->AsBufferTextureHost();
+        if (!bh || bh->GetBufferDescriptor().type() != BufferDescriptor::TRGBDescriptor) continue;
+        const RGBDescriptor& rgb = bh->GetBufferDescriptor().get_RGBDescriptor();
+        const int sstride = ImageDataSerializer::GetRGBStride(rgb);
+        const uint8_t* src = bh->GetBuffer();
+        const bool alpha = rgb.format() == gfx::SurfaceFormat::B8G8R8A8;
+        bool used = false;
+        for (auto it = tr.RectIter(); !it.Done(); it.Next()) {
+          gfx::IntRect r = it.Get();
+          r.MoveBy(lf.tx, lf.ty);
+          r = r.Intersect(lf.clip).Intersect(band);
+          if (r.IsEmpty()) continue;
+          // the tile's pixel under the frame's (x, y) is (x - tx - off.x, y - ty - off.y)
+          const int sx = r.x - lf.tx - off.x, sy = r.y - lf.ty - off.y;
+          if (sx < 0 || sy < 0 || sx + r.width > ts.width || sy + r.height > ts.height) continue;
+          for (int y = 0; y < r.height; y++) {
+            const uint8_t* s = src + (size_t)(sy + y) * sstride + (size_t)sx * 4;
+            uint8_t* d = dest + (size_t)(r.y + y) * stride + (size_t)r.x * 4;
+            if (alpha) JihadCpuOver(d, s, r.width);
+            else memcpy(d, s, (size_t)r.width * 4);
+          }
+          aN.rects++;
+          used = true;
+        }
+        if (used) aN.tiles++;
+      }
+    }
+    for (int y = lo; y < hi; y++) {
+      uint8_t* p = dest + (size_t)y * stride + 3;
+      for (int x = 0; x < aW; x++, p += 4) *p = 0xFF;
+    }
+  }
+}
+
+// T-505 item 4: the band frame composed on the CPU (JihadCpuCollect, JihadCpuDraw), the tree prepared by the caller
+// (the shadow properties and the async transforms at this frame's scroll, the visible regions and the effective
+// transforms at the frame's world). True when the frame is done this way (*aOk its outcome); false sends it to the
+// GPU band pass, nothing written
+static bool
+JihadCpuBands(JihadFrameRequest* aReq, Layer* aRoot, const int aBands[2][2], int aWidth, int aHeight,
+              CompositorOGL* aOgl, bool* aOk, double* aMsShift, double* aMsDraw)
+{
+  sJihadCpu.frames++;
+  sJihadCpu.leaves = sJihadCpu.tiled = sJihadCpu.colour = sJihadCpu.tiles = sJihadCpu.rects = 0;
+  nsTArray<JihadCpuLeaf> leaves;
+  const bool can = JihadCpuCollect(aRoot, RenderTargetIntRect(0, 0, aWidth, aHeight), true, aBands, aWidth, aHeight, leaves, sJihadCpu);
+  if (!can) { JihadCpuLog(); return false; }
+  sJihadCpu.could++;
+  if (leaves.IsEmpty()) sJihadCpu.none++;
+  // the rows kept, moved first (the GPU pass moves them while its bands compose)
+  bool ok = true;
+  const TimeStamp s0 = TimeStamp::Now();
+  if (aReq->cancelled) ok = false; else aOgl->JihadShiftRowsNow(aReq);   // T-509: given up, dest untouched
+  *aMsShift = (TimeStamp::Now() - s0).ToMilliseconds();
+  const TimeStamp d0 = TimeStamp::Now();
+  if (ok) JihadCpuDraw(aReq, leaves, aBands, aWidth, aHeight, sJihadCpu);
+  if (ok && aReq->cancelled) ok = false;
+  *aMsDraw = (TimeStamp::Now() - d0).ToMilliseconds();
+  sJihadCpu.cpu++;
+  JihadCpuLog();
+  *aOk = ok;
+  return true;
 }
 
 // T-544: the frame's fixed and stuck rects (the last JihadUpdateLastFixed's) out to the daemon
@@ -2472,15 +2719,62 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       // other, read ONCE into the compositor's scratch rows and split from there: a glReadPixels
       // call costs ~4 ms of its own on this driver, whatever the rows.
       const int bands[2][2] = { {aReq->lo, aReq->hi}, {aReq->lo2, aReq->hi2} };
-      if (jPartsPrepped) JihadCpuBandCensus(mLayerManager->GetRoot(), bands, aWidth, aHeight);   // T-505 item 4: a count
       int hs[2] = {0, 0}, top = 0;
       for (int b = 0; b < 2; b++) { const int lo = std::max(0, bands[b][0]), hi = std::min(aHeight, bands[b][1]); hs[b] = hi > lo ? hi - lo : 0; top += hs[b]; }
       const int fullRows = hs[0] + hs[1];   // read whole; the chunks under them only in their columns
       top += chunkRows;
+      const TimeStamp tp0 = TimeStamp::Now();
+      bool ok = top > 0 && top <= bandMax;
+      double msBegin = 0, msCompose = 0, msRead = 0, msShift = 0, msEnd = 0;
+      int passRows = 0;
+      // T-517: the bands and the column chunks as regions of one frame (LayerManagerComposite::
+      // JihadSetRegions); JIHAD_GPU_PASS_PER_REGION=1 composes each on its own, as before
+      static const bool sPassPerRegion = getenv("JIHAD_GPU_PASS_PER_REGION") != nullptr;
+      // T-505 item 4: the bands composed on the CPU from the tiles when every layer under them allows it
+      // (JIHAD_GPU_CPU_BANDS=1, JihadCpuBands above: a frame of full-width bands alone, no column chunks); the GPU
+      // band pass otherwise, as before
+      bool cpuDone = false;
+      double msCpuPrep = 0, msCpuDraw = 0;
+      if (ok && JihadCpuBandsWanted() && !aReq->verify && nChunks == 0 && aReq->nCols == 0 && !sPassPerRegion &&
+          mCompositionManager && mLayerManager->GetRoot()) {
+        const TimeStamp p0 = TimeStamp::Now();
+        // the composite's steps before its render (CompositeToTarget's, as JihadDiffNow takes them): the shadow
+        // properties from the layers, the async transforms at this frame's scroll, the parts hidden for a frame
+        // without them, then the visible regions, the effective transforms at the frame's world and the tree
+        // diff — taken and dropped as a band composite takes it (UpdateAndRender computes the differences
+        // whatever it draws), which re-clones the diff's baseline at this frame's state: left at an older
+        // frame's, the next diff-first frame measured the scroll of several frames as its shift and recorded
+        // the frame rows off (the first verify round, 2026-11-04: 22 wrong frames in both lanes)
+        Layer* root = mLayerManager->GetRoot();
+        mLayerManager->BeginTransaction();
+        SetShadowProperties(root);
+        mCompositionManager->ComputeRotation();
+        // the animations' clock as a composite sets it (the scheduler's, as ForceComposeToTarget notes it first:
+        // sampled from an older composite's instant the next frame would rewind them, review F4)
+        mCompositorScheduler->JihadNoteCompose();
+        const TimeStamp time = mIsTesting ? mTestTime : mCompositorScheduler->GetLastComposeTime();
+        const bool nextFrame = mCompositionManager->TransformShadowTree(time, mVsyncRate);
+        if (sJihadContentOnly) JihadHideForJob();
+        mLayerManager->JihadDiffOnly();
+        mLayerManager->JihadEndTransactionNoComposite();
+        bool cpuOk = false;
+        cpuDone = JihadCpuBands(aReq, root, bands, aWidth, aHeight, ogl, &cpuOk, &msShift, &msCpuDraw);
+        msCpuPrep = (TimeStamp::Now() - p0).ToMilliseconds() - msShift - msCpuDraw;
+        if (cpuDone) {
+          ok = cpuOk;
+          // a composite's bookkeeping: the next frame asked when an animation moved or a composite-until time
+          // stands (CompositeToTarget's tail); the content side told its transaction is composed (its paints wait
+          // for that)
+          if (nextFrame) { JihadReqNote("the next frame asked (an animation), a CPU band frame"); ScheduleComposition(); }
+          else if (!mCompositor->GetCompositeUntilTime().IsNull()) { JihadReqNote("composite until, a CPU band frame"); ScheduleComposition(); }
+          TimeStamp now = TimeStamp::Now();
+          DidComposite(now, now);
+        }
+      }
+      if (!cpuDone) {
       // the band pass: its own small surface and target when available (round 106), else the
       // stack at the top of the frame-sized target (round 105)
-      const TimeStamp tp0 = TimeStamp::Now();
-      const int passRows = top > 0 ? ogl->JihadBeginBandPass(aWidth, top) : 0;   // T-527: the band surface or the tall one
+      passRows = top > 0 ? ogl->JihadBeginBandPass(aWidth, top) : 0;   // T-527: the band surface or the tall one
       if (!passRows) {
         // T-513 (review): stacked at the top of the frame-sized target, so the frame's own surface
         // current (a band frame before this one left the band pbuffer current, and on the Adreno 220
@@ -2488,15 +2782,9 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
         ogl->JihadUseFrameSurface();
         ogl->JihadEnsureTargetSize(aWidth, aHeight);
       }
-      const double msBegin = (TimeStamp::Now() - tp0).ToMilliseconds();
+      msBegin = (TimeStamp::Now() - tp0).ToMilliseconds();
       const gfx::IntRect passBounds = passRows ? gfx::IntRect(0, 0, aWidth, passRows) : whole;
-      bool ok = top > 0 && top <= bandMax;
-      TimeStamp tb0 = TimeStamp::Now();
-      double msCompose = 0, msRead = 0, msShift = 0;
       int at = 0;
-      // T-517: the bands and the column chunks as regions of one frame (LayerManagerComposite::
-      // JihadSetRegions); JIHAD_GPU_PASS_PER_REGION=1 composes each on its own, as before
-      static const bool sPassPerRegion = getenv("JIHAD_GPU_PASS_PER_REGION") != nullptr;
       if (!sPassPerRegion && ok) {
         gfx::Matrix4x4 worlds[12];
         gfx::IntRect rects[12];
@@ -2608,13 +2896,14 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       }
       const TimeStamp te0 = TimeStamp::Now();
       if (passRows) ogl->JihadEndBandPass();
-      const double msEnd = (TimeStamp::Now() - te0).ToMilliseconds();
+      msEnd = (TimeStamp::Now() - te0).ToMilliseconds();
+      }   // the GPU band pass
       const double msEntry = (tp0 - tEntry).ToMilliseconds();
       mLayerManager->JihadIgnoreDiff(false);
       mLayerManager->JihadSetWorldTransform(world);
       mLayerManager->UpdateRenderBounds(whole);
       mLayerManager->JihadSetBand(gfx::IntRect(), gfx::IntRect());
-      ogl->JihadSelectTarget();
+      if (!cpuDone) ogl->JihadSelectTarget();
       aReq->invLo = diffFirst ? dfInvLo : 0; aReq->invHi = diffFirst ? dfInvHi : 0;
       aReq->invX0 = diffFirst ? dfInvX0 : 0; aReq->invX1 = diffFirst ? dfInvX1 : 0;   // T-511
       aReq->scrollOnly = !diffFirst;
@@ -2657,8 +2946,14 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
       aReq->ok = ok;
       static uint32_t sBandFrames = 0;
       if (sBandFrames < 12 || (sBandFrames % 10) == 0) {
-        JIHAD_GPU_LOG("[jihad-gpu] compositor thread: band frame %u: rows %d..%d and %d..%d, x %d..%d, %d columns in %d chunks (%d rows), %d kept, entry %.1f ms, surface in %.1f ms, compose %.1f ms, shift %.1f ms, read %.1f ms, surface out %.1f ms, all %.1f ms, ok=%d\n",
-                sBandFrames, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->readX0, aReq->readX1 ? aReq->readX1 : aWidth, aReq->nCols, nChunks, chunkRows, aReq->nKeep, msEntry, msBegin, msCompose, msShift, msRead, msEnd, (TimeStamp::Now() - tEntry).ToMilliseconds(), (int)ok);
+        if (cpuDone) {
+          JIHAD_GPU_LOG("[jihad-gpu] compositor thread: cpu band frame %u: rows %d..%d and %d..%d, %d leaves (%d tiled, %d colour), %d tiles, %d rects, %d kept, entry %.1f ms, prep %.1f ms, shift %.1f ms, draw %.1f ms, all %.1f ms, ok=%d\n",
+                  sBandFrames, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, sJihadCpu.leaves, sJihadCpu.tiled, sJihadCpu.colour, sJihadCpu.tiles, sJihadCpu.rects,
+                  aReq->nKeep, msEntry, msCpuPrep, msShift, msCpuDraw, (TimeStamp::Now() - tEntry).ToMilliseconds(), (int)ok);
+        } else {
+          JIHAD_GPU_LOG("[jihad-gpu] compositor thread: band frame %u: rows %d..%d and %d..%d, x %d..%d, %d columns in %d chunks (%d rows), %d kept, entry %.1f ms, surface in %.1f ms, compose %.1f ms, shift %.1f ms, read %.1f ms, surface out %.1f ms, all %.1f ms, ok=%d\n",
+                  sBandFrames, aReq->lo, aReq->hi, aReq->lo2, aReq->hi2, aReq->readX0, aReq->readX1 ? aReq->readX1 : aWidth, aReq->nCols, nChunks, chunkRows, aReq->nKeep, msEntry, msBegin, msCompose, msShift, msRead, msEnd, (TimeStamp::Now() - tEntry).ToMilliseconds(), (int)ok);
+        }
       }
       ++sBandFrames;
       aReq->done(aReq);

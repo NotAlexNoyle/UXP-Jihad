@@ -112,6 +112,9 @@ public:
   void ForceComposeToTarget(gfx::DrawTarget* aTarget, const gfx::IntRect* aRect);
   // Jihad T-502 (pull mode): composites asked for and not run; the daemon pulls a frame when it moves.
   uint32_t JihadRequests() const { return mJihadRequests; }
+  // Jihad T-505 item 4: a band frame composed on the CPU counts as a composite for the animations' clock (what
+  // ForceComposeToTarget sets before its composite; the next frame samples them from here)
+  void JihadNoteCompose() { mLastCompose = TimeStamp::Now(); }
 
   const TimeStamp& GetLastComposeTime()
   {

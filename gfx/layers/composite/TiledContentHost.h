@@ -242,6 +242,12 @@ public:
 
   virtual TiledContentHost* AsTiledContentHost() override { return this; }
 
+  // Jihad T-505 item 4: the tiles as held, for the band frames composed on the CPU from their buffers
+  // (CompositorBridgeParent's JihadCpuBands): the high-precision buffer, and the low-precision one (drawn under it
+  // when it holds tiles: such a frame stays on the GPU)
+  TiledLayerBufferComposite& JihadTiles() { return mTiledBuffer; }
+  const TiledLayerBufferComposite& JihadLowResTiles() const { return mLowPrecisionTiledBuffer; }
+
   virtual void Attach(Layer* aLayer,
                       Compositor* aCompositor,
                       AttachFlags aFlags = NO_FLAGS) override;
