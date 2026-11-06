@@ -528,6 +528,9 @@ public:
   // compositor thread: compose to the window (the pbuffer / renderbuffer) and read it into
   // aDest (B8G8R8A8, aStride bytes a row, the top-left aWidth x aHeight of the frame).
   uint32_t JihadRequests() const;
+  // T-576: the last composite's animations want another frame
+  bool JihadAnimating() const { return mJihadAnimating; }
+  mozilla::Atomic<bool> mJihadAnimating;
   // Reads back rows [aRowLo, aRowHi) (0,0 = none asked for) joined with the rows the composite
   // changed, which it reports in aInvLo/aInvHi (0,0 = nothing changed).
   // Composes into the free window target and hands the read of rows [aReq->lo, aReq->hi)

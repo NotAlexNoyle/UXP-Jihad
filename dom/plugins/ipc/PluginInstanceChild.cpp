@@ -86,6 +86,15 @@ enum {
     kJihadShowSites
 };
 static uint32_t gJihadShowFrom[kJihadShowSites];
+// The frame's three parts, summed between the 2 s reports (the `per draw` line)
+static uint32_t gJihadPumpUs = 0, gJihadDrawUs = 0, gJihadShowUs = 0;
+// A draw is posted on this thread's loop: the pump stops, or the player runs its next frame first
+// and this one is never drawn
+static bool gJihadDrawPosted = false;
+// When the plugin last asked for a draw itself: the pump's short period is for a movie that plays
+static uint32_t gJihadSelfInvalMs = 0;
+// When the last frame went to the parent (AsyncShowPluginFrame's floor)
+static uint32_t gJihadLastDrawMs = 0;
 static const char* const kJihadShowNames[kJihadShowSites] = {
     "setwin", "hostinval", "plugininval", "retry", "bgupd", "bgtail", "bgdestroy"
 };
@@ -256,6 +265,8 @@ PluginInstanceChild::PluginInstanceChild(const NPPluginFuncs* aPluginIface,
     , mDoAlphaExtraction(false)
     , mHasPainted(false)
     , mSurfaceDifferenceRect(0,0,0,0)
+    , mJihadShowsInFlight(0)
+    , mJihadShowOwed(false)
     , mDestroyed(false)
 #ifdef XP_WIN
     , mLastKeyEventConsumed(false)
@@ -4039,7 +4050,7 @@ JihadPumpGlib(int aMaxIterations)
         return 0;
     }
     int n = 0;
-    while (n < aMaxIterations) {
+    while (n < aMaxIterations && !gJihadDrawPosted) {
         if (sPending && !sPending(nullptr)) {
             break;
         }
@@ -4201,6 +4212,17 @@ static bool JihadHostIsDrivingFrames()
 }
 
 bool
+PluginInstanceChild::RecvJihadShowDone()
+{
+    mJihadShowsInFlight--;
+    if (mJihadShowOwed) {
+        mJihadShowOwed = false;
+        AsyncShowPluginFrame();
+    }
+    return true;
+}
+
+bool
 PluginInstanceChild::RecvJihadRequestFrame()
 {
     sJihadEverHostDriven = true;
@@ -4258,9 +4280,16 @@ public:
             fflush(stderr);
         }
 
+        // The pump is the player's clock: a frame's timer fires only when the pump next runs, and
+        // this delay starts when the frame's work ended. 16 ms after 20 ms of work caps a movie at
+        // 27 frames a second however fast it could go (Bloxorz, 36 fps, 2026-11-06). While a movie
+        // plays the delay is short; a still one wakes as seldom as before.
+        static const int sPlayingMs = getenv("JIHAD_PLUGIN_PUMP_MS") ? atoi(getenv("JIHAD_PLUGIN_PUMP_MS")) : 4;
+        const uint32_t pumpNowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        const bool playing = gJihadSelfInvalMs && (pumpNowMs - gJihadSelfInvalMs) < 250;
         MessageLoop::current()->PostDelayedTask(
             RefPtr<Runnable>(new JihadGlibPumpTask()).forget(),
-            kJihadGlibPumpIntervalMs);
+            playing ? sPlayingMs : kJihadGlibPumpIntervalMs);
         return NS_OK;
     }
 };
@@ -4303,6 +4332,7 @@ JihadStartGlibPump(PluginInstanceChild* aInstance)
 //
 // The context is cached per (buffer,size) because a plugin repaints constantly and both
 // objects would otherwise leak once per frame.
+
 static void*
 JihadPiranhaContextFor(unsigned char* aData, int aWidth, int aHeight, int aStride)
 {
@@ -4555,10 +4585,16 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
 
             // Let the plugin's own scheduled work run before we ask it to draw, so the
             // frame it paints is current rather than whatever it had at instantiation.
-            JihadPumpGlib(50);
+            {
+                PRIntervalTime t0 = PR_IntervalNow();
+                JihadPumpGlib(50);
+                gJihadPumpUs += PR_IntervalToMicroseconds(PR_IntervalNow() - t0);
+            }
 
+            PRIntervalTime drawT0 = PR_IntervalNow();
             int16_t handled = mPluginIface->event
                 ? mPluginIface->event(&mData, reinterpret_cast<void*>(&ev)) : -1;
+            gJihadDrawUs += PR_IntervalToMicroseconds(PR_IntervalNow() - drawT0);
             gJihadPalmDrawEvents++;
 
             static int sLogged = 0;
@@ -4577,6 +4613,12 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
                     fprintf(stderr, "[jihad-npapi-child] palm draw: %u in %ums (%.1f fps)\n",
                             sDraws, nowMs - sLastReport,
                             sDraws * 1000.0 / double(nowMs - sLastReport));
+                    // WHERE A FRAME'S TIME GOES, per draw: the pump before it, the plugin's draw,
+                    // the wait in the synchronous Show. Whatever is left of the period is the
+                    // plugin's own work between draws, or the loop idle
+                    fprintf(stderr, "[jihad-npapi-child]   per draw: pump %u us, draw %u us, show %u us\n",
+                            gJihadPumpUs / sDraws, gJihadDrawUs / sDraws, gJihadShowUs / sDraws);
+                    gJihadPumpUs = gJihadDrawUs = gJihadShowUs = 0;
                     // WHICH SITE ASKED FOR THOSE DRAWS. These are requests to draw, not draws:
                     // AsyncShowPluginFrame coalesces while an invalidate task is already pending,
                     // so the sum is an UPPER bound on sDraws and the interesting number is the
@@ -4851,6 +4893,15 @@ PluginInstanceChild::ShowPluginFrame()
         return true;
     }
 
+    // A FRAME STILL IN FLIGHT HOLDS ITS SURFACE (JihadShow). Two surfaces take turns, so with one
+    // frame in flight the current surface is free; with two, or one and no second surface, the
+    // surface about to be drawn may still be read by the parent. Nothing blocks: the damage stays
+    // accumulated, the newest pixels are drawn when the parent answers.
+    if (mJihadShowsInFlight > 1 || (mJihadShowsInFlight == 1 && !mBackSurface)) {
+        mJihadShowOwed = true;
+        return true;
+    }
+
     if (!EnsureCurrentBuffer()) {
         return false;
     }
@@ -5034,9 +5085,24 @@ PluginInstanceChild::ShowPluginFrame()
     // Unused, except to possibly return a shmem to us
     SurfaceDescriptor returnSurf;
 
-    if (!SendShow(r, currSurf, &returnSurf)) {
-        return false;
+    // Measured 2026-11-06, Bloxorz: Flash's work 27 ms a frame, the draw 2 ms, the synchronous Show
+    // 14-17 ms, nearly all of it waiting for the daemon's main thread. 50 ms a frame, where the
+    // stock browser takes 33. So the frame goes without the wait; $JIHAD_PLUGIN_SYNC_SHOW=1 for an
+    // A/B run.
+    static const bool sSyncShow = getenv("JIHAD_PLUGIN_SYNC_SHOW") && atoi(getenv("JIHAD_PLUGIN_SYNC_SHOW"));
+    PRIntervalTime showT0 = PR_IntervalNow();
+    if (sSyncShow) {
+        if (!SendShow(r, currSurf, &returnSurf)) {
+            return false;
+        }
+    } else {
+        if (!SendJihadShow(r, currSurf)) {
+            return false;
+        }
+        mJihadShowsInFlight++;
+        gJihadLastDrawMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
     }
+    gJihadShowUs += PR_IntervalToMicroseconds(PR_IntervalNow() - showT0);
 
     SwapSurfaces();
     mSurfaceDifferenceRect = rect;
@@ -5098,6 +5164,7 @@ PluginInstanceChild::InvalidateRectDelayed(void)
     }
 
     mCurrentInvalidateTask = nullptr;
+    gJihadDrawPosted = false;
     if (mAccumulatedInvalidRect.IsEmpty()) {
         return;
     }
@@ -5125,7 +5192,19 @@ PluginInstanceChild::AsyncShowPluginFrame(void)
     mCurrentInvalidateTask =
         NewNonOwningCancelableRunnableMethod(this, &PluginInstanceChild::InvalidateRectDelayed);
     RefPtr<Runnable> addrefedTask = mCurrentInvalidateTask;
+    // A FLOOR BETWEEN DRAWS. The card shows some 30 frames a second, the most the stock browser reached
+    // on any title is 32. A movie running faster (Bubble Tanks, 55 fps) had each frame drawn and copied
+    // twice, 50 a second, 11 ms of CPU each, on a device with none spare: the card fell to 24 where the
+    // stock browser holds 32. The movie's own clock is not touched, and the pump goes on meanwhile.
+    static const int sFloorMs = getenv("JIHAD_PLUGIN_DRAW_MS") ? atoi(getenv("JIHAD_PLUGIN_DRAW_MS")) : 28;
+    const uint32_t drawNowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+    const uint32_t sinceDraw = drawNowMs - gJihadLastDrawMs;
+    if (sFloorMs > 0 && gJihadLastDrawMs && sinceDraw < uint32_t(sFloorMs)) {
+        MessageLoop::current()->PostDelayedTask(addrefedTask.forget(), sFloorMs - sinceDraw);
+        return;
+    }
     MessageLoop::current()->PostTask(addrefedTask.forget());
+    gJihadDrawPosted = true;
 }
 
 void
@@ -5159,6 +5238,9 @@ PluginInstanceChild::InvalidateRect(NPRect* aInvalidRect)
         // accumulated rectangle
         gJihadShowFrom[sJihadInHostRepaint ? kJihadShowInvalidate
                                           : kJihadShowPluginSelf]++;
+        if (!sJihadInHostRepaint) {
+            gJihadSelfInvalMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        }
         AsyncShowPluginFrame();
         return;
     }
@@ -5484,6 +5566,7 @@ PluginInstanceChild::Destroy()
     if (mCurrentInvalidateTask) {
         mCurrentInvalidateTask->Cancel();
         mCurrentInvalidateTask = nullptr;
+        gJihadDrawPosted = false;
     }
     if (mCurrentAsyncSetWindowTask) {
         mCurrentAsyncSetWindowTask->Cancel();

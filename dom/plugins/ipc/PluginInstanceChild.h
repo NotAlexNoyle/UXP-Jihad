@@ -146,6 +146,9 @@ protected:
     RecvJihadRequestFrame() override;
 
     virtual bool
+    RecvJihadShowDone() override;
+
+    virtual bool
     AnswerNPP_Destroy(NPError* result) override;
 
     virtual PPluginScriptableObjectChild*
@@ -695,6 +698,10 @@ private:
     // Used for reading back to current surface and syncing data,
     // in plugin coordinates.
     nsIntRect mSurfaceDifferenceRect;
+
+    // JihadShow: frames sent the parent has not answered, and a draw that waits for its answer
+    int mJihadShowsInFlight;
+    bool mJihadShowOwed;
 
     // Has this instance been destroyed, either by ActorDestroy or NPP_Destroy?
     bool mDestroyed;

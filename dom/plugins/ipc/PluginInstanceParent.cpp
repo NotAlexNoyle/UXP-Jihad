@@ -984,6 +984,95 @@ MOZ_EXPORT int jihad_plugin_request_frame(void)
 }
 }
 
+
+static uint32_t gJihadRecvShowUs = 0;
+
+// THE PLUGIN LANE (T-576): while it is open the card takes the plugin's frames from here, and the plugin
+// marks nothing damaged. So any damage is the page's, even inside the plugin's rect: an element laid
+// exactly over the movie looks like the movie's own damage otherwise, and the lane drew over it.
+static bool gJihadLaneOpen = false;
+
+extern "C" MOZ_EXPORT void
+jihad_plugin_lane_set(int aOpen)
+{
+    gJihadLaneOpen = aOpen != 0;
+    if (!aOpen) {
+        PluginInstanceParent::JihadLaneClosed();
+    }
+}
+
+// The layer's image is the newest, but nothing has told the layer: the next paint of the page draws it
+void
+PluginInstanceParent::JihadLaneClosed()
+{
+    if (!gJihadLiveInstances) {
+        return;
+    }
+    nsTArray<PluginInstanceParent*> snap(*gJihadLiveInstances);
+    for (uint32_t i = 0; i < snap.Length(); i++) {
+        if (!gJihadLiveInstances->Contains(snap[i]) || !snap[i]->mJihadLastFrame) {
+            continue;
+        }
+        const IntSize size = snap[i]->mJihadLastFrame->GetSize();
+        NPRect r = { 0, 0, (uint16_t)size.height, (uint16_t)size.width };
+        snap[i]->RecvNPN_InvalidateRect(r);
+    }
+}
+
+// THE PLUGIN LANE's source (T-576): the newest frame of the page's one live plugin, opaque ones only.
+// aDest null: is there one, how big. The X byte comes out as alpha 255, which the card's raw blit needs.
+bool
+PluginInstanceParent::JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
+                                    int* aFullW, int* aFullH)
+{
+    if (!gJihadLiveInstances || gJihadLiveInstances->Length() != 1) {
+        return false;
+    }
+    RefPtr<gfx::DataSourceSurface> frame = (*gJihadLiveInstances)[0]->mJihadLastFrame;
+    if (!frame) {
+        return false;
+    }
+    const IntSize size = frame->GetSize();
+    if (aFullW) *aFullW = size.width;
+    if (aFullH) *aFullH = size.height;
+    if (!aDest) {
+        return true;
+    }
+    if (aX < 0 || aY < 0 || aW <= 0 || aH <= 0 || aX + aW > size.width || aY + aH > size.height) {
+        return false;
+    }
+    gfx::DataSourceSurface::ScopedMap map(frame, gfx::DataSourceSurface::READ);
+    if (!map.IsMapped()) {
+        return false;
+    }
+    for (int y = 0; y < aH; y++) {
+        const uint32_t* s = reinterpret_cast<const uint32_t*>(map.GetData() + (ptrdiff_t)(aY + y) * map.GetStride()) + aX;
+        uint32_t* d = reinterpret_cast<uint32_t*>(aDest + (ptrdiff_t)y * aDestStride);
+        for (int x = 0; x < aW; x++) {
+            d[x] = s[x] | 0xff000000u;
+        }
+    }
+    return true;
+}
+
+extern "C" MOZ_EXPORT int
+jihad_plugin_lane_copy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
+                       int* aFullW, int* aFullH)
+{
+    return PluginInstanceParent::JihadLaneCopy(aDest, aDestStride, aX, aY, aW, aH, aFullW, aFullH) ? 1 : 0;
+}
+
+bool
+PluginInstanceParent::RecvJihadShow(const NPRect& updatedRect,
+                                    const SurfaceDescriptor& newSurface)
+{
+    SurfaceDescriptor prevSurface;
+    if (!RecvShow(updatedRect, newSurface, &prevSurface)) {
+        return false;
+    }
+    return SendJihadShowDone();
+}
+
 bool
 PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                                const SurfaceDescriptor& newSurface,
@@ -997,6 +1086,11 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
 
     MOZ_ASSERT(!IsUsingDirectDrawing());
 
+    // The handling's own time: what the child's blocked Show pays once this thread gets to it
+    struct JihadRecvShowTimer {
+        PRIntervalTime t0 = PR_IntervalNow();
+        ~JihadRecvShowTimer() { gJihadRecvShowUs += PR_IntervalToMicroseconds(PR_IntervalNow() - t0); }
+    } jihadTimer;
     // FRAME-RATE READOUT, parent side. Paired with the child's `palm draw:` line: the child
     // reports how often the plugin was ASKED to draw, this reports how many of those frames
     // actually crossed the process boundary. A gap between the two numbers is the difference
@@ -1009,12 +1103,14 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
         if (!sLastReport) {
             sLastReport = nowMs;
         } else if (nowMs - sLastReport >= 2000) {
-            fprintf(stderr, "[jihad-npapi] RecvShow: %u in %ums (%.1f fps)\n",
+            fprintf(stderr, "[jihad-npapi] RecvShow: %u in %ums (%.1f fps), %u us each\n",
                     sShows, nowMs - sLastReport,
-                    sShows * 1000.0 / double(nowMs - sLastReport));
+                    sShows * 1000.0 / double(nowMs - sLastReport),
+                    gJihadRecvShowUs / sShows);
             fflush(stderr);
             sShows = 0;
             sLastReport = nowMs;
+            gJihadRecvShowUs = 0;
         }
     }
 
@@ -1137,8 +1233,12 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
             const bool srcHasAlpha =
                 srcFmt != SurfaceFormat::B8G8R8X8 &&
                 srcFmt != SurfaceFormat::R8G8B8X8;
+            // 2026-11-06: an opaque source keeps an opaque format. As B8G8R8A8 with its alpha forced
+            // the frame was BLENDED over a white fill, pixel by pixel, 165000 of them at Bloxorz's
+            // size; cairo draws B8G8R8X8 as a plain copy, and takes no alpha from the X byte.
             RefPtr<gfx::DataSourceSurface> copy =
-                gfx::Factory::CreateDataSourceSurface(ssize, SurfaceFormat::B8G8R8A8);
+                gfx::Factory::CreateDataSourceSurface(ssize, srcHasAlpha ? SurfaceFormat::B8G8R8A8
+                                                                         : SurfaceFormat::B8G8R8X8);
             if (copy) {
                 gfx::DataSourceSurface::ScopedMap dstMap(copy, gfx::DataSourceSurface::WRITE);
                 if (dstMap.IsMapped()) {
@@ -1147,13 +1247,9 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                         uint8_t* dstRow = dstMap.GetData() + (ptrdiff_t)y * dstMap.GetStride();
                         memcpy(dstRow, imgSurf->Data() + (ptrdiff_t)y * imgSurf->Stride(),
                                rowBytes);
-                        if (!srcHasAlpha) {
-                            for (int32_t x = 0; x < ssize.width; x++) {
-                                dstRow[x * 4 + 3] = 0xff;  // BGRA: byte 3 is alpha
-                            }
-                        }
                     }
                     image = new SourceSurfaceImage(ssize, copy);
+                    mJihadLastFrame = srcHasAlpha ? nullptr : copy;
                 }
             }
         }
@@ -1189,7 +1285,9 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     // never had to choose: it pulls the plugin synchronously inside the page paint, so it is
     // 1:1 by construction. This counter is what lets the daemon be 1:1 too.
     ++gJihadPluginFrameSeq;
-    RecvNPN_InvalidateRect(updatedRect);
+    if (!gJihadLaneOpen) {
+        RecvNPN_InvalidateRect(updatedRect);
+    }
 
     PLUGIN_LOG_DEBUG(("   (RecvShow invalidated for surface %p)",
                       mFrontSurface.get()));

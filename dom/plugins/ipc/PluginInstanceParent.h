@@ -28,6 +28,7 @@
 #include "mozilla/EventForwards.h"
 
 class gfxASurface;
+namespace mozilla { namespace gfx { class DataSourceSurface; } }
 class gfxContext;
 class nsPluginInstanceOwner;
 
@@ -46,6 +47,7 @@ class D3D11SurfaceHolder;
 class PluginInstanceParent : public PPluginInstanceParent
                            , public PluginDataResolver
 {
+    RefPtr<mozilla::gfx::DataSourceSurface> mJihadLastFrame;
     friend class PluginModuleParent;
     friend class BrowserStreamParent;
     friend class PluginStreamParent;
@@ -201,6 +203,15 @@ public:
 #endif
 
     // Async rendering
+    virtual bool
+    RecvJihadShow(const NPRect& updatedRect,
+                  const SurfaceDescriptor& newSurface) override;
+
+    // The plugin lane: the one live instance's newest opaque frame (jihad_plugin_lane_copy)
+    static bool JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
+                              int* aFullW, int* aFullH);
+    static void JihadLaneClosed();
+
     virtual bool
     RecvShow(const NPRect& updatedRect,
              const SurfaceDescriptor& newSurface,

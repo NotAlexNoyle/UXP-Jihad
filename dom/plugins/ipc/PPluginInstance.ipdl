@@ -148,6 +148,9 @@ child:
   // mCurrentInvalidateTask, so an extra request while one is in flight is a no-op.
   async JihadRequestFrame();
 
+  // The parent has taken its copy of a frame sent by JihadShow: that surface is the child's again.
+  async JihadShowDone();
+
   // ********************** Async plugins rendering
   // see https://wiki.mozilla.org/Gecko:AsyncPluginPainting
   // **********************
@@ -266,6 +269,10 @@ parent:
   // @param newSurface - remotable surface
   // @param prevSurface - if the previous surface was shared-memory, returns
   //                      the shmem for reuse
+  // Show without the wait: the player's thread goes on while the parent's main thread gets to the
+  // frame. Answered by JihadShowDone.
+  async JihadShow(NPRect updatedRect, SurfaceDescriptor newSurface);
+
   sync Show(NPRect updatedRect, SurfaceDescriptor newSurface)
     returns (SurfaceDescriptor prevSurface);
 #ifdef MOZ_ENABLE_NPAPI

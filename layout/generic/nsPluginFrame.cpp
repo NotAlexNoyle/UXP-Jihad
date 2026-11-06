@@ -34,6 +34,7 @@
 #include "nsIObjectLoadingContent.h"
 #include "nsContentUtils.h"
 #include "nsDisplayList.h"
+#include "nsIDocShell.h"
 #include "nsFocusManager.h"
 #include "nsLayoutUtils.h"
 #include "nsFrameManager.h"
@@ -1759,3 +1760,94 @@ nsPluginFrame::IsPaintedByGecko() const
 }
 
 NS_IMPL_FRAMEARENA_HELPERS(nsPluginFrame)
+
+// THE PLUGIN LANE's proof (T-576): the frame of the page's plugin can go straight into the card's
+// buffer only if the plugin is what shows in its whole rect. 1: it is. 0: no plugin drawn. -1: an
+// item is painted over it. -2: it lies under an effect or a clip of its own. -3: more than one.
+namespace {
+struct JihadLaneWalk {
+  int plugins = 0;
+  bool covered = false;
+  bool tainted = false;
+  nsRect bounds;
+  nsRect view;
+};
+} // namespace
+
+static void
+JihadLaneScan(nsDisplayListBuilder* aBuilder, nsDisplayList* aList, JihadLaneWalk& aWalk, bool aEffect)
+{
+  for (nsDisplayItem* i = aList->GetBottom(); i; i = i->GetAbove()) {
+    const nsDisplayItem::Type t = i->GetType();
+    bool snap = false;
+    if (t == nsDisplayItem::TYPE_PLUGIN) {
+      aWalk.plugins++;
+      aWalk.bounds = i->GetBounds(aBuilder, &snap);
+      if (aEffect) {
+        aWalk.tainted = true;
+      }
+      // The root scroll frame clips everything to the view, which the overscan rows go past
+      // and are right to. A clip inside the view is the page's own.
+      const DisplayItemClip& clip = i->GetClip();
+      if (clip.HasClip() &&
+          (clip.GetRoundedRectCount() > 0 ||
+           !clip.GetClipRect().Contains(aWalk.bounds.Intersect(aWalk.view)))) {
+        aWalk.tainted = true;
+      }
+      continue;
+    }
+    if (nsDisplayList* kids = i->GetChildren()) {
+      const bool effect = t == nsDisplayItem::TYPE_OPACITY || t == nsDisplayItem::TYPE_TRANSFORM ||
+                          t == nsDisplayItem::TYPE_PERSPECTIVE || t == nsDisplayItem::TYPE_MASK ||
+                          t == nsDisplayItem::TYPE_FILTER || t == nsDisplayItem::TYPE_BLEND_MODE;
+      JihadLaneScan(aBuilder, kids, aWalk, aEffect || effect);
+      continue;
+    }
+    // These paint nothing
+    if (t == nsDisplayItem::TYPE_LAYER_EVENT_REGIONS || t == nsDisplayItem::TYPE_SCROLL_INFO_LAYER ||
+        t == nsDisplayItem::TYPE_EVENT_RECEIVER) {
+      continue;
+    }
+    // A text item's bounds are its font's box, not its ink: the line right under a movie reaches
+    // into it by a few pixels and draws nothing there
+    nsRect itemBounds = i->GetBounds(aBuilder, &snap);
+    if (t == nsDisplayItem::TYPE_TEXT) {
+      itemBounds.Deflate(0, itemBounds.height / 4);
+    }
+    if (aWalk.plugins && !itemBounds.Intersect(aWalk.bounds).IsEmpty()) {
+      aWalk.covered = true;
+      static int sLog = 0;
+      if (sLog++ < 8) {
+        fprintf(stderr, "[jihad-npapi] lane: over the plugin: %s\n", i->Name());
+      }
+    }
+  }
+}
+
+extern "C" MOZ_EXPORT int
+jihad_plugin_lane_proof(nsIDocShell* aDocShell)
+{
+  nsCOMPtr<nsIPresShell> shell = aDocShell ? aDocShell->GetPresShell() : nullptr;
+  if (!shell) {
+    return 0;
+  }
+  shell->FlushPendingNotifications(Flush_Layout);
+  nsIFrame* root = shell->GetRootFrame();
+  if (!root) {
+    return 0;
+  }
+  nsDisplayListBuilder builder(root, nsDisplayListBuilderMode::PAINTING, false);
+  nsDisplayList list;
+  JihadLaneWalk walk;
+  walk.view = root->GetRect();
+  builder.EnterPresShell(root);
+  builder.SetDirtyRect(root->GetVisualOverflowRectRelativeToSelf());
+  root->BuildDisplayListForStackingContext(&builder, &list);
+  builder.LeavePresShell(root, nullptr);
+  JihadLaneScan(&builder, &list, walk, false);
+  list.DeleteAll();
+  if (walk.plugins == 0) return 0;
+  if (walk.plugins > 1) return -3;
+  if (walk.tainted) return -2;
+  return walk.covered ? -1 : 1;
+}

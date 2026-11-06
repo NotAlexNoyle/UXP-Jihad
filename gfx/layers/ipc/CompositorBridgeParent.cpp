@@ -1419,6 +1419,7 @@ CompositorBridgeParent::CompositeToTarget(DrawTarget* aTarget, const gfx::IntRec
   TimeStamp time = mIsTesting ? mTestTime : mCompositorScheduler->GetLastComposeTime();
   const TimeStamp jihadT0 = sJihadPhases ? TimeStamp::Now() : TimeStamp();
   bool requestNextFrame = mCompositionManager->TransformShadowTree(time, mVsyncRate);
+  mJihadAnimating = requestNextFrame;
   if (sJihadPhases) gJihadPhase[7] += (TimeStamp::Now() - jihadT0).ToMilliseconds();
   // Jihad T-504: an overview window is the scrolled content alone: the daemon stitches windows composed at
   // other scrolls into one picture, where fixed and stuck layers would sit once per window. Their shadow

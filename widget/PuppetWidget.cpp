@@ -1715,6 +1715,14 @@ jihad_offscreen_set_view(nsIWidget* aWidget, double aScale, double aOffsetX, dou
   }
 }
 
+// T-576: the last composite had animations that want another frame
+MOZ_EXPORT int
+jihad_offscreen_compositor_animating(nsIWidget* aWidget)
+{
+  mozilla::layers::CompositorBridgeParent* bridge = aWidget ? static_cast<PuppetWidget*>(aWidget)->JihadBridge() : nullptr;
+  return bridge && bridge->JihadAnimating() ? 1 : 0;
+}
+
 // T-502: how many composites the compositor has asked for (layer updates, animations); the
 // daemon pulls a frame whenever this moves. 0 without a compositor.
 MOZ_EXPORT uint32_t
