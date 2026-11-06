@@ -1715,6 +1715,19 @@ jihad_offscreen_set_view(nsIWidget* aWidget, double aScale, double aOffsetX, dou
   }
 }
 
+// T-576: a popup is a display root of its own, drawn over the frame after it: no plugin lane under one
+MOZ_EXPORT int
+jihad_offscreen_popups_open()
+{
+  nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+  if (!pm) {
+    return 0;
+  }
+  nsTArray<nsIFrame*> popups;
+  pm->GetVisiblePopups(popups);
+  return (int)popups.Length();
+}
+
 // T-576: the last composite had animations that want another frame
 MOZ_EXPORT int
 jihad_offscreen_compositor_animating(nsIWidget* aWidget)

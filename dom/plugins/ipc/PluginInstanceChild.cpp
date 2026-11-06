@@ -88,13 +88,11 @@ enum {
 static uint32_t gJihadShowFrom[kJihadShowSites];
 // The frame's three parts, summed between the 2 s reports (the `per draw` line)
 static uint32_t gJihadPumpUs = 0, gJihadDrawUs = 0, gJihadShowUs = 0;
-// A draw is posted on this thread's loop: the pump stops, or the player runs its next frame first
-// and this one is never drawn
-static bool gJihadDrawPosted = false;
+// Draws posted on this thread's loop: the pump stops, or the player runs its next frame first
+// and this one is never drawn. A count: several instances share the loop and the pump
+static int gJihadDrawsPosted = 0;
 // When the plugin last asked for a draw itself: the pump's short period is for a movie that plays
 static uint32_t gJihadSelfInvalMs = 0;
-// When the last frame went to the parent (AsyncShowPluginFrame's floor)
-static uint32_t gJihadLastDrawMs = 0;
 static const char* const kJihadShowNames[kJihadShowSites] = {
     "setwin", "hostinval", "plugininval", "retry", "bgupd", "bgtail", "bgdestroy"
 };
@@ -267,6 +265,8 @@ PluginInstanceChild::PluginInstanceChild(const NPPluginFuncs* aPluginIface,
     , mSurfaceDifferenceRect(0,0,0,0)
     , mJihadShowsInFlight(0)
     , mJihadShowOwed(false)
+    , mJihadLastDrawMs(0)
+    , mJihadDrawCounted(false)
     , mDestroyed(false)
 #ifdef XP_WIN
     , mLastKeyEventConsumed(false)
@@ -4050,7 +4050,7 @@ JihadPumpGlib(int aMaxIterations)
         return 0;
     }
     int n = 0;
-    while (n < aMaxIterations && !gJihadDrawPosted) {
+    while (n < aMaxIterations && gJihadDrawsPosted == 0) {
         if (sPending && !sPending(nullptr)) {
             break;
         }
@@ -4215,7 +4215,8 @@ bool
 PluginInstanceChild::RecvJihadShowDone()
 {
     mJihadShowsInFlight--;
-    if (mJihadShowOwed) {
+    // Destroy cancelled the draw; an answer to a frame sent before it must not post another
+    if (mJihadShowOwed && !mDestroyed) {
         mJihadShowOwed = false;
         AsyncShowPluginFrame();
     }
@@ -5100,7 +5101,7 @@ PluginInstanceChild::ShowPluginFrame()
             return false;
         }
         mJihadShowsInFlight++;
-        gJihadLastDrawMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+        mJihadLastDrawMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
     }
     gJihadShowUs += PR_IntervalToMicroseconds(PR_IntervalNow() - showT0);
 
@@ -5164,7 +5165,10 @@ PluginInstanceChild::InvalidateRectDelayed(void)
     }
 
     mCurrentInvalidateTask = nullptr;
-    gJihadDrawPosted = false;
+    if (mJihadDrawCounted) {
+        mJihadDrawCounted = false;
+        gJihadDrawsPosted--;
+    }
     if (mAccumulatedInvalidRect.IsEmpty()) {
         return;
     }
@@ -5178,7 +5182,7 @@ PluginInstanceChild::InvalidateRectDelayed(void)
 void
 PluginInstanceChild::AsyncShowPluginFrame(void)
 {
-    if (mCurrentInvalidateTask) {
+    if (mCurrentInvalidateTask || mDestroyed) {
         return;
     }
 
@@ -5198,13 +5202,14 @@ PluginInstanceChild::AsyncShowPluginFrame(void)
     // stock browser holds 32. The movie's own clock is not touched, and the pump goes on meanwhile.
     static const int sFloorMs = getenv("JIHAD_PLUGIN_DRAW_MS") ? atoi(getenv("JIHAD_PLUGIN_DRAW_MS")) : 28;
     const uint32_t drawNowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
-    const uint32_t sinceDraw = drawNowMs - gJihadLastDrawMs;
-    if (sFloorMs > 0 && gJihadLastDrawMs && sinceDraw < uint32_t(sFloorMs)) {
+    const uint32_t sinceDraw = drawNowMs - mJihadLastDrawMs;
+    if (sFloorMs > 0 && mJihadLastDrawMs && sinceDraw < uint32_t(sFloorMs)) {
         MessageLoop::current()->PostDelayedTask(addrefedTask.forget(), sFloorMs - sinceDraw);
         return;
     }
     MessageLoop::current()->PostTask(addrefedTask.forget());
-    gJihadDrawPosted = true;
+    mJihadDrawCounted = true;
+    gJihadDrawsPosted++;
 }
 
 void
@@ -5566,7 +5571,10 @@ PluginInstanceChild::Destroy()
     if (mCurrentInvalidateTask) {
         mCurrentInvalidateTask->Cancel();
         mCurrentInvalidateTask = nullptr;
-        gJihadDrawPosted = false;
+        if (mJihadDrawCounted) {
+            mJihadDrawCounted = false;
+            gJihadDrawsPosted--;
+        }
     }
     if (mCurrentAsyncSetWindowTask) {
         mCurrentAsyncSetWindowTask->Cancel();

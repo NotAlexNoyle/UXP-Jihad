@@ -1800,7 +1800,22 @@ JihadLaneScan(nsDisplayListBuilder* aBuilder, nsDisplayList* aList, JihadLaneWal
       const bool effect = t == nsDisplayItem::TYPE_OPACITY || t == nsDisplayItem::TYPE_TRANSFORM ||
                           t == nsDisplayItem::TYPE_PERSPECTIVE || t == nsDisplayItem::TYPE_MASK ||
                           t == nsDisplayItem::TYPE_FILTER || t == nsDisplayItem::TYPE_BLEND_MODE;
-      JihadLaneScan(aBuilder, kids, aWalk, aEffect || effect);
+      if (effect) {
+        // Its children's bounds are in their own coordinates and it paints past them: it counts as one
+        // item with its own bounds. A plugin inside it is not drawn 1:1 at all.
+        JihadLaneWalk inner;
+        inner.view = aWalk.view;
+        JihadLaneScan(aBuilder, kids, inner, true);
+        if (inner.plugins) {
+          aWalk.plugins += inner.plugins;
+          aWalk.bounds = inner.bounds;
+          aWalk.tainted = true;
+        } else if (aWalk.plugins && !i->GetBounds(aBuilder, &snap).Intersect(aWalk.bounds).IsEmpty()) {
+          aWalk.covered = true;
+        }
+        continue;
+      }
+      JihadLaneScan(aBuilder, kids, aWalk, aEffect);
       continue;
     }
     // These paint nothing
@@ -1812,7 +1827,7 @@ JihadLaneScan(nsDisplayListBuilder* aBuilder, nsDisplayList* aList, JihadLaneWal
     // into it by a few pixels and draws nothing there
     nsRect itemBounds = i->GetBounds(aBuilder, &snap);
     if (t == nsDisplayItem::TYPE_TEXT) {
-      itemBounds.Deflate(0, itemBounds.height / 4);
+      itemBounds.Deflate(0, std::min(itemBounds.height / 4, 240));   // 4 CSS px at most
     }
     if (aWalk.plugins && !itemBounds.Intersect(aWalk.bounds).IsEmpty()) {
       aWalk.covered = true;
@@ -1825,7 +1840,7 @@ JihadLaneScan(nsDisplayListBuilder* aBuilder, nsDisplayList* aList, JihadLaneWal
 }
 
 extern "C" MOZ_EXPORT int
-jihad_plugin_lane_proof(nsIDocShell* aDocShell)
+jihad_plugin_lane_proof(nsIDocShell* aDocShell, int* aX, int* aY, int* aW, int* aH)
 {
   nsCOMPtr<nsIPresShell> shell = aDocShell ? aDocShell->GetPresShell() : nullptr;
   if (!shell) {
@@ -1848,6 +1863,10 @@ jihad_plugin_lane_proof(nsIDocShell* aDocShell)
   list.DeleteAll();
   if (walk.plugins == 0) return 0;
   if (walk.plugins > 1) return -3;
+  // Where the plugin is now: the daemon's own record of it is refreshed every 500 ms
+  const int d = root->PresContext()->AppUnitsPerDevPixel();
+  *aX = walk.bounds.x / d; *aY = walk.bounds.y / d;
+  *aW = walk.bounds.width / d; *aH = walk.bounds.height / d;
   if (walk.tainted) return -2;
   return walk.covered ? -1 : 1;
 }

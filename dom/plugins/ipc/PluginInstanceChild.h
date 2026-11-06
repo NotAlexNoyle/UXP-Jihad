@@ -702,6 +702,8 @@ private:
     // JihadShow: frames sent the parent has not answered, and a draw that waits for its answer
     int mJihadShowsInFlight;
     bool mJihadShowOwed;
+    uint32_t mJihadLastDrawMs;   // when the last frame went to the parent: AsyncShowPluginFrame's floor
+    bool mJihadDrawCounted;      // the draw posted counts in the pump's gJihadDrawsPosted
 
     // Has this instance been destroyed, either by ActorDestroy or NPP_Destroy?
     bool mDestroyed;

@@ -48,6 +48,7 @@ class PluginInstanceParent : public PPluginInstanceParent
                            , public PluginDataResolver
 {
     RefPtr<mozilla::gfx::DataSourceSurface> mJihadLastFrame;
+    bool mJihadInAsyncShow = false;
     friend class PluginModuleParent;
     friend class BrowserStreamParent;
     friend class PluginStreamParent;

@@ -1067,7 +1067,10 @@ PluginInstanceParent::RecvJihadShow(const NPRect& updatedRect,
                                     const SurfaceDescriptor& newSurface)
 {
     SurfaceDescriptor prevSurface;
-    if (!RecvShow(updatedRect, newSurface, &prevSurface)) {
+    mJihadInAsyncShow = true;
+    const bool shown = RecvShow(updatedRect, newSurface, &prevSurface);
+    mJihadInAsyncShow = false;
+    if (!shown) {
         return false;
     }
     return SendJihadShowDone();
@@ -1115,6 +1118,7 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     }
 
     // XXXjwatt rewrite to use Moz2D
+    mJihadLastFrame = nullptr;   // the lane's source is this frame's copy or nothing, never an older one
     RefPtr<gfxASurface> surface;
     if (newSurface.type() == SurfaceDescriptor::TShmem) {
         if (!newSurface.get_Shmem().IsReadable()) {
@@ -1253,7 +1257,7 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                 }
             }
         }
-        if (!image) {
+        if (!image && !mJihadInAsyncShow) {
             // Fallback to the original wrap if the copy path could not be taken.
             bool isPlugin = true;
             RefPtr<gfx::SourceSurface> sourceSurface =
@@ -1261,13 +1265,17 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
             image = new SourceSurfaceImage(ssize, sourceSurface);
         }
 
-        ImageContainer::NonOwningImage holder(image);
-        holder.mFrameID = ++mFrameID;
-        AutoTArray<ImageContainer::NonOwningImage,1> imageList;
-        imageList.AppendElement(holder);
+        // JihadShow answers as soon as this returns and the child draws into that surface again, so
+        // it gets no wrap: a frame that could not be copied (no memory) is dropped.
+        if (image) {
+            ImageContainer::NonOwningImage holder(image);
+            holder.mFrameID = ++mFrameID;
+            AutoTArray<ImageContainer::NonOwningImage,1> imageList;
+            imageList.AppendElement(holder);
 
-        ImageContainer *container = GetImageContainer();
-        container->SetCurrentImages(imageList);
+            ImageContainer *container = GetImageContainer();
+            container->SetCurrentImages(imageList);
+        }
     }
     else if (mImageContainer) {
         mImageContainer->ClearAllImages();
@@ -1285,7 +1293,7 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     // never had to choose: it pulls the plugin synchronously inside the page paint, so it is
     // 1:1 by construction. This counter is what lets the daemon be 1:1 too.
     ++gJihadPluginFrameSeq;
-    if (!gJihadLaneOpen) {
+    if (!gJihadLaneOpen || !gJihadLiveInstances || gJihadLiveInstances->Length() != 1) {
         RecvNPN_InvalidateRect(updatedRect);
     }
 
