@@ -265,7 +265,6 @@ PluginInstanceChild::PluginInstanceChild(const NPPluginFuncs* aPluginIface,
     , mSurfaceDifferenceRect(0,0,0,0)
     , mJihadShowsInFlight(0)
     , mJihadShowOwed(false)
-    , mJihadLastDrawMs(0)
     , mJihadDrawCounted(false)
     , mDestroyed(false)
 #ifdef XP_WIN
@@ -5101,7 +5100,6 @@ PluginInstanceChild::ShowPluginFrame()
             return false;
         }
         mJihadShowsInFlight++;
-        mJihadLastDrawMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
     }
     gJihadShowUs += PR_IntervalToMicroseconds(PR_IntervalNow() - showT0);
 
@@ -5196,17 +5194,6 @@ PluginInstanceChild::AsyncShowPluginFrame(void)
     mCurrentInvalidateTask =
         NewNonOwningCancelableRunnableMethod(this, &PluginInstanceChild::InvalidateRectDelayed);
     RefPtr<Runnable> addrefedTask = mCurrentInvalidateTask;
-    // A FLOOR BETWEEN DRAWS. The card shows some 30 frames a second, the most the stock browser reached
-    // on any title is 32. A movie running faster (Bubble Tanks, 55 fps) had each frame drawn and copied
-    // twice, 50 a second, 11 ms of CPU each, on a device with none spare: the card fell to 24 where the
-    // stock browser holds 32. The movie's own clock is not touched, and the pump goes on meanwhile.
-    static const int sFloorMs = getenv("JIHAD_PLUGIN_DRAW_MS") ? atoi(getenv("JIHAD_PLUGIN_DRAW_MS")) : 28;
-    const uint32_t drawNowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
-    const uint32_t sinceDraw = drawNowMs - mJihadLastDrawMs;
-    if (sFloorMs > 0 && mJihadLastDrawMs && sinceDraw < uint32_t(sFloorMs)) {
-        MessageLoop::current()->PostDelayedTask(addrefedTask.forget(), sFloorMs - sinceDraw);
-        return;
-    }
     MessageLoop::current()->PostTask(addrefedTask.forget());
     mJihadDrawCounted = true;
     gJihadDrawsPosted++;

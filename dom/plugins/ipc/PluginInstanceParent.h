@@ -28,6 +28,7 @@
 #include "mozilla/EventForwards.h"
 
 class gfxASurface;
+class gfxImageSurface;
 namespace mozilla { namespace gfx { class DataSourceSurface; } }
 class gfxContext;
 class nsPluginInstanceOwner;
@@ -49,6 +50,12 @@ class PluginInstanceParent : public PPluginInstanceParent
 {
     RefPtr<mozilla::gfx::DataSourceSurface> mJihadLastFrame;
     bool mJihadInAsyncShow = false;
+    // The plugin lane, direct: the child's surface of the newest frame, unanswered, so the child stays off it
+    RefPtr<gfxImageSurface> mJihadPending;
+    mozilla::gfx::IntSize mJihadFrameSize;
+    bool mJihadHoldAnswer = false;
+    void JihadSetImage(const unsigned char* aData, int aStride, const mozilla::gfx::IntSize& aSize);
+    void JihadTakePending();
     friend class PluginModuleParent;
     friend class BrowserStreamParent;
     friend class PluginStreamParent;
@@ -209,9 +216,9 @@ public:
                   const SurfaceDescriptor& newSurface) override;
 
     // The plugin lane: the one live instance's newest opaque frame (jihad_plugin_lane_copy)
-    static bool JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
-                              int* aFullW, int* aFullH);
-    static void JihadLaneClosed();
+    static int JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
+                             int* aFullW, int* aFullH);
+    static void JihadLaneClosed(const unsigned char* aRows, int aStride);
 
     virtual bool
     RecvShow(const NPRect& updatedRect,

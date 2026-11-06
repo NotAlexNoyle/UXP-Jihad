@@ -990,76 +990,155 @@ static uint32_t gJihadRecvShowUs = 0;
 // THE PLUGIN LANE (T-576): while it is open the card takes the plugin's frames from here, and the plugin
 // marks nothing damaged. So any damage is the page's, even inside the plugin's rect: an element laid
 // exactly over the movie looks like the movie's own damage otherwise, and the lane drew over it.
-static bool gJihadLaneOpen = false;
+//
+// DIRECT (2): no copy here at all. A movie's frame cost this thread up to 6.7 ms for a fresh surface and a
+// copy nobody reads while the lane is open. The child's own surface is the source, and the answer waits
+// until the lane has taken it, so the child stays off it, and a card that cannot keep up holds the player
+// back at two frames in flight instead of being drawn for. 1: copies, for a plugin partly off the frame,
+// whose rows the lane would not have at its close.
+static int gJihadLaneMode = 0;
 
 extern "C" MOZ_EXPORT void
-jihad_plugin_lane_set(int aOpen)
+jihad_plugin_lane_set(int aMode, const unsigned char* aRows, int aStride)
 {
-    gJihadLaneOpen = aOpen != 0;
-    if (!aOpen) {
-        PluginInstanceParent::JihadLaneClosed();
+    gJihadLaneMode = aMode;
+    if (!aMode) {
+        PluginInstanceParent::JihadLaneClosed(aRows, aStride);
     }
 }
 
-// The layer's image is the newest, but nothing has told the layer: the next paint of the page draws it
 void
-PluginInstanceParent::JihadLaneClosed()
+PluginInstanceParent::JihadSetImage(const unsigned char* aData, int aStride, const IntSize& aSize)
+{
+    RefPtr<gfx::DataSourceSurface> copy =
+        gfx::Factory::CreateDataSourceSurface(aSize, SurfaceFormat::B8G8R8X8);
+    if (!copy) {
+        return;
+    }
+    {
+        gfx::DataSourceSurface::ScopedMap map(copy, gfx::DataSourceSurface::WRITE);
+        if (!map.IsMapped()) {
+            return;
+        }
+        for (int32_t y = 0; y < aSize.height; y++) {
+            memcpy(map.GetData() + (ptrdiff_t)y * map.GetStride(), aData + (ptrdiff_t)y * aStride, aSize.width * 4);
+        }
+    }
+    RefPtr<Image> image = new SourceSurfaceImage(aSize, copy);
+    ImageContainer::NonOwningImage holder(image);
+    holder.mFrameID = ++mFrameID;
+    AutoTArray<ImageContainer::NonOwningImage,1> imageList;
+    imageList.AppendElement(holder);
+    GetImageContainer()->SetCurrentImages(imageList);
+    mJihadLastFrame = copy;
+}
+
+// The frame the lane has not taken: into the layer's image, and answered
+void
+PluginInstanceParent::JihadTakePending()
+{
+    if (mJihadPending) {
+        RefPtr<gfxImageSurface> pending = mJihadPending.forget();
+        JihadSetImage(pending->Data(), pending->Stride(), pending->GetSize());
+        SendJihadShowDone();
+    }
+}
+
+// The layer's image is older than the card, and nothing has told the layer: the newest frame goes in
+// (the one not taken, or the rows the card shows), and the next paint of the page draws it
+void
+PluginInstanceParent::JihadLaneClosed(const unsigned char* aRows, int aStride)
 {
     if (!gJihadLiveInstances) {
         return;
     }
     nsTArray<PluginInstanceParent*> snap(*gJihadLiveInstances);
     for (uint32_t i = 0; i < snap.Length(); i++) {
-        if (!gJihadLiveInstances->Contains(snap[i]) || !snap[i]->mJihadLastFrame) {
+        PluginInstanceParent* inst = snap[i];
+        if (!gJihadLiveInstances->Contains(inst)) {
             continue;
         }
-        const IntSize size = snap[i]->mJihadLastFrame->GetSize();
-        NPRect r = { 0, 0, (uint16_t)size.height, (uint16_t)size.width };
-        snap[i]->RecvNPN_InvalidateRect(r);
+        IntSize size = inst->mJihadLastFrame ? inst->mJihadLastFrame->GetSize() : inst->mJihadFrameSize;
+        if (inst->mJihadPending) {
+            size = inst->mJihadPending->GetSize();
+            inst->JihadTakePending();
+        } else if (aRows && !inst->mJihadLastFrame && size.width > 0) {
+            inst->JihadSetImage(aRows, aStride, size);
+        }
+        if (size.width > 0) {
+            NPRect r = { 0, 0, (uint16_t)size.height, (uint16_t)size.width };
+            inst->RecvNPN_InvalidateRect(r);
+        }
     }
 }
 
-// THE PLUGIN LANE's source (T-576): the newest frame of the page's one live plugin, opaque ones only.
+// THE PLUGIN LANE's source: the newest frame of the page's one live plugin, opaque ones only.
 // aDest null: is there one, how big. The X byte comes out as alpha 255, which the card's raw blit needs.
-bool
+// 1: copied. 2: nothing newer than what the lane took. 0: no.
+int
 PluginInstanceParent::JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
                                     int* aFullW, int* aFullH)
 {
     if (!gJihadLiveInstances || gJihadLiveInstances->Length() != 1) {
-        return false;
+        return 0;
     }
-    RefPtr<gfx::DataSourceSurface> frame = (*gJihadLiveInstances)[0]->mJihadLastFrame;
-    if (!frame) {
-        return false;
+    PluginInstanceParent* inst = (*gJihadLiveInstances)[0];
+    RefPtr<gfxImageSurface> pending = inst->mJihadPending;
+    RefPtr<gfx::DataSourceSurface> frame = inst->mJihadLastFrame;
+    if (!pending && !frame && (gJihadLaneMode != 2 || inst->mJihadFrameSize.width <= 0)) {
+        return 0;
     }
-    const IntSize size = frame->GetSize();
+    const IntSize size = pending ? pending->GetSize() : frame ? frame->GetSize() : inst->mJihadFrameSize;
     if (aFullW) *aFullW = size.width;
     if (aFullH) *aFullH = size.height;
     if (!aDest) {
-        return true;
+        return 1;
+    }
+    if (!pending && !frame) {
+        return 2;
     }
     if (aX < 0 || aY < 0 || aW <= 0 || aH <= 0 || aX + aW > size.width || aY + aH > size.height) {
-        return false;
+        return 0;
     }
-    gfx::DataSourceSurface::ScopedMap map(frame, gfx::DataSourceSurface::READ);
-    if (!map.IsMapped()) {
-        return false;
+    const unsigned char* data;
+    int stride;
+    gfx::DataSourceSurface::MappedSurface mapped = { nullptr, 0 };
+    if (pending) {
+        data = pending->Data();
+        stride = pending->Stride();
+    } else {
+        if (!frame->Map(gfx::DataSourceSurface::READ, &mapped)) {
+            return 0;
+        }
+        data = mapped.mData;
+        stride = mapped.mStride;
     }
     for (int y = 0; y < aH; y++) {
-        const uint32_t* s = reinterpret_cast<const uint32_t*>(map.GetData() + (ptrdiff_t)(aY + y) * map.GetStride()) + aX;
+        const uint32_t* s = reinterpret_cast<const uint32_t*>(data + (ptrdiff_t)(aY + y) * stride) + aX;
         uint32_t* d = reinterpret_cast<uint32_t*>(aDest + (ptrdiff_t)y * aDestStride);
         for (int x = 0; x < aW; x++) {
             d[x] = s[x] | 0xff000000u;
         }
     }
-    return true;
+    if (pending) {
+        inst->mJihadPending = nullptr;
+        inst->SendJihadShowDone();
+    } else {
+        frame->Unmap();
+        if (gJihadLaneMode == 2) {
+            // Taken, and the lane's frames come from the child now: nothing older may go out after them
+            inst->mJihadFrameSize = size;
+            inst->mJihadLastFrame = nullptr;
+        }
+    }
+    return 1;
 }
 
 extern "C" MOZ_EXPORT int
 jihad_plugin_lane_copy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
                        int* aFullW, int* aFullH)
 {
-    return PluginInstanceParent::JihadLaneCopy(aDest, aDestStride, aX, aY, aW, aH, aFullW, aFullH) ? 1 : 0;
+    return PluginInstanceParent::JihadLaneCopy(aDest, aDestStride, aX, aY, aW, aH, aFullW, aFullH);
 }
 
 bool
@@ -1072,6 +1151,10 @@ PluginInstanceParent::RecvJihadShow(const NPRect& updatedRect,
     mJihadInAsyncShow = false;
     if (!shown) {
         return false;
+    }
+    if (mJihadHoldAnswer) {
+        mJihadHoldAnswer = false;
+        return true;   // the lane answers when it has taken the frame
     }
     return SendJihadShowDone();
 }
@@ -1117,6 +1200,23 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
         }
     }
 
+    // The plugin lane, direct: the child's surface is the frame. A newer frame answers the older
+    if (mJihadInAsyncShow && gJihadLaneMode == 2 && newSurface.type() == SurfaceDescriptor::TShmem &&
+        newSurface.get_Shmem().IsReadable() && gJihadLiveInstances && gJihadLiveInstances->Length() == 1) {
+        RefPtr<gfxASurface> direct = gfxSharedImageSurface::Open(newSurface.get_Shmem());
+        RefPtr<gfxImageSurface> img = direct ? direct->GetAsImageSurface() : nullptr;
+        if (img) {
+            if (mJihadPending) {
+                SendJihadShowDone();
+            }
+            mJihadPending = img;
+            mJihadFrameSize = img->GetSize();
+            mJihadLastFrame = nullptr;
+            mJihadHoldAnswer = true;
+            ++gJihadPluginFrameSeq;
+            return true;
+        }
+    }
     // XXXjwatt rewrite to use Moz2D
     mJihadLastFrame = nullptr;   // the lane's source is this frame's copy or nothing, never an older one
     RefPtr<gfxASurface> surface;
@@ -1254,6 +1354,7 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
                     }
                     image = new SourceSurfaceImage(ssize, copy);
                     mJihadLastFrame = srcHasAlpha ? nullptr : copy;
+                    mJihadFrameSize = ssize;
                 }
             }
         }
@@ -1293,7 +1394,7 @@ PluginInstanceParent::RecvShow(const NPRect& updatedRect,
     // never had to choose: it pulls the plugin synchronously inside the page paint, so it is
     // 1:1 by construction. This counter is what lets the daemon be 1:1 too.
     ++gJihadPluginFrameSeq;
-    if (!gJihadLaneOpen || !gJihadLiveInstances || gJihadLiveInstances->Length() != 1) {
+    if (!gJihadLaneMode || !gJihadLiveInstances || gJihadLiveInstances->Length() != 1) {
         RecvNPN_InvalidateRect(updatedRect);
     }
 
