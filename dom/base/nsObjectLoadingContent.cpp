@@ -1874,6 +1874,19 @@ nsObjectLoadingContent::UpdateObjectParameters(bool aJavaURI)
     // is not necessary.)
   } else if (thisContent->NodeInfo()->Equals(nsGkAtoms::object)) {
     thisContent->GetAttr(kNameSpaceID_None, nsGkAtoms::data, uriStr);
+    // Jihad T-574: an <object> whose movie stands in <param name="movie">, the form written for IE: WebKit
+    // takes src, movie, code or url from the params, and the stock browser plays it. Here it drew nothing
+    if (uriStr.IsEmpty()) {
+      nsTArray<MozPluginParameter> jihadParams;
+      GetNestedParams(jihadParams, false);
+      for (uint32_t i = 0; i < jihadParams.Length(); i++) {
+        const nsString& n = jihadParams[i].mName;
+        if (n.LowerCaseEqualsLiteral("movie") || n.LowerCaseEqualsLiteral("src") || n.LowerCaseEqualsLiteral("url")) {
+          uriStr = jihadParams[i].mValue;
+          break;
+        }
+      }
+    }
   } else if (thisContent->NodeInfo()->Equals(nsGkAtoms::embed)) {
     thisContent->GetAttr(kNameSpaceID_None, nsGkAtoms::src, uriStr);
   } else {
