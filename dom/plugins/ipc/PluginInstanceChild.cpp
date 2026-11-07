@@ -32,6 +32,8 @@ using mozilla::gfx::SharedDIBSurface;
 #endif
 #include "gfxSharedImageSurface.h"
 #include <dlfcn.h>   // Jihad R7: reach the plugin's own glib for npPalmEventLoopValue
+#include <link.h>    // Jihad T-575: where the player is loaded
+#include <sys/mman.h>
 #include "gfxUtils.h"
 #include "gfxAlphaRecovery.h"
 
@@ -88,6 +90,92 @@ enum {
 static uint32_t gJihadShowFrom[kJihadShowSites];
 // The frame's three parts, summed between the 2 s reports (the `per draw` line)
 static uint32_t gJihadPumpUs = 0, gJihadDrawUs = 0, gJihadShowUs = 0;
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+// THE PLAYER'S ARROW KEYS (T-575, cavekit-flash R5). The player's key handler takes the event's chr, or its
+// raw code if that is 0, refuses anything over 254, and treats the rest as a character (libflashplayer.so,
+// 10.3.185.65, 0x44970): 0xE0A0, webOS's Up, is dropped, and no code at all reaches ActionScript's 37-40, in
+// the stock browser either. Its key constructor has the table (0x192468: Left 1, Right 2, Home 3, End 4, Up 14,
+// Down 15, PageUp 16, PageDown 17), and the handler reaches it only for Shift and Ctrl. So these codes are
+// routed to it: 0x91-0xA1, C1 controls and two characters nobody types, become table entry raw - 0x90. The
+// instructions are checked one by one first: on any other player nothing is touched and the keys stay as they
+// were. Without it no game with arrow keys can be played on this device.
+static bool
+JihadFlashKeysPatched()
+{
+    static int sState = -1;
+    if (sState >= 0) {
+        return sState == 1;
+    }
+    sState = 0;
+    uintptr_t base = 0;
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        if (info->dlpi_name && strstr(info->dlpi_name, "libflashplayer.so")) {
+            *static_cast<uintptr_t*>(data) = info->dlpi_addr;
+            return 1;
+        }
+        return 0;
+    }, &base);
+    if (!base) {
+        return false;
+    }
+    static const struct { uint32_t off, was, now; } kEdits[] = {
+        { 0x44b00, 0xe3560081, 0xe3560090 },   // cmp r6,#0x81      -> cmp r6,#0x90
+        { 0x44b04, 0x0a000035, 0x8a000035 },   // beq 44be0         -> bhi 44be0
+        { 0x44be0, 0xe28d4050, 0xe2461090 },   // add r4,sp,#80     -> sub r1,r6,#0x90
+        { 0x44be4, 0xe1a01006, 0xe3510011 },   // mov r1,r6         -> cmp r1,#17
+        { 0x44be8, 0xe1a02009, 0x8affff92 },   // mov r2,r9         -> bhi 44a38 (a character)
+        { 0x44bec, 0xe1a03005, 0xe28d4050 },   // mov r3,r5         -> add r4,sp,#80
+        { 0x44bf0, 0xeaffffca, 0xe1a02009 },   // b 44b20           -> mov r2,r9 (special)
+        { 0x44bf4, 0xe320f000, 0xe1a03005 },   // nop               -> mov r3,r5
+        { 0x44bf8, 0xe320f000, 0xeaffffc8 },   // nop               -> b 44b20
+    };
+    for (const auto& e : kEdits) {
+        if (*reinterpret_cast<const uint32_t*>(base + e.off) != e.was) {
+            fprintf(stderr, "[jihad-npapi-child] arrow keys: not this player (at 0x%x), left as it is\n", (unsigned)e.off);
+            return false;
+        }
+    }
+    const uintptr_t page = (base + 0x44b00) & ~uintptr_t(0xfff);
+    const size_t len = (base + 0x44bfc + 4) - page;
+    if (mprotect(reinterpret_cast<void*>(page), len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        fprintf(stderr, "[jihad-npapi-child] arrow keys: mprotect failed\n");
+        return false;
+    }
+    for (const auto& e : kEdits) {
+        *reinterpret_cast<uint32_t*>(base + e.off) = e.now;
+    }
+    __builtin___clear_cache(reinterpret_cast<char*>(base + 0x44b00), reinterpret_cast<char*>(base + 0x44bfc + 4));
+    mprotect(reinterpret_cast<void*>(page), len, PROT_READ | PROT_EXEC);
+    fprintf(stderr, "[jihad-npapi-child] arrow keys: the player's key table is reachable\n");
+    sState = 1;
+    return true;
+}
+
+static void
+JihadTranslateFlashKey(NPEvent& aEvent)
+{
+    if (aEvent.eventType != npPalmKeyDownEvent && aEvent.eventType != npPalmKeyUpEvent) {
+        return;
+    }
+    int entry = 0;
+    switch (aEvent.data.keyEvent.rawkeyCode) {
+        case 0xE0A0: entry = 14; break;   // Up
+        case 0xE0A1: entry = 15; break;   // Down
+        case 0xE0A2: entry = 1;  break;   // Left
+        case 0xE0A3: entry = 2;  break;   // Right
+        case 0xE0B1: entry = 3;  break;   // Home
+        case 0xE0B2: entry = 4;  break;   // End
+        case 0xE0B3: entry = 16; break;   // PageUp
+        case 0xE0B4: entry = 17; break;   // PageDown
+        default: return;
+    }
+    if (JihadFlashKeysPatched()) {
+        aEvent.data.keyEvent.chr = 0;
+        aEvent.data.keyEvent.rawkeyCode = 0x90 + entry;
+    }
+}
+#endif
+
 // Draws posted on this thread's loop: the pump stops, or the player runs its next frame first
 // and this one is never drawn. A count: several instances share the loop and the pump
 static int gJihadDrawsPosted = 0;
@@ -1124,6 +1212,10 @@ PluginInstanceChild::AnswerNPP_HandleEvent(const NPRemoteEvent& event,
 
     *handled = WinlessHandleEvent(evcopy);
     return true;
+#endif
+
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+    JihadTranslateFlashKey(evcopy);
 #endif
 
     // XXX A previous call to mPluginIface->event might block, e.g. right click

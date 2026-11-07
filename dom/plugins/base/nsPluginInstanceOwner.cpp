@@ -2115,6 +2115,10 @@ void nsPluginInstanceOwner::PerformDelayedBlurs()
 
 #endif
 
+// Jihad T-575: the character of the key event on its way: a DOM keydown has none, a player's does
+static int gJihadKeyChar = 0, gJihadKeyRaw = 0;
+extern "C" MOZ_EXPORT void jihad_plugin_key_char(int aChar, int aRaw) { gJihadKeyChar = aChar; gJihadKeyRaw = aRaw; }
+
 nsEventStatus nsPluginInstanceOwner::ProcessEvent(const WidgetGUIEvent& anEvent)
 {
   nsEventStatus rv = nsEventStatus_eIgnore;
@@ -2691,9 +2695,9 @@ nsEventStatus nsPluginInstanceOwner::ProcessEvent(const WidgetGUIEvent& anEvent)
           (keyEvent.IsShift()   ? npPalmShiftKeyModifier : 0) |
           (keyEvent.IsMeta()    ? npPalmMetaKeyModifier  : 0);
         pluginEvent.data.keyEvent.chr =
-          static_cast<int32_t>(keyEvent.PseudoCharCode());
+          static_cast<int32_t>(keyEvent.PseudoCharCode() ? keyEvent.PseudoCharCode() : gJihadKeyChar);
         pluginEvent.data.keyEvent.modifiers   = mods;
-        pluginEvent.data.keyEvent.rawkeyCode  = static_cast<int32_t>(keyEvent.mKeyCode);
+        pluginEvent.data.keyEvent.rawkeyCode  = gJihadKeyRaw ? gJihadKeyRaw : static_cast<int32_t>(keyEvent.mKeyCode);
         pluginEvent.data.keyEvent.rawModifier = mods;
       }
     } else if (anEvent.mMessage == eFocus || anEvent.mMessage == eBlur) {
