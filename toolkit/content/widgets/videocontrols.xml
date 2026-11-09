@@ -508,6 +508,14 @@
                             if (!this.scrubber.isDragging)
                                 this.setPlayButtonState(true);
                             this.stopScrubTimer();    // Jihad: no interpolation while paused
+                            // Jihad: a touch screen has no pointer to hover the bar back with. A pause (the
+                            // tap on the picture) shows the bar and keeps it (_hideControlsFn) until play.
+                            if (!this.isAudioOnly && this.dynamicControls) {
+                                clearTimeout(this._hideControlsTimeout);
+                                this._hideControlsTimeout = 0;
+                                this.startFadeIn(this.controlBar);
+                                this._controlsHiddenByTimeout = false;
+                            }
                             this.setupStatusFader();
                             break;
                         case "ended":
@@ -937,6 +945,8 @@
 
                 _hideControlsTimeout : 0,
                 _hideControlsFn : function () {
+                    // Jihad: never while paused — a finger has no hover to bring the bar back (see "pause")
+                    if (Utils.video.paused && !Utils.video.ended) { Utils._hideControlsTimeout = 0; return; }
                     if (!Utils.scrubber.isDragging) {
                         Utils.startFade(Utils.controlBar, false);
                         Utils._hideControlsTimeout = 0;
