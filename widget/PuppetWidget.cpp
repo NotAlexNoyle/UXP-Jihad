@@ -1172,6 +1172,7 @@ PuppetWidget::JihadComposePoll(uint32_t aToken, bool aWait, int* aOut, bool* aSc
           for (int k = 0; k < 4; k++) aOut[49 + k] = (int)job->req.partsSig[k];
           aOut[53] = job->req.partsRead;
         }
+        if (aOutLen >= 55) aOut[54] = (int)job->req.treeSeq;   // T-605: the tree the job composed
       }
       if (aScrollOnly) *aScrollOnly = job->req.scrollOnly;
     } else if (!aWait && job->req.composed) {

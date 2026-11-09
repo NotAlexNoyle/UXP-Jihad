@@ -177,6 +177,8 @@ struct JihadFrameRequest {
                                        //   parts' rects still reported (the daemon draws them on the CPU). With flag
                                        //   64, the parts alone with the same rule
   uint32_t partsGen = 0;               // T-505, out: the parts' signature (the poll's thirtieth int; see partsHave)
+  uint32_t treeSeq = 0;                // T-605, out: the content's layer transactions applied when the job composed
+                                       //   (the poll's 55th int): a verify reference of another count saw a newer tree
   // T-505 (E2, the inspector's design): a frame without its parts reads the parts' picture in its own job when their
   // signature (their layers' content, attributes, structure and sizes) is not the one the daemon holds a picture of:
   // the parts alone, cleared transparent, packed on the band surface and read with their alpha into partsDest (each

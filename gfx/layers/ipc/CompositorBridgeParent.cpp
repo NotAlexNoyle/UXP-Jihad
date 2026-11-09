@@ -2274,9 +2274,14 @@ JihadColumnRead(const JihadFrameRequest* aReq, int aInvX0, int aInvX1, int aInvL
   return true;
 }
 
+// T-605: the content's layer transactions applied so far (ShadowLayersUpdated), stamped on each frame job when it
+// composes: the daemon's verify compares a frame only with a reference composed on the same tree
+static std::atomic<uint32_t> sJihadTreeSeq{0};
+
 bool
 CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScale, float aOffsetX, float aOffsetY)
 {
+  if (aReq) aReq->treeSeq = sJihadTreeSeq.load();
   // T-509 device test (JIHAD_GPU_TEST_STALL=<n>): the nth job holds the compositor thread 6 s, as a
   // GPU wait that does not come back would; the daemon gives the frame up and goes on in software
   {
@@ -3301,6 +3306,7 @@ CompositorBridgeParent::ShadowLayersUpdated(LayerTransactionParent* aLayerTree,
                                             int32_t aPaintSyncId,
                                             bool aHitTestUpdate)
 {
+  sJihadTreeSeq++;   // T-605
   ScheduleRotationOnCompositorThread(aTargetConfig, aIsFirstPaint);
 
   // Instruct the LayerManager to update its render bounds now. Since all the orientation
