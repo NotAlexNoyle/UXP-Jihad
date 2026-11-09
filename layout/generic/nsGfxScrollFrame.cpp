@@ -74,6 +74,7 @@
 #include <algorithm>
 #include <cstdlib> // for std::abs(int/long)
 #include <cmath> // for std::abs(float/double)
+#include "mozilla/dom/HTMLImageElement.h"   // Jihad T-558: JihadLazyScrolled
 
 #define PAINT_SKIP_LOG(...)
 // #define PAINT_SKIP_LOG(...) printf_stderr("PSKIP: " __VA_ARGS__)
@@ -4842,6 +4843,10 @@ ScrollFrameHelper::FireScrollEvent()
   WidgetGUIEvent event(true, eScroll, nullptr);
   nsEventStatus status = nsEventStatus_eIgnore;
   nsIContent* content = mOuter->GetContent();
+  // Jihad T-558: the document's deferred lazy images get one check after this scroll (HTMLImageElement.cpp)
+  if (content) {
+    mozilla::dom::HTMLImageElement::JihadLazyScrolled(content->OwnerDoc());
+  }
   nsPresContext* prescontext = mOuter->PresContext();
   // Fire viewport scroll events at the document (where they
   // will bubble to the window)

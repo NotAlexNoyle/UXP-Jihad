@@ -368,14 +368,20 @@ protected:
   RefPtr<ResponsiveImageSelector> mResponsiveSelector;
 
 private:
-  static void LazyLoadTimerCallback(nsITimer* aTimer, void* aClosure);
+public:
+  // Jihad (cavekit-lowpower-uxp.md R4, T-558): upstream's lazy loading (issue #3030, reverted there) carried behind
+  // the pref jihad.images.lazy, its 250 ms poll per image replaced by one check per document when its scroll frames
+  // fire a scroll event (ScrollFrameHelper::FireScrollEvent -> JihadLazyScrolled), with a slow safety check (2 s)
+  // while any image of the document is deferred.
+  static void JihadLazyScrolled(nsIDocument* aDoc);
+  void MaybeLoadImageFromLazyTimer();   // the document's check calls it: load now, or stay deferred
 
+private:
   bool ShouldLazyLoadImage() const;
   bool IsProbablyVisibleForLazyLoad() const;
   bool ShouldDeferImageLoad() const;
-  void EnsureLazyLoadTimer();
-  void StopLazyLoadTimer();
-  void MaybeLoadImageFromLazyTimer();
+  void EnsureLazyLoadTimer();   // registers this image with its document's deferred set
+  void StopLazyLoadTimer();     // and takes it out
 
   bool SourceElementMatches(nsIContent* aSourceNode);
 
@@ -409,8 +415,8 @@ private:
   RefPtr<ImageLoadTask> mPendingImageLoadTask;
   nsCOMPtr<nsIPrincipal> mSrcTriggeringPrincipal;
   nsCOMPtr<nsIPrincipal> mSrcsetTriggeringPrincipal;
-  nsCOMPtr<nsITimer> mLazyLoadTimer;
   bool mLazyLoadAlwaysLoad;
+  bool mLazyLoadRegistered = false;   // Jihad T-558: in its document's deferred set
 
   // Last URL that was attempted to load by this element.
   nsCOMPtr<nsIURI> mLastSelectedSource;

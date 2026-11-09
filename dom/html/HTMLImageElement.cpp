@@ -48,6 +48,8 @@
 #include "nsLayoutUtils.h"
 #include "nsIScrollableFrame.h"
 #include "nsITimer.h"
+#include "nsClassHashtable.h"      // Jihad T-558: the documents' deferred images
+#include "mozilla/Preferences.h"   // Jihad T-558: jihad.images.lazy
 
 using namespace mozilla::net;
 
@@ -971,17 +973,80 @@ HTMLImageElement::QueueImageLoadTask(bool aAlwaysLoad)
   nsContentUtils::RunInStableState(task.forget());
 }
 
+// Jihad T-558: the deferred images of each document, checked together — right after a scroll event of one of the
+// document's scroll frames (50 ms later, so a drag's events coalesce), and every 2 s as a safety net for layout
+// that moves an image into view without a scroll. Raw pointers: an image leaves the set in StopLazyLoadTimer, which
+// its destructor, UnbindFromTree and every load path call; a document's entry goes when its set empties.
+namespace {
+struct JihadLazyDoc {
+  nsTArray<mozilla::dom::HTMLImageElement*> images;
+  nsCOMPtr<nsITimer> timer;
+  nsIDocument* doc = nullptr;
+};
+typedef nsClassHashtable<nsPtrHashKey<nsIDocument>, JihadLazyDoc> JihadLazyDocs;
+JihadLazyDocs* sJihadLazyDocs = nullptr;
+const uint32_t kJihadLazyScrollDelayMs = 50;
+const uint32_t kJihadLazySafetyMs = 2000;
+
+void JihadLazyArm(JihadLazyDoc* aEntry, uint32_t aMs);
+
 void
-HTMLImageElement::LazyLoadTimerCallback(nsITimer* aTimer, void* aClosure)
+JihadLazyTimerCallback(nsITimer* aTimer, void* aClosure)
 {
-  HTMLImageElement* self = static_cast<HTMLImageElement*>(aClosure);
-  self->mLazyLoadTimer = nullptr;
-  self->MaybeLoadImageFromLazyTimer();
+  JihadLazyDoc* entry = static_cast<JihadLazyDoc*>(aClosure);
+  // the check may load an image (which takes it out of the set) or keep it: walk a copy
+  nsTArray<mozilla::dom::HTMLImageElement*> images(entry->images);
+  for (uint32_t i = 0; i < images.Length(); i++) {
+    if (sJihadLazyDocs && sJihadLazyDocs->Get(entry->doc) == entry && entry->images.Contains(images[i])) {
+      images[i]->MaybeLoadImageFromLazyTimer();
+    }
+  }
+  if (sJihadLazyDocs && sJihadLazyDocs->Get(entry->doc) == entry && !entry->images.IsEmpty()) {
+    JihadLazyArm(entry, kJihadLazySafetyMs);
+  }
+}
+
+void
+JihadLazyArm(JihadLazyDoc* aEntry, uint32_t aMs)
+{
+  if (!aEntry->timer) {
+    aEntry->timer = do_CreateInstance("@mozilla.org/timer;1");
+    if (!aEntry->timer) {
+      return;
+    }
+  } else {
+    aEntry->timer->Cancel();
+  }
+  aEntry->timer->InitWithFuncCallback(JihadLazyTimerCallback, aEntry, aMs, nsITimer::TYPE_ONE_SHOT);
+}
+} // namespace
+
+/* static */ void
+HTMLImageElement::JihadLazyScrolled(nsIDocument* aDoc)
+{
+  if (!sJihadLazyDocs || !aDoc) {
+    return;
+  }
+  JihadLazyDoc* entry = sJihadLazyDocs->Get(aDoc);
+  if (!entry || entry->images.IsEmpty()) {
+    return;
+  }
+  JihadLazyArm(entry, kJihadLazyScrollDelayMs);
 }
 
 bool
 HTMLImageElement::ShouldLazyLoadImage() const
 {
+  // Jihad T-558: a lever measured before it is a default; off, loading="lazy" is read as eager, as before
+  static bool sPrefRead = false;
+  static bool sLazyOn = false;
+  if (!sPrefRead) {
+    sPrefRead = true;
+    sLazyOn = Preferences::GetBool("jihad.images.lazy", false);
+  }
+  if (!sLazyOn) {
+    return false;
+  }
   nsAutoString loading;
   const_cast<HTMLImageElement*>(this)->GetAttr(kNameSpaceID_None, nsGkAtoms::loading, loading);
   return loading.LowerCaseEqualsLiteral("lazy");
@@ -1042,18 +1107,27 @@ HTMLImageElement::ShouldDeferImageLoad() const
 void
 HTMLImageElement::EnsureLazyLoadTimer()
 {
-  if (mLazyLoadTimer || !LoadingEnabled()) {
+  if (mLazyLoadRegistered || !LoadingEnabled()) {
     return;
   }
-
-  mLazyLoadTimer = do_CreateInstance("@mozilla.org/timer;1");
-  if (!mLazyLoadTimer) {
+  nsIDocument* doc = OwnerDoc();
+  if (!doc) {
     return;
   }
-
-  // Poll while deferred so scrolling can promote offscreen images into load range.
-  mLazyLoadTimer->InitWithFuncCallback(LazyLoadTimerCallback, this, 250,
-                                       nsITimer::TYPE_ONE_SHOT);
+  if (!sJihadLazyDocs) {
+    sJihadLazyDocs = new JihadLazyDocs();
+  }
+  JihadLazyDoc* entry = sJihadLazyDocs->Get(doc);
+  if (!entry) {
+    entry = new JihadLazyDoc();
+    entry->doc = doc;
+    sJihadLazyDocs->Put(doc, entry);
+  }
+  entry->images.AppendElement(this);
+  mLazyLoadRegistered = true;
+  if (!entry->timer) {
+    JihadLazyArm(entry, kJihadLazySafetyMs);
+  }
 }
 
 void
@@ -1061,12 +1135,29 @@ HTMLImageElement::StopLazyLoadTimer()
 {
   mLazyLoadAlwaysLoad = false;
 
-  if (!mLazyLoadTimer) {
+  if (!mLazyLoadRegistered) {
     return;
   }
-
-  mLazyLoadTimer->Cancel();
-  mLazyLoadTimer = nullptr;
+  mLazyLoadRegistered = false;
+  if (!sJihadLazyDocs) {
+    return;
+  }
+  nsIDocument* doc = OwnerDoc();
+  JihadLazyDoc* entry = doc ? sJihadLazyDocs->Get(doc) : nullptr;
+  if (!entry) {
+    return;
+  }
+  entry->images.RemoveElement(this);
+  if (entry->images.IsEmpty()) {
+    if (entry->timer) {
+      entry->timer->Cancel();
+    }
+    sJihadLazyDocs->Remove(doc);   // deletes the entry with its timer reference
+    if (sJihadLazyDocs->Count() == 0) {
+      delete sJihadLazyDocs;
+      sJihadLazyDocs = nullptr;
+    }
+  }
 }
 
 void
