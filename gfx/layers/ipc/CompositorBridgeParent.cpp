@@ -11,6 +11,9 @@
 #include <mutex>                        // Jihad T-505 (per part): sJihadPartPaintLock
 #include "CompositableHost.h"           // Jihad T-505 item 4: the tiled layers under the bands
 #include "mozilla/layers/TiledContentHost.h"   // Jihad T-505 item 4: the tiles' buffers (JihadCpuBands)
+#if defined(__ARM_NEON__)
+# include <arm_neon.h>                          // Jihad T-505, the scaler: the bilinear sample in NEON
+#endif
 #include "mozilla/layers/ImageDataSerializer.h"   // Jihad T-505 item 4: a tile buffer's stride
 #include <utility>                      // for pair
 #include "LayerTransactionParent.h"     // for LayerTransactionParent
@@ -1588,15 +1591,31 @@ JihadCpuBandsWanted()
   return sOn;
 }
 
+// T-505, the scaler (2026-11-09; the owner's scale choice (a) after the Deciding Vote of 2026-11-04 had set it
+// aside): a tiled layer painted at resolution 1 under a card zoom below 1 carries a uniform downscale in its
+// effective transform (desktop Wikipedia's fit zoom of 0.69: none of its band frames was at scale 1 in 2026-11-03's
+// census, so every one went to the GPU band pass and its glReadPixels). With JIHAD_GPU_CPU_SCALE=1 such a leaf is
+// composed on the CPU too: each band pixel is the bilinear sample of the four layer pixels around its source point,
+// the GPU pass's linear filter at the same scale, so the paints stay at resolution 1 (the resolution switch's
+// dearer paints, 2026-11-04, are what this avoids). Off until measured on interleaved Wikipedia rounds (T-505).
+static bool
+JihadCpuScaleWanted()
+{
+  static const bool sOn = getenv("JIHAD_GPU_CPU_SCALE") && atoi(getenv("JIHAD_GPU_CPU_SCALE")) != 0;
+  return sOn;
+}
+
 struct JihadCpuLeaf {
   Layer* layer;
   gfx::IntRect clip;   // the layer's scissor on the frame (ContainerPrepare's CalculateScissorRect chain)
   int tx, ty;          // its effective transform: a translation of whole frame pixels
+  bool scaled;         // the scaler: a uniform downscale instead, the translation as it is
+  float scale, ftx, fty;
 };
 
 struct JihadCpuCount {   // the band frames' census (a line every 20 band frames), and this frame's own counts
   uint32_t frames = 0, cpu = 0, could = 0, scaled = 0, fractional = 0, other = 0, masked = 0, blend = 0, group = 0,
-           is3d = 0, transl = 0, lowres = 0, tile = 0, none = 0;
+           is3d = 0, transl = 0, lowres = 0, tile = 0, none = 0, scaledok = 0;   // scaledok: leaves drawn by the scaler
   int leaves = 0, tiled = 0, colour = 0, tiles = 0, rects = 0;
 };
 static JihadCpuCount sJihadCpu;
@@ -1605,10 +1624,10 @@ static void
 JihadCpuLog()
 {
   if ((sJihadCpu.frames % 20) != 0) return;
-  JIHAD_GPU_LOG("[jihad-gpu] cpu bands: %u band frames, %u composed on the CPU (%u could be); not: scaled %u, fractional %u, not tiled or colour %u, masked %u, blend %u, group %u, 3d %u, translucent %u, low-res or resolution %u, tile format %u; no layer %u\n",
+  JIHAD_GPU_LOG("[jihad-gpu] cpu bands: %u band frames, %u composed on the CPU (%u could be); not: scaled %u, fractional %u, not tiled or colour %u, masked %u, blend %u, group %u, 3d %u, translucent %u, low-res or resolution %u, tile format %u; no layer %u; %u leaves by the scaler\n",
                 sJihadCpu.frames, sJihadCpu.cpu, sJihadCpu.could, sJihadCpu.scaled, sJihadCpu.fractional, sJihadCpu.other,
                 sJihadCpu.masked, sJihadCpu.blend, sJihadCpu.group, sJihadCpu.is3d, sJihadCpu.transl, sJihadCpu.lowres,
-                sJihadCpu.tile, sJihadCpu.none);
+                sJihadCpu.tile, sJihadCpu.none, sJihadCpu.scaledok);
 }
 
 // a rect on the frame meets one of the band rows
@@ -1669,10 +1688,17 @@ JihadCpuCollect(Layer* aLayer, const RenderTargetIntRect& aParentClip, bool aRoo
   if (!JihadCpuMeets(ob, aBands, aW, aH)) return true;
   if (!is2d) { aN.is3d++; return false; }
   // a scale of 1 within float noise (a scale of 1.0009 over 1024 px is a pixel at the edge, review F7) and a
-  // translation of whole pixels (SnapTransformTranslation's)
-  if (fabsf(m._11 - 1.0f) > 2e-5f || fabsf(m._22 - 1.0f) > 2e-5f || fabsf(m._12) > 2e-5f || fabsf(m._21) > 2e-5f) { aN.scaled++; return false; }
+  // translation of whole pixels (SnapTransformTranslation's); or, with the scaler, a uniform downscale between
+  // 0.25 and 1 (the card's zoom below 1 over tiles at resolution 1), its translation taken as it is
+  if (fabsf(m._12) > 2e-5f || fabsf(m._21) > 2e-5f) { aN.scaled++; return false; }
+  const bool unit = fabsf(m._11 - 1.0f) <= 2e-5f && fabsf(m._22 - 1.0f) <= 2e-5f;
+  bool scaled = false; float scale = 1.0f;
+  if (!unit) {
+    if (!JihadCpuScaleWanted() || fabsf(m._11 - m._22) > 1e-4f || m._11 < 0.25f || m._11 > 1.0f) { aN.scaled++; return false; }
+    scaled = true; scale = m._11;
+  }
   const int itx = (int)lroundf(m._31), ity = (int)lroundf(m._32);
-  if (fabsf(m._31 - (float)itx) > 0.01f || fabsf(m._32 - (float)ity) > 0.01f) { aN.fractional++; return false; }
+  if (!scaled && (fabsf(m._31 - (float)itx) > 0.01f || fabsf(m._32 - (float)ity) > 0.01f)) { aN.fractional++; return false; }
   if (aLayer->GetMaskLayer() || aLayer->GetAncestorMaskLayerCount() > 0) { aN.masked++; return false; }
   if (aLayer->GetMixBlendMode() != gfx::CompositionOp::OP_OVER) { aN.blend++; return false; }
   if (aLayer->GetEffectiveOpacity() < 0.999f) { aN.transl++; return false; }
@@ -1696,7 +1722,8 @@ JihadCpuCollect(Layer* aLayer, const RenderTargetIntRect& aParentClip, bool aRoo
       TileHost& tile = tb.GetTile(i);
       if (tile.IsPlaceholderTile()) continue;
       const gfx::IntPoint off = tb.GetTileOffset(tb.GetPlacement().TilePosition(i));
-      const int ty0 = off.y + ity, ty1 = ty0 + ts.height;
+      const int ty0 = scaled ? (int)floorf(off.y * scale + m._32) : off.y + ity;
+      const int ty1 = scaled ? (int)ceilf((off.y + ts.height) * scale + m._32) : ty0 + ts.height;
       bool under = false;
       for (int b = 0; b < 2; b++) {
         const int lo = std::max(0, aBands[b][0]), hi = std::min(aH, aBands[b][1]);
@@ -1722,9 +1749,200 @@ JihadCpuCollect(Layer* aLayer, const RenderTargetIntRect& aParentClip, bool aRoo
   leaf.layer = aLayer;
   leaf.clip = gfx::IntRect(clip.x, clip.y, clip.width, clip.height);
   leaf.tx = itx; leaf.ty = ity;
+  leaf.scaled = scaled; leaf.scale = scale; leaf.ftx = m._31; leaf.fty = m._32;
+  if (scaled) aN.scaledok++;
   aLeaves.AppendElement(leaf);
   aN.leaves++;
   return true;
+}
+
+static gfx::IntRect JihadCoveredPixels(const gfx::Rect& aR);   // below
+static inline void JihadCpuOver(uint8_t* d, const uint8_t* s, int n);   // below
+
+// T-505, the scaler: a tiled leaf under a uniform downscale drawn into a band. For each rect of the layer's drawn
+// region (valid tiles within the visible region, in layer pixels) the band pixels it covers at the scale are
+// visited; a pixel's source point is ((x + 0.5 - tx) / s - 0.5, (y + 0.5 - ty) / s - 0.5) in layer pixels, its
+// value the bilinear sample of the four layer pixels around that point (the GPU pass's linear filter at the same
+// scale), the neighbours clamped to the rect (no sample from outside what is drawn). Weights in 1/256ths;
+// premultiplied, "over" when a tile's format carries alpha.
+// How the pixels are reached (the builds of 2026-11-09): a tile sits at GetTileOffset, the grid's ORIGIN plus its
+// position times the tile size — a layer small enough for one tile has that tile where the layer's region is, not
+// at a multiple of the tile size (the title block of Wikipedia: one 601x71 tile at 263,92; the first builds looked
+// the tiles up from a grid at 0,0 and drew nothing for it, 2026-11-09's verify). Each source row a sample needs is
+// copied once into a cached buffer (one memcpy per tile column) and the samples read from that: the per-pixel
+// reads straight from the tiles' shared buffers cost 260-520 us a band row on the device (the second and third
+// builds), a sequential copy does not. A pixel one of whose four sources is not a tile's bytes (a placeholder, no
+// buffer) is left as it was.
+struct JihadCpuTileRef { const uint8_t* base; int stride; bool alpha; bool ok; };
+struct JihadCpuSrcRow { int sy; nsTArray<uint8_t> px; nsTArray<uint8_t> ok; bool alpha; };
+static void
+JihadCpuDrawScaled(uint8_t* aDest, int aStride, const JihadCpuLeaf& aLf, TiledLayerBufferComposite& aTb,
+                   const nsIntRegion& aRegion, const gfx::IntRect& aBand, JihadCpuCount& aN)
+{
+  const gfx::IntSize ts = aTb.GetTileSize();
+  const TilesPlacement& pl = aTb.GetPlacement();
+  const gfx::IntPoint org = aTb.GetTileOffset(TileIntPoint(0, 0));   // the grid's origin in layer pixels
+  const float s = aLf.scale, inv = 1.0f / s;
+  const int tw = ts.width, th = ts.height;
+  auto tileDiv = [](int v, int len) -> int { return (v >= 0) ? v / len : -((-v - 1) / len) - 1; };
+  auto tileAt = [&](int tpx, int tpy) -> JihadCpuTileRef {
+    JihadCpuTileRef r; r.base = nullptr; r.stride = 0; r.alpha = false; r.ok = false;
+    const TileIntPoint pos(tpx, tpy);
+    if (!pl.HasTile(pos)) return r;
+    TileHost& tile = aTb.GetTile(pl.TileIndex(pos));
+    if (tile.IsPlaceholderTile() || !tile.mTextureHost) return r;
+    BufferTextureHost* bh = tile.mTextureHost->AsBufferTextureHost();
+    if (!bh || bh->GetBufferDescriptor().type() != BufferDescriptor::TRGBDescriptor || !bh->GetBuffer()) return r;
+    const RGBDescriptor& rgb = bh->GetBufferDescriptor().get_RGBDescriptor();
+    r.base = bh->GetBuffer(); r.stride = ImageDataSerializer::GetRGBStride(rgb);
+    r.alpha = rgb.format() == gfx::SurfaceFormat::B8G8R8A8; r.ok = true;
+    return r;
+  };
+  static int sDiag = 0;   // the first leaves drawn, described (the scaler's rounds)
+  const bool diag = sDiag < 6;
+  if (diag) {
+    sDiag++;
+    const gfx::IntRect rb = aRegion.GetBounds();
+    JIHAD_GPU_LOG("[jihad-gpu] scaler leaf: scale %.4f t %.2f,%.2f tiles %dx%d at %d,%d first %d,%d size %dx%d (%u tiles), region %d rects bounds %d,%d %dx%d, clip %d,%d %dx%d, band rows %d..%d\n",
+                  s, aLf.ftx, aLf.fty, tw, th, org.x, org.y, pl.mFirst.x, pl.mFirst.y, pl.mSize.width, pl.mSize.height, aTb.GetTileCount(),
+                  aRegion.GetNumRects(), rb.x, rb.y, rb.width, rb.height, aLf.clip.x, aLf.clip.y, aLf.clip.width, aLf.clip.height, aBand.y, aBand.YMost());
+  }
+  long diagPx = 0, diagSkip = 0, diagRects = 0;
+  const TimeStamp diagT0 = TimeStamp::Now();
+  nsTArray<int> ix0s, ix1s, tc0s, tc1s, wxs;   // per band column: the two source columns (byte offsets in a copied row), their tile columns, the weight
+  JihadCpuSrcRow cache[2];
+  nsTArray<uint8_t> rowBuf, vrow;   // the band row composed here; the two source rows blended down
+  for (auto it = aRegion.RectIter(); !it.Done(); it.Next()) {
+    const gfx::IntRect vr = it.Get();
+    if (vr.IsEmpty()) continue;
+    gfx::IntRect dr = JihadCoveredPixels(gfx::Rect(vr.x * s + aLf.ftx, vr.y * s + aLf.fty, vr.width * s, vr.height * s));
+    dr = dr.Intersect(aLf.clip).Intersect(aBand);
+    if (dr.IsEmpty()) continue;
+    diagRects++;
+    // The samples' reach: one layer pixel past the rect on each side where a tile holds it (the GPU's linear filter
+    // reads the texel beyond a rect's edge inside a tile and duplicates only at a tile's edge; clamped at the rect,
+    // the fourth build differed from the GPU by one row at every rect seam — 1 wrong row a frame, 2026-11-09's verify)
+    auto hasTile = [&](int lx, int ly) -> bool {
+      const TileIntPoint pos(tileDiv(lx - org.x, tw), tileDiv(ly - org.y, th));
+      return pl.HasTile(pos) && !aTb.GetTile(pl.TileIndex(pos)).IsPlaceholderTile();
+    };
+    const int xLo = hasTile(vr.x - 1, vr.y) ? vr.x - 1 : vr.x, xHi = hasTile(vr.XMost(), vr.y) ? vr.XMost() + 1 : vr.XMost();
+    const int yLo = hasTile(vr.x, vr.y - 1) ? vr.y - 1 : vr.y, yHi = hasTile(vr.x, vr.YMost()) ? vr.YMost() + 1 : vr.YMost();
+    const int tcMin = tileDiv(xLo - org.x, tw), tcMax = tileDiv(xHi - 1 - org.x, tw), nTc = tcMax - tcMin + 1;
+    ix0s.SetLength(dr.width); ix1s.SetLength(dr.width); tc0s.SetLength(dr.width); tc1s.SetLength(dr.width); wxs.SetLength(dr.width);
+    for (int i = 0; i < dr.width; i++) {
+      const float u = ((float)(dr.x + i) + 0.5f - aLf.ftx) * inv - 0.5f;
+      int ix = (int)floorf(u);
+      int wx = (int)lroundf((u - (float)ix) * 256.0f);
+      if (wx >= 256) { ix++; wx = 0; }
+      int ix1 = ix + 1;
+      ix = std::max(xLo, std::min(xHi - 1, ix)); ix1 = std::max(xLo, std::min(xHi - 1, ix1));
+      ix0s[i] = (ix - xLo) * 4; ix1s[i] = (ix1 - xLo) * 4;
+      tc0s[i] = tileDiv(ix - org.x, tw) - tcMin; tc1s[i] = tileDiv(ix1 - org.x, tw) - tcMin;
+      wxs[i] = wx;
+    }
+    cache[0].sy = INT32_MIN; cache[1].sy = INT32_MIN;
+    // a source row of this rect, copied once: its pixels over vr's columns, per tile column whether the tile had bytes
+    auto fetch = [&](int sy) -> JihadCpuSrcRow& {
+      if (cache[0].sy == sy) return cache[0];
+      if (cache[1].sy == sy) return cache[1];
+      JihadCpuSrcRow& r = cache[sy & 1];
+      r.sy = sy; r.px.SetLength((size_t)(xHi - xLo) * 4); r.ok.SetLength(nTc); r.alpha = false;
+      const int tr = tileDiv(sy - org.y, th);
+      const int tileY = org.y + tr * th;
+      for (int c = 0; c < nTc; c++) {
+        const int tc = tcMin + c;
+        const JihadCpuTileRef t = tileAt(tc, tr);
+        r.ok[c] = t.ok ? 1 : 0;
+        if (!t.ok) continue;
+        if (t.alpha) r.alpha = true;
+        const int tx0 = org.x + tc * tw;
+        const int x0 = std::max(xLo, tx0), x1 = std::min(xHi, tx0 + tw);
+        if (x1 <= x0) continue;
+        memcpy(r.px.Elements() + (size_t)(x0 - xLo) * 4, t.base + (size_t)(sy - tileY) * t.stride + (size_t)(x0 - tx0) * 4, (size_t)(x1 - x0) * 4);
+      }
+      return r;
+    };
+    for (int y = dr.y; y < dr.YMost(); y++) {
+      const float v = ((float)y + 0.5f - aLf.fty) * inv - 0.5f;
+      int iy = (int)floorf(v);
+      int wy = (int)lroundf((v - (float)iy) * 256.0f);
+      if (wy >= 256) { iy++; wy = 0; }
+      int iy1 = iy + 1;
+      iy = std::max(yLo, std::min(yHi - 1, iy)); iy1 = std::max(yLo, std::min(yHi - 1, iy1));
+      const JihadCpuSrcRow& r0 = fetch(iy);
+      const JihadCpuSrcRow& r1 = (iy1 == iy) ? r0 : fetch(iy1);
+      const bool anyAlpha = r0.alpha || r1.alpha;
+      const uint8_t* ok0 = r0.ok.Elements(); const uint8_t* ok1 = r1.ok.Elements();
+      bool allOk = true;
+      for (int c = 0; c < nTc; c++) { if (!ok0[c] || !ok1[c]) { allOk = false; break; } }
+      // Two passes (the sixth build sampled each pixel in NEON with a transfer to ARM registers each, 160 ns a
+      // pixel — no better than the scalar 200): first the two source rows blended DOWN into one row at this output
+      // row's weight, 16 bytes an instruction group in NEON (plain bytes without it); then that row resampled
+      // ACROSS, each output pixel the lerp of its two source pixels on packed 32-bit words (a pixel's two channel
+      // pairs multiplied at once), "over" the standing pixel where the tiles carry alpha.
+      const int spanPx = xHi - xLo;
+      vrow.SetLength((size_t)spanPx * 4);
+      {
+        const uint8_t* s0 = r0.px.Elements(); const uint8_t* s1 = r1.px.Elements();
+        uint8_t* v = vrow.Elements();
+        const unsigned w1 = (unsigned)wy, w0 = 256 - w1;
+        const size_t nBytes = (size_t)spanPx * 4;
+        size_t k = 0;
+        if (w1 == 0) { memcpy(v, s0, nBytes); k = nBytes; }
+        else if (w0 == 0) { memcpy(v, s1, nBytes); k = nBytes; }
+#if defined(__ARM_NEON__)
+        else {
+          // w0 and w1 are both 1..255 here and sum to 256: a*w0 + b*w1 <= 255*256 fits 16 bits, and the rounding
+          // narrow by 8 is the division by the sum (the seventh build divided by 255 and overflowed: white wrapped to
+          // black in whole bands, 2026-11-09's verify)
+          const uint8x8_t vw0 = vdup_n_u8((uint8_t)w0);
+          const uint8x8_t vw1 = vdup_n_u8((uint8_t)w1);
+          for (; k + 16 <= nBytes; k += 16) {
+            const uint8x16_t a = vld1q_u8(s0 + k), b = vld1q_u8(s1 + k);
+            uint16x8_t lo = vmull_u8(vget_low_u8(a), vw0);  lo = vmlal_u8(lo, vget_low_u8(b), vw1);
+            uint16x8_t hi = vmull_u8(vget_high_u8(a), vw0); hi = vmlal_u8(hi, vget_high_u8(b), vw1);
+            vst1q_u8(v + k, vcombine_u8(vrshrn_n_u16(lo, 8), vrshrn_n_u16(hi, 8)));
+          }
+        }
+#endif
+        for (; k < nBytes; k++) v[k] = (uint8_t)((s0[k] * w0 + s1[k] * w1 + 128) >> 8);
+      }
+      const uint32_t* vr32 = reinterpret_cast<const uint32_t*>(vrow.Elements());
+      uint8_t* d = aDest + (size_t)y * aStride + (size_t)dr.x * 4;
+      rowBuf.SetLength((size_t)dr.width * 4);
+      uint32_t* o32 = reinterpret_cast<uint32_t*>(rowBuf.Elements());
+      if (anyAlpha || !allOk) memcpy(rowBuf.Elements(), d, (size_t)dr.width * 4);   // "over" needs the standing pixels; so does a pixel with no source
+      const int* ix0 = ix0s.Elements(); const int* ix1 = ix1s.Elements(); const int* wxp = wxs.Elements();
+      const int* tc0 = tc0s.Elements(); const int* tc1 = tc1s.Elements();
+      for (int i = 0; i < dr.width; i++) {
+        if (!allOk && (!ok0[tc0[i]] || !ok0[tc1[i]] || !ok1[tc0[i]] || !ok1[tc1[i]])) { diagSkip++; continue; }
+        diagPx++;
+        const uint32_t p = vr32[ix0[i] >> 2], q = vr32[ix1[i] >> 2];
+        const uint32_t w1 = (uint32_t)wxp[i], w0 = 256 - w1;
+        const uint32_t rb = (((p & 0x00FF00FFu) * w0 + (q & 0x00FF00FFu) * w1) >> 8) & 0x00FF00FFu;
+        const uint32_t ag = (((p >> 8) & 0x00FF00FFu) * w0 + ((q >> 8) & 0x00FF00FFu) * w1) & 0xFF00FF00u;
+        uint32_t out = rb | ag;
+        if (anyAlpha) {
+          const uint32_t a = out >> 24;
+          if (a == 0) continue;
+          if (a < 255) {
+            const uint32_t dst = o32[i], k = 255 - a;
+            uint32_t drb = (dst & 0x00FF00FFu) * k, dag = ((dst >> 8) & 0x00FF00FFu) * k;
+            drb += 0x00800080u; drb = ((drb + ((drb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+            dag += 0x00800080u; dag = (dag + ((dag >> 8) & 0x00FF00FFu)) & 0xFF00FF00u;
+            out += drb | dag;   // premultiplied: each channel stays within its byte
+          }
+        } else {
+          out |= 0xFF000000u;
+        }
+        o32[i] = out;
+      }
+      memcpy(d, rowBuf.Elements(), (size_t)dr.width * 4);
+    }
+    aN.rects++;
+  }
+  if (diag) JIHAD_GPU_LOG("[jihad-gpu] scaler leaf done: %ld rects drawn, %ld pixels written, %ld skipped (no tile bytes), %.1f ms\n", diagRects, diagPx, diagSkip, (TimeStamp::Now() - diagT0).ToMilliseconds());
 }
 
 // premultiplied "over" of n pixels (B8G8R8A8), as the compositor's blend (ONE, ONE_MINUS_SRC_ALPHA)
@@ -1752,6 +1970,7 @@ JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, con
 {
   uint8_t* dest = aReq->dest;
   const int stride = aReq->stride;
+  nsTArray<uint8_t> rowBuf;   // a row composed here and written to the frame once (write-through memory)
   for (int b = 0; b < 2; b++) {
     const int lo = std::max(0, aBands[b][0]), hi = std::min(aH, aBands[b][1]);
     if (hi <= lo) continue;
@@ -1763,7 +1982,11 @@ JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, con
       if (l->GetType() == Layer::TYPE_COLOR) {
         ColorLayer* cl = l->AsColorLayer();
         gfx::IntRect r = cl->GetBounds();
-        r.MoveBy(lf.tx, lf.ty);
+        if (lf.scaled) {   // the scaler: the bounds at the scale, the pixels whose centres they cover
+          r = JihadCoveredPixels(gfx::Rect(r.x * lf.scale + lf.ftx, r.y * lf.scale + lf.fty, r.width * lf.scale, r.height * lf.scale));
+        } else {
+          r.MoveBy(lf.tx, lf.ty);
+        }
         r = r.Intersect(lf.clip).Intersect(band);
         if (r.IsEmpty()) continue;
         const gfx::Color c = cl->GetColor();
@@ -1772,12 +1995,21 @@ JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, con
                           (uint8_t)lroundf(std::max(0.0f, std::min(1.0f, c.g)) * a * 255.0f),
                           (uint8_t)lroundf(std::max(0.0f, std::min(1.0f, c.r)) * a * 255.0f),
                           (uint8_t)lroundf(a * 255.0f) };
-        for (int y = r.y; y < r.YMost(); y++) {
-          uint8_t* d = dest + (size_t)y * stride + (size_t)r.x * 4;
-          if (px[3] == 255) {
-            for (int x = 0; x < r.width; x++, d += 4) { d[0] = px[0]; d[1] = px[1]; d[2] = px[2]; d[3] = px[3]; }
-          } else {
-            for (int x = 0; x < r.width; x++, d += 4) JihadCpuOver(d, px, 1);
+        // The fill is composed in a cached row and written to the frame once per row: the frame rows are
+        // write-through memory (JihadFrameWindow.h), where a byte store or a read costs a bus round trip each —
+        // Wikipedia's white background under a band took ~40 ms of the fourth scaler build's 43 ms "draw"
+        // (2026-11-09), the scaler itself a few; a memcpy writes whole words in bursts.
+        rowBuf.SetLength((size_t)r.width * 4);
+        uint8_t* rb = rowBuf.Elements();
+        if (px[3] == 255) {
+          for (int x = 0; x < r.width; x++) memcpy(rb + (size_t)x * 4, px, 4);
+          for (int y = r.y; y < r.YMost(); y++) memcpy(dest + (size_t)y * stride + (size_t)r.x * 4, rb, (size_t)r.width * 4);
+        } else {
+          for (int y = r.y; y < r.YMost(); y++) {
+            uint8_t* d = dest + (size_t)y * stride + (size_t)r.x * 4;
+            memcpy(rb, d, (size_t)r.width * 4);
+            for (int x = 0; x < r.width; x++) JihadCpuOver(rb + (size_t)x * 4, px, 1);
+            memcpy(d, rb, (size_t)r.width * 4);
           }
         }
         aN.rects++;
@@ -1791,6 +2023,13 @@ JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, con
       nsIntRegion region = tb.GetValidRegion();
       if (l->MayResample()) region.AndWith(l->GetLocalVisibleRegion().GetBounds().ToUnknownRect());
       else region.AndWith(l->GetLocalVisibleRegion().ToUnknownRegion());
+      if (lf.scaled) {   // the scaler: the band's rows in layer pixels (a row wider each side for the samples' neighbours)
+        const int ly0 = (int)floorf((band.y - lf.fty) / lf.scale) - 1, ly1 = (int)ceilf((band.YMost() - lf.fty) / lf.scale) + 1;
+        region.AndWith(gfx::IntRect(INT32_MIN / 2, ly0, INT32_MAX, ly1 - ly0));
+        JihadCpuDrawScaled(dest, stride, lf, tb, region, band, aN);
+        aN.tiles++;
+        continue;
+      }
       // only the tiles under this band are touched (the rest were not checked, review F9)
       {
         gfx::IntRect bandLayer = band;
@@ -1820,11 +2059,16 @@ JihadCpuDraw(JihadFrameRequest* aReq, const nsTArray<JihadCpuLeaf>& aLeaves, con
           // the tile's pixel under the frame's (x, y) is (x - tx - off.x, y - ty - off.y)
           const int sx = r.x - lf.tx - off.x, sy = r.y - lf.ty - off.y;
           if (sx < 0 || sy < 0 || sx + r.width > ts.width || sy + r.height > ts.height) continue;
+          if (alpha) rowBuf.SetLength((size_t)r.width * 4);
           for (int y = 0; y < r.height; y++) {
             const uint8_t* s = src + (size_t)(sy + y) * sstride + (size_t)sx * 4;
             uint8_t* d = dest + (size_t)(r.y + y) * stride + (size_t)r.x * 4;
-            if (alpha) JihadCpuOver(d, s, r.width);
-            else memcpy(d, s, (size_t)r.width * 4);
+            if (alpha) {   // "over" needs the standing pixels: read once, blend in the cached row, write once
+              uint8_t* rb = rowBuf.Elements();
+              memcpy(rb, d, (size_t)r.width * 4); JihadCpuOver(rb, s, r.width); memcpy(d, rb, (size_t)r.width * 4);
+            } else {
+              memcpy(d, s, (size_t)r.width * 4);
+            }
           }
           aN.rects++;
           used = true;
