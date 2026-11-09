@@ -1315,6 +1315,7 @@ void HTMLMediaElement::DoLoad()
   // view" of a gallery of videos.
   if (EventStateManager::IsHandlingUserInput()) {
     mHasUserInteraction = true;
+    mJihadGestured = true;
   }
 
   SetPlayedOrSeeked(false);
@@ -1750,6 +1751,26 @@ static bool IsAutoplayEnabled()
   return Preferences::GetBool("media.autoplay.enabled");
 }
 
+// Jihad T-603: jihad.media.autoplayWithSound (live: the settings page's row applies at once). True is upstream's
+// behaviour (pages may start media with sound by themselves); false lets a page start media only muted (or at
+// volume 0) until the user's gesture reaches the element, and pauses one a script unmutes without a gesture.
+static bool sJihadAutoplayWithSound = true;
+static bool JihadAutoplayWithSound()
+{
+  static bool sCached = false;
+  if (!sCached) {
+    sCached = true;
+    Preferences::AddBoolVarCache(&sJihadAutoplayWithSound, "jihad.media.autoplayWithSound", true);
+  }
+  return sJihadAutoplayWithSound;
+}
+
+bool
+HTMLMediaElement::JihadSoundBlocked() const
+{
+  return !JihadAutoplayWithSound() && !mJihadGestured && !EventStateManager::IsHandlingUserInput() && JihadAudible();
+}
+
 void HTMLMediaElement::UpdatePreloadAction()
 {
   PreloadAction nextAction = PRELOAD_UNDEFINED;
@@ -2036,6 +2057,7 @@ HTMLMediaElement::Seek(double aTime,
   // play will not be blocked when initiated by a script.
   if (EventStateManager::IsHandlingUserInput()) {
     mHasUserInteraction = true;
+    mJihadGestured = true;
   }
 
   StopSuspendingAfterFirstFrame();
@@ -2303,11 +2325,15 @@ HTMLMediaElement::SetVolume(double aVolume, ErrorResult& aRv)
     return;
 
   mVolume = aVolume;
+  if (EventStateManager::IsHandlingUserInput()) {
+    mJihadGestured = true;
+  }
 
   // Here we want just to update the volume.
   SetVolumeInternal();
 
   DispatchAsyncEvent(NS_LITERAL_STRING("volumechange"));
+  JihadPauseIfSoundBlocked();
 }
 
 NS_IMETHODIMP HTMLMediaElement::SetVolume(double aVolume)
@@ -2403,6 +2429,9 @@ NS_IMETHODIMP HTMLMediaElement::SetMuted(bool aMuted)
     return NS_OK;
   }
 
+  if (EventStateManager::IsHandlingUserInput()) {
+    mJihadGestured = true;
+  }
   if (aMuted) {
     SetMutedInternal(mMuted | MUTED_BY_CONTENT);
   } else {
@@ -2410,7 +2439,20 @@ NS_IMETHODIMP HTMLMediaElement::SetMuted(bool aMuted)
   }
 
   DispatchAsyncEvent(NS_LITERAL_STRING("volumechange"));
+  JihadPauseIfSoundBlocked();
   return NS_OK;
+}
+
+// Jihad T-603: a playing element a script made audible without the user's gesture is paused (as Chromium does under
+// its autoplay policy), with the pref off; the page sees an ordinary pause.
+void
+HTMLMediaElement::JihadPauseIfSoundBlocked()
+{
+  if (!mPaused && JihadSoundBlocked()) {
+    ErrorResult rv;
+    Pause(rv);
+    rv.SuppressException();
+  }
 }
 
 class HTMLMediaElement::StreamCaptureTrackSource :
@@ -3272,6 +3314,14 @@ HTMLMediaElement::NotifyXPCOMShutdown()
 already_AddRefed<Promise>
 HTMLMediaElement::Play(ErrorResult& aRv)
 {
+  // Jihad T-603: a play() our autoplay-with-sound gate refuses is REJECTED with NotAllowedError, as current browsers
+  // do: pages test for it and fall back to a muted start (upstream's pending promise below never settles, so such a
+  // page waited forever; found by the autoplay-sound finger script, 2026-11-09). The load goes on, so a tap can play.
+  if (JihadSoundBlocked()) {
+    MaybeDoLoad();
+    aRv.Throw(NS_ERROR_DOM_MEDIA_NOT_ALLOWED_ERR);
+    return nullptr;
+  }
   if (!IsAllowedToPlay()) {
     MaybeDoLoad();
     
@@ -3333,6 +3383,9 @@ HTMLMediaElement::PlayInternal(ErrorResult& aRv)
 
   // Play was not blocked so assume user interacted with the element.
   mHasUserInteraction = true;
+  if (EventStateManager::IsHandlingUserInput()) {
+    mJihadGestured = true;   // Jihad T-603: only a real gesture lets it make sound later
+  }
 
   StopSuspendingAfterFirstFrame();
   SetPlayedOrSeeked(true);
@@ -5087,6 +5140,10 @@ bool HTMLMediaElement::CanActivateAutoplay()
     return false;
   }
 
+  if (JihadSoundBlocked()) {   // Jihad T-603: the autoplay attribute starts an audible element only after a gesture
+    return false;
+  }
+
   bool hasData =
     (mDecoder && mReadyState >= nsIDOMHTMLMediaElement::HAVE_ENOUGH_DATA) ||
     (mSrcStream && mSrcStream->Active()) ||
@@ -6108,6 +6165,11 @@ HTMLMediaElement::IsAllowedToPlay()
   if (!mHasUserInteraction &&
       !IsAutoplayEnabled() &&
       !EventStateManager::IsHandlingUserInput()) {
+    return false;
+  }
+
+  // Jihad T-603: with jihad.media.autoplayWithSound false, a page starts media by itself only muted
+  if (JihadSoundBlocked()) {
     return false;
   }
 

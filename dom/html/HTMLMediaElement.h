@@ -1650,6 +1650,14 @@ private:
   // Used to block autoplay when disabled.
   bool mHasUserInteraction;
 
+  // Jihad (T-603, cavekit-gre-widgets.md R1, from the Atlas app's "Autoplay media with sound"): a user's gesture has
+  // reached this element (a tap that played, loaded, seeked, unmuted or set its volume). With the pref
+  // jihad.media.autoplayWithSound false, the element may make sound only after one; muted it plays freely.
+  bool mJihadGestured = false;
+  bool JihadAudible() const { return !Muted() && mVolume > 0.0; }
+  bool JihadSoundBlocked() const;   // the pref is off, no gesture yet, and the element would be heard
+  void JihadPauseIfSoundBlocked();
+
   // True if the first frame has been successfully loaded.
   bool mFirstFrameLoaded;
 
