@@ -22,6 +22,12 @@
 #include "vm/TraceLogging.h"
 #include "wasm/WasmIonCompile.h"
 
+#if defined(XP_LINUX)
+# include <sys/resource.h>   // Jihad T-556: the helpers' nice value
+# include <sys/syscall.h>
+# include <unistd.h>
+#endif
+
 #include "jscntxtinlines.h"
 #include "jscompartmentinlines.h"
 #include "jsobjinlines.h"
@@ -68,6 +74,24 @@ js::EnsureHelperThreadsInitialized()
     return gHelperThreadState->ensureInitialized();
 }
 
+// Jihad (cavekit-lowpower-uxp.md R2, T-556): the helper threads sized and placed for a two-core device by the
+// environment, each switch measured against the baseline before it is a default; unset, everything is as upstream.
+//   JIHAD_JS_HELPER_THREADS=<n>  the pool's size (upstream: cores + 4 = 6 on the TouchPad), at least 2
+//   JIHAD_JS_ION_THREADS=<n>     Ion compilations at once (upstream: the whole pool)
+//   JIHAD_JS_PARSE_THREADS=<n>   off-thread parses at once (upstream: 2, issue #3050)
+//   JIHAD_JS_HELPER_NICE=<n>     the helpers' nice value on Linux (upstream: the process's), 1..19
+static size_t
+JihadEnvCount(const char* aName, size_t aDefault, size_t aMin)
+{
+    const char* e = getenv(aName);
+    if (!e || !*e)
+        return aDefault;
+    long v = strtol(e, nullptr, 10);
+    if (v < (long)aMin)
+        v = (long)aMin;
+    return (size_t)v;
+}
+
 static size_t
 ThreadCountForCPUCount(size_t cpuCount)
 {
@@ -78,7 +102,7 @@ ThreadCountForCPUCount(size_t cpuCount)
     // calculated here just adds some extra capacity on top. Use threadCount
     // with care as it may end up deadlocking.
     static const uint32_t EXCESS_THREADS = 4;
-    return cpuCount + EXCESS_THREADS;
+    return JihadEnvCount("JIHAD_JS_HELPER_THREADS", cpuCount + EXCESS_THREADS, 2);
 }
 
 void
@@ -921,6 +945,9 @@ GlobalHelperThreadState::maxIonCompilationThreads() const
 {
     if (IsHelperThreadSimulatingOOM(js::oom::THREAD_TYPE_ION))
         return 1;
+    static const size_t sJihadIon = JihadEnvCount("JIHAD_JS_ION_THREADS", 0, 1);   // 0: unset
+    if (sJihadIon && sJihadIon < threadCount)
+        return sJihadIon;
     return threadCount;
 }
 
@@ -947,7 +974,8 @@ GlobalHelperThreadState::maxParseThreads() const
     // For the time being, return a hard-coded value of 2 on all targets and CPUs.
     // It's unclear where the contention happens, but it has shown to be detrimental
     // especially on *nixes and older hardware. 
-    return 2;
+    static const size_t sJihadParse = JihadEnvCount("JIHAD_JS_PARSE_THREADS", 2, 1);   // Jihad T-556
+    return sJihadParse;
 }
 
 size_t
@@ -1403,6 +1431,16 @@ void
 HelperThread::ThreadMain(void* arg)
 {
     ThisThread::SetName("JS Helper");
+
+#if defined(XP_LINUX)
+    // Jihad T-556: the helpers below the main thread and the compositor when asked (the page's own compile and
+    // parse work must not take a core from the thread that answers the card)
+    {
+        static const size_t sNice = JihadEnvCount("JIHAD_JS_HELPER_NICE", 0, 0);
+        if (sNice >= 1 && sNice <= 19)
+            setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), (int)sNice);
+    }
+#endif
 
     //See bug 1104658.
     //Set the FPU control word to be the same as the main thread's, or math
