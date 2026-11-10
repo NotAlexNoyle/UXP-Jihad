@@ -1213,6 +1213,95 @@ CompositorBridgeParent::JihadHideForJob()
 // (gJihadPartsGen: a daemon with the one signature reads every part when any paint happened under one, as before).
 // A content leaf drawn after a part (above it, in paint order) whose pixels meet it is a cover: a popup over a fixed
 // bar, a page over a fixed background
+// T-606: a leaf drawn above a part covers it only where its pixels are not transparent. Desktop Wikipedia's article
+// layer sits above its two sticky sidebars by design (a positioned body after them in one stacking context) and never
+// draws on them, but FrameLayerBuilder simplifies a painted layer's visible region to four rects (Accumulate's
+// SimplifyOutward(4)), and the bound covers the sidebars: three such "covers" turned the CPU parts off for the document
+// (T-605's rounds). For a tiled painted layer under an axis-aligned transform, the tiles under the overlap are read from
+// their shared memory, as the CPU band path reads them, and the layer covers the part only where a tile pixel is drawn:
+// alpha above 0, or with component alpha a pixel that is not black on black and white on white. A tile's drawn bounds
+// are kept per texture and update count (a repaint bumps it), so a tile is read once per paint. Any other layer covers
+// as before.
+struct JihadTileInk { const uint8_t* buf = nullptr; uint32_t serial = 0; const uint8_t* white = nullptr; uint32_t wserial = 0; gfx::IntRect ink; };
+static std::map<const void*, JihadTileInk> sJihadTileInk;   // the compositor thread's
+
+static gfx::IntRect
+JihadTileInkOf(BufferTextureHost* aBh, BufferTextureHost* aWhite)
+{
+  const RGBDescriptor& rgb = aBh->GetBufferDescriptor().get_RGBDescriptor();
+  const int w = rgb.size().width, h = rgb.size().height;
+  const uint8_t* b = aBh->GetBuffer();
+  if (!b || (rgb.format() != gfx::SurfaceFormat::B8G8R8A8 && !aWhite)) return gfx::IntRect(0, 0, w, h);   // opaque
+  const int bs = ImageDataSerializer::GetRGBStride(rgb);
+  const uint8_t* wt = nullptr;
+  int ws = 0;
+  if (aWhite) {
+    const RGBDescriptor& wr = aWhite->GetBufferDescriptor().get_RGBDescriptor();
+    wt = aWhite->GetBuffer(); ws = ImageDataSerializer::GetRGBStride(wr);
+    if (!wt || wr.size() != rgb.size()) return gfx::IntRect(0, 0, w, h);
+  }
+  int x0 = w, y0 = h, x1 = 0, y1 = 0;
+  for (int y = 0; y < h; y++) {
+    const uint32_t* row = reinterpret_cast<const uint32_t*>(b + (size_t)y * bs);
+    const uint32_t* wrow = wt ? reinterpret_cast<const uint32_t*>(wt + (size_t)y * ws) : nullptr;
+    int fx = -1, lx = -1;
+    for (int x = 0; x < w; x++) {
+      const bool ink = wrow ? ((row[x] & 0x00ffffffu) != 0 || (wrow[x] & 0x00ffffffu) != 0x00ffffffu) : (row[x] >> 24) != 0;
+      if (ink) { if (fx < 0) fx = x; lx = x; }
+    }
+    if (fx >= 0) { x0 = std::min(x0, fx); x1 = std::max(x1, lx + 1); y0 = std::min(y0, y); y1 = y + 1; }
+  }
+  return x1 > x0 ? gfx::IntRect(x0, y0, x1 - x0, y1 - y0) : gfx::IntRect();
+}
+
+static bool
+JihadLeafDrawsIn(Layer* aLayer, const nsIntRegion& aOnFrame)
+{
+  static const bool sOff = getenv("JIHAD_GPU_EXACT_COVERS") && atoi(getenv("JIHAD_GPU_EXACT_COVERS")) == 0;
+  if (sOff || aLayer->GetType() != Layer::TYPE_PAINTED) return true;
+  LayerComposite* lc = aLayer->AsLayerComposite();
+  CompositableHost* ch = lc ? lc->GetCompositableHost() : nullptr;
+  TiledContentHost* th = ch ? ch->AsTiledContentHost() : nullptr;
+  gfx::Matrix m;
+  if (!th || !aLayer->GetEffectiveTransform().Is2D(&m) || m._12 != 0.0f || m._21 != 0.0f || m._11 <= 0.0f || m._22 <= 0.0f) return true;
+  gfx::Matrix inv = m;
+  if (!inv.Invert()) return true;
+  TiledLayerBufferComposite& tb = th->JihadTiles();
+  nsIntRegion inLayer;   // the overlap in the layer's pixels
+  for (auto it = aOnFrame.RectIter(); !it.Done(); it.Next()) {
+    const gfx::IntRect& q = it.Get();
+    inLayer.OrWith(gfx::RoundedOut(inv.TransformBounds(gfx::Rect(q.x, q.y, q.width, q.height))));
+  }
+  inLayer.AndWith(tb.GetValidRegion());
+  if (inLayer.IsEmpty()) return false;   // no painted tile under the part
+  const float res = tb.GetResolution() > 0.0f ? tb.GetResolution() : 1.0f;
+  if (sJihadTileInk.size() > 1024) sJihadTileInk.clear();
+  for (size_t i = 0; i < tb.GetTileCount(); i++) {
+    TileHost& tile = tb.GetTile(i);
+    if (tile.IsPlaceholderTile()) continue;
+    const gfx::IntPoint off = tb.GetTileOffset(tb.GetPlacement().TilePosition(i));
+    nsIntRegion tr(gfx::IntRect(off, tb.GetScaledTileSize()));
+    tr.AndWith(inLayer);
+    if (tr.IsEmpty()) continue;
+    BufferTextureHost* bh = tile.mTextureHost ? tile.mTextureHost->AsBufferTextureHost() : nullptr;
+    BufferTextureHost* wh = tile.mTextureHostOnWhite ? tile.mTextureHostOnWhite->AsBufferTextureHost() : nullptr;
+    if (!bh || bh->GetBufferDescriptor().type() != BufferDescriptor::TRGBDescriptor) return true;
+    if (tile.mTextureHostOnWhite && (!wh || wh->GetBufferDescriptor().type() != BufferDescriptor::TRGBDescriptor)) return true;
+    JihadTileInk& e = sJihadTileInk[bh];
+    const uint8_t* wbuf = wh ? wh->GetBuffer() : nullptr;
+    const uint32_t wser = wh ? wh->JihadUpdateSerial() : 0;
+    if (e.buf != bh->GetBuffer() || e.serial != bh->JihadUpdateSerial() || e.white != wbuf || e.wserial != wser) {
+      e.buf = bh->GetBuffer(); e.serial = bh->JihadUpdateSerial(); e.white = wbuf; e.wserial = wser;
+      e.ink = JihadTileInkOf(bh, wh);
+    }
+    if (e.ink.IsEmpty()) continue;
+    const gfx::IntRect inkLayer = gfx::RoundedOut(gfx::Rect(off.x + e.ink.x / res, off.y + e.ink.y / res, e.ink.width / res, e.ink.height / res));
+    tr.AndWith(inkLayer);
+    if (!tr.IsEmpty()) return true;
+  }
+  return false;
+}
+
 uint32_t
 CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* aCovered, int aWidth, int aHeight, uint32_t* aRectSig)
 {
@@ -1307,12 +1396,19 @@ CompositorBridgeParent::JihadPartsSig(const gfx::IntRect* aRects, int aN, bool* 
             nsIntRegion mine;
             onFrame(l, mine);
             mine.AndWith(partsSoFar);
-            if (!mine.IsEmpty()) {
+            if (!mine.IsEmpty() && JihadLeafDrawsIn(l, mine)) {   // T-606: where it draws, not where its region's bound lies
               if (!*aCovered && sCoverLog++ < 20) {
                 const gfx::IntRect b = mine.GetBounds();
                 JIHAD_GPU_LOG("[jihad-gpu] parts: layer %p (type %d) drawn above a part at %d,%d %dx%d\n", l, (int)t, b.x, b.y, b.width, b.height);
               }
               *aCovered = true;
+            } else if (!mine.IsEmpty()) {
+              static uint32_t sClearLog = 0;
+              if (sClearLog++ < 10) {
+                const gfx::IntRect b = mine.GetBounds();
+                JIHAD_GPU_LOG("[jihad-gpu] parts: layer %p (type %d) above a part at %d,%d %dx%d draws nothing there: not a cover (T-606)\n",
+                              l, (int)t, b.x, b.y, b.width, b.height);
+              }
             }
           }
         }

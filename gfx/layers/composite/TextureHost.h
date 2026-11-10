@@ -645,6 +645,9 @@ public:
 
   virtual size_t GetBufferSize() = 0;
 
+  // Jihad T-606: the content's update count, for a cache of what a tile's pixels hold (CompositorBridgeParent)
+  uint32_t JihadUpdateSerial() const { return mUpdateSerial; }
+
   virtual bool Lock() override;
 
   virtual void Unlock() override;
