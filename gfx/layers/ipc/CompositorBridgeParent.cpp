@@ -1177,9 +1177,25 @@ CompositorBridgeParent::JihadHideForJob()
     return l->GetIsFixedPosition() || (l->GetIsStickyPosition() && (sJihadContentOnly || mCompositionManager->JihadIsStuck(l)));
   };
   const bool partsAlone = sJihadOverview == 2;
+  // T-605 diagnostic (JIHAD_GPU_DIFFLOG): each layer a frame without its parts hides, with its bounds on the frame and
+  // its children: a part hidden here that the parts list (JihadFixedRectsNow) has no rect for leaves a hole no dress fills
+  static const bool sHideLog = getenv("JIHAD_GPU_DIFFLOG") != nullptr;
+  static uint32_t sHideN = 0;
+  const bool hideLog = sHideLog && !partsAlone && sJihadContentOnly && (sHideN++ % 20) == 0;
   ForEachNode<ForwardIterator>(root, [&](Layer* l) {
     if (!partsAlone) {
-      if (part(l)) l->AsLayerComposite()->SetShadowOpacity(0.0f);
+      if (part(l)) {
+        if (hideLog) {
+          const gfx::IntRect vb = l->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+          const gfx::IntRect ob = vb.IsEmpty() ? gfx::IntRect() :
+            gfx::RoundedOut(l->GetEffectiveTransform().TransformBounds(gfx::Rect(vb.x, vb.y, vb.width, vb.height)));
+          int kids = 0; for (Layer* c = l->GetFirstChild(); c; c = c->GetNextSibling()) kids++;
+          JIHAD_GPU_LOG("[jihad-gpu] hide part %p type %d fixed %d sticky %d stuck %d: local %d,%d %dx%d, on the frame %d,%d %dx%d, %d children\n",
+                        l, (int)l->GetType(), (int)l->GetIsFixedPosition(), (int)l->GetIsStickyPosition(),
+                        (int)(mCompositionManager->JihadIsStuck(l)), vb.x, vb.y, vb.width, vb.height, ob.x, ob.y, ob.width, ob.height, kids);
+        }
+        l->AsLayerComposite()->SetShadowOpacity(0.0f);
+      }
       return;
     }
     if (l->GetFirstChild()) return;
