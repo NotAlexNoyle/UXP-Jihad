@@ -1194,6 +1194,24 @@ CompositorBridgeParent::JihadHideForJob()
                         l, (int)l->GetType(), (int)l->GetIsFixedPosition(), (int)l->GetIsStickyPosition(),
                         (int)(mCompositionManager->JihadIsStuck(l)), vb.x, vb.y, vb.width, vb.height, ob.x, ob.y, ob.width, ob.height, kids);
         }
+        // T-605: a part with more than one child (the contents sidebar holds 9 at the faulty frames of the load, 1
+        // after): every child with its bounds on the frame, each such frame up to 60 lines, so the frame the fault
+        // shows in has its list
+        static uint32_t sKidsLog = 0;
+        if (sHideLog && !partsAlone && sJihadContentOnly && sKidsLog < 60) {
+          int kids2 = 0; for (Layer* c = l->GetFirstChild(); c; c = c->GetNextSibling()) kids2++;
+          if (kids2 > 1) {
+            for (Layer* c = l->GetFirstChild(); c && sKidsLog < 60; c = c->GetNextSibling(), sKidsLog++) {
+              const gfx::IntRect cb = c->GetLocalVisibleRegion().GetBounds().ToUnknownRect();
+              const gfx::IntRect cf = cb.IsEmpty() ? gfx::IntRect() :
+                gfx::RoundedOut(c->GetEffectiveTransform().TransformBounds(gfx::Rect(cb.x, cb.y, cb.width, cb.height)));
+              int gk = 0; for (Layer* g = c->GetFirstChild(); g; g = g->GetNextSibling()) gk++;
+              JIHAD_GPU_LOG("[jihad-gpu]   part %p child %p type %d fixed %d sticky %d opacity %.2f clip %d: on the frame %d,%d %dx%d (%u rects), %d children\n",
+                            l, c, (int)c->GetType(), (int)c->GetIsFixedPosition(), (int)c->GetIsStickyPosition(), c->GetEffectiveOpacity(),
+                            c->GetClipRect() ? 1 : 0, cf.x, cf.y, cf.width, cf.height, (unsigned)c->GetLocalVisibleRegion().GetNumRects(), gk);
+            }
+          }
+        }
         l->AsLayerComposite()->SetShadowOpacity(0.0f);
       }
       return;
