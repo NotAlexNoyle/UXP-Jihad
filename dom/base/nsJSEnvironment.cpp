@@ -91,11 +91,24 @@ const size_t gStackSize = 8192;
 
 #define NS_SHRINK_GC_BUFFERS_DELAY  4000 // ms
 
+// Jihad (T-623, an experiment): JIHAD_GC_TIMERS=tff takes TenFourFox's longer timers for a
+// slow CPU (its issue #483): the first GC after 30 s, a full GC after 100 s, the CC's
+// forget-skippable step every 2.5 s. Unset: upstream's.
+static bool
+JihadTffGCTimers()
+{
+  static const bool on = [] {
+    const char* v = getenv("JIHAD_GC_TIMERS");
+    return v && !strcmp(v, "tff");
+  }();
+  return on;
+}
+
 // The amount of time we wait from the first request to GC to actually
 // doing the first GC.
-#define NS_FIRST_GC_DELAY           10000 // ms
+#define NS_FIRST_GC_DELAY           (JihadTffGCTimers() ? 30000 : 10000) // ms
 
-#define NS_FULL_GC_DELAY            60000 // ms
+#define NS_FULL_GC_DELAY            (JihadTffGCTimers() ? 100000 : 60000) // ms
 
 // The default amount of time to wait from the user being idle to starting a
 // shrinking GC.
@@ -111,7 +124,7 @@ const size_t gStackSize = 8192;
 // and doing the actual CC.
 #define NS_CC_DELAY                 6000 // ms
 
-#define NS_CC_SKIPPABLE_DELAY       250 // ms
+#define NS_CC_SKIPPABLE_DELAY       (JihadTffGCTimers() ? 2500 : 250) // ms
 
 // Maximum amount of time that should elapse between incremental CC slices
 static const int64_t kICCIntersliceDelay = 32; // ms
