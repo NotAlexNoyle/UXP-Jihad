@@ -830,9 +830,10 @@ struct AssemblerBufferWithConstantPools : public AssemblerBuffer<SliceSize, Inst
         return this->nextOffset();
     }
 
+    // T-627 (bug 1333447): the slow path, kept out of line so putInt stays small.
+    MOZ_NEVER_INLINE
     BufferOffset allocEntry(size_t numInst, unsigned numPoolEntries,
-                            uint8_t* inst, uint8_t* data, PoolEntry* pe = nullptr,
-                            bool markAsBranch = false)
+                            uint8_t* inst, uint8_t* data, PoolEntry* pe = nullptr)
     {
         // The allocation of pool entries is not supported in a no-pool region,
         // check.
@@ -878,8 +879,19 @@ struct AssemblerBufferWithConstantPools : public AssemblerBuffer<SliceSize, Inst
         return this->putBytes(numInst * InstSize, inst);
     }
 
-    BufferOffset putInt(uint32_t value, bool markAsBranch = false) {
-        return allocEntry(1, 0, (uint8_t*)&value, nullptr, nullptr, markAsBranch);
+    // T-627 (bug 1333447): one plain instruction skips allocEntry unless nop fill is on or the pool must flush.
+    // No oom() test here: space for the word exists, and every caller's result is checked later anyway.
+    MOZ_ALWAYS_INLINE
+    BufferOffset putInt(uint32_t value) {
+        if (nopFill_ || !hasSpaceForInsts(/* numInsts= */ 1, /* numPoolEntries= */ 0))
+            return allocEntry(1, 0, (uint8_t*)&value, nullptr, nullptr);
+
+#if defined(JS_CODEGEN_ARM) || defined(JS_CODEGEN_ARM64) || \
+    defined(JS_CODEGEN_MIPS32) || defined(JS_CODEGEN_MIPS64)
+        return this->putU32Aligned(value);
+#else
+        return this->AssemblerBuffer<SliceSize, Inst>::putInt(value);
+#endif
     }
 
     // Register a short-range branch deadline.

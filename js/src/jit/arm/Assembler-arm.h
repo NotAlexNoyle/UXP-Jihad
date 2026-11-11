@@ -1242,7 +1242,7 @@ class Assembler : public AssemblerShared
     // Shim around AssemblerBufferWithConstantPools::allocEntry.
     BufferOffset allocEntry(size_t numInst, unsigned numPoolEntries,
                             uint8_t* inst, uint8_t* data, ARMBuffer::PoolEntry* pe = nullptr,
-                            bool markAsBranch = false, bool loadToPC = false);
+                            bool loadToPC = false);
 
     Instruction* editSrc(BufferOffset bo) {
         return m_buffer.getInst(bo);
@@ -1424,12 +1424,24 @@ class Assembler : public AssemblerShared
     // Size of the data table, in bytes.
     size_t bytesNeeded() const;
 
-    // Write a blob of binary into the instruction stream *OR* into a
-    // destination address.
-    BufferOffset writeInst(uint32_t x);
+    // Write a single instruction into the instruction stream.
+    // T-627 (bug 1333447): very hot, so inline.
+    MOZ_ALWAYS_INLINE BufferOffset writeInst(uint32_t x) {
+        BufferOffset offs = m_buffer.putInt(x);
+#ifdef JS_DISASM_ARM
+        spew(m_buffer.getInstOrNull(offs));
+#endif
+        return offs;
+    }
 
-    // As above, but also mark the instruction as a branch.
-    BufferOffset writeBranchInst(uint32_t x, Label* documentation = nullptr);
+    // As above, for a branch; "documentation" only feeds the disassembly.
+    MOZ_ALWAYS_INLINE BufferOffset writeBranchInst(uint32_t x, Label* documentation = nullptr) {
+        BufferOffset offs = m_buffer.putInt(x);
+#ifdef JS_DISASM_ARM
+        spewBranch(m_buffer.getInstOrNull(offs), documentation);
+#endif
+        return offs;
+    }
 
     // Write a placeholder NOP for a branch into the instruction stream
     // (in order to adjust assembler addresses and mark it as a branch), it will

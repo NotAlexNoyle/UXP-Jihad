@@ -134,6 +134,16 @@ class BufferSlice
             memcpy(&instructions[length()], source, numBytes);
         bytelength_ += numBytes;
     }
+
+    // T-627 (bug 1333447): one aligned instruction word; the fixed-size memcpy compiles to a single store.
+    MOZ_ALWAYS_INLINE
+    void putU32Aligned(uint32_t value) {
+        MOZ_ASSERT(bytelength_ + 4 <= SliceSize);
+        MOZ_ASSERT((bytelength_ & 3) == 0);
+        MOZ_ASSERT((uintptr_t(&instructions[0]) & 3) == 0);
+        memcpy(&instructions[bytelength_], &value, 4);
+        bytelength_ += 4;
+    }
 };
 
 template<int SliceSize, class Inst>
@@ -231,6 +241,17 @@ class AssemblerBuffer
 
     BufferOffset putInt(uint32_t value) {
         return putBytes(sizeof(value), &value);
+    }
+
+    // T-627 (bug 1333447): putInt without the generic byte copy.
+    MOZ_ALWAYS_INLINE
+    BufferOffset putU32Aligned(uint32_t value) {
+        if (!ensureSpace(sizeof(value)))
+            return BufferOffset();
+
+        BufferOffset ret = nextOffset();
+        tail->putU32Aligned(value);
+        return ret;
     }
 
     // Add numBytes bytes to this buffer.
