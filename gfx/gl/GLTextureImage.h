@@ -192,6 +192,7 @@ bool JihadPoolTexture(GLContext* aGL, GLuint aTexture, const gfx::IntSize& aSize
 GLuint JihadTakePooledTexture(GLContext* aGL, const gfx::IntSize& aSize);
 void JihadDropPooledTextures(GLContext* aGL, bool aDelete);
 void JihadFlushRetiredTextures(GLContext* aGL);
+struct JihadNPixmap;   // Jihad T-636 (JihadNPixmap.h)
 
 class BasicTextureImage
     : public TextureImage
@@ -209,7 +210,7 @@ public:
     virtual void BindTexture(GLenum aTextureUnit);
 
     virtual bool DirectUpdate(gfx::DataSourceSurface* aSurf, const nsIntRegion& aRegion, const gfx::IntPoint& aFrom = gfx::IntPoint(0,0));
-    virtual GLuint GetTextureID() { return mTexture; }
+    virtual GLuint GetTextureID();
 
     virtual void MarkValid() { mTextureState = Valid; }
 
@@ -227,6 +228,12 @@ protected:
     TextureState mTextureState2 = Created;
     GLint mTexFilter = 0x2601;   // GL_LINEAR
     void JihadSwapTextures();    // now: retire the name and take a fresh one
+    // Jihad T-636 (JIHAD_GPU_NPIXMAP_TILES=1): a Palm native pixmap whose memory the texture samples
+    // live. While it is set, mTexture is the pixmap's own name and an update is a copy into its
+    // memory, with no GL upload (JihadNPixmap.h).
+    JihadNPixmap* mJihadPixmap = nullptr;
+    bool JihadAttachPixmap();    // true: mJihadPixmap is set (it was, or one was taken)
+    void JihadDetachPixmap();    // back to a plain name with no storage
     RefPtr<GLContext> mGLContext;
 };
 

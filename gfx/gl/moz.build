@@ -147,6 +147,11 @@ UNIFIED_SOURCES += [
     'TextureImageEGL.cpp',
 ]
 
+# Jihad T-636: on its own, its file-local names are common ones
+SOURCES += [
+    'JihadNPixmap.cpp',
+]
+
 include('/ipc/chromium/chromium-config.mozbuild')
 
 FINAL_LIBRARY = 'xul'

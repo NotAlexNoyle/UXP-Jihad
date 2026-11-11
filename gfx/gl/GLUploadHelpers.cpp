@@ -16,6 +16,7 @@
 #include "mozilla/gfx/Logging.h"
 
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+#include "JihadNPixmap.h"               // Jihad T-636: the "upload totals" line
 
 namespace mozilla {
 
@@ -441,6 +442,7 @@ UploadImageDataToTexture(GLContext* gl,
       const double all = (mozilla::TimeStamp::Now() - e0).ToMilliseconds();
       ++gJihadUploads;
       gJihadUploadUs += (uint64_t)(all * 1000.0);
+      JihadNPixmapNoteGLUpload(all);   // Jihad T-636: the A/B's GL side
       if (all >= 8.0 && sN++ < 60)
         JIHAD_GPU_LOG("[jihad-gpu] upload steps: make current %.1f ms, bind %.1f ms, the rest %.1f ms (all %.1f)\n",
                 (e1 - e0).ToMilliseconds(), (e2 - e1).ToMilliseconds(), all - (e2 - e0).ToMilliseconds(), all);

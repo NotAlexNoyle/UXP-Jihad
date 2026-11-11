@@ -21,6 +21,7 @@
 #include "TextureImageEGL.h"
 
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
+#include "JihadNPixmap.h"               // Jihad T-636
 
 using namespace mozilla::gfx;
 
@@ -121,6 +122,12 @@ BasicTextureImage::~BasicTextureImage()
     // if we don't have a context (either real or shared),
     // then they went away when the contex was deleted, because it
     // was the only one that had access to it.
+    if (mJihadPixmap) {
+        // Jihad T-636: the name is the pixmap's and goes with it, to the pixmaps' pool
+        const bool current = ctx && ctx->MakeCurrent();
+        JihadNPixmapGive(current ? ctx : nullptr, mJihadPixmap);
+        return;
+    }
     if (ctx && ctx->MakeCurrent()) {
         // Jihad T-504: a texture with storage goes to the pool instead (JihadPoolTexture)
         if (ctx == mGLContext && !mTexture2 && mTextureState != Created &&
@@ -262,6 +269,7 @@ void JihadDropPooledTextures(GLContext* aGL, bool aDelete)
     if (aDelete && !mine.empty() && aGL && aGL->MakeCurrent()) {
         aGL->fDeleteTextures((GLsizei)mine.size(), mine.data());
     }
+    JihadNPixmapDropPool(aGL, aDelete);   // Jihad T-636
     if (sJihadConvertGL == aGL) {
         if (aDelete && sJihadConvertFb && aGL && aGL->MakeCurrent()) {
             aGL->fDeleteFramebuffers(1, &sJihadConvertFb);
@@ -332,9 +340,68 @@ BasicTextureImage::JihadSwapTextures()
     mTextureState = Created;
 }
 
+// Jihad T-636: the texture's storage becomes a native pixmap's memory. The name held so far goes
+// (to the tile textures' pool when it has storage) and the pixmap's own name takes its place.
+bool
+BasicTextureImage::JihadAttachPixmap()
+{
+    if (mJihadPixmap) {
+        return true;
+    }
+    if (mContentType == ContentType::ALPHA || !JihadNPixmapWanted(mSize)) {
+        return false;
+    }
+    JihadNPixmap* pixmap = JihadNPixmapTake(mGLContext, mSize);
+    if (!pixmap) {
+        return false;
+    }
+    if (mTextureState == Created || !JihadPoolTexture(mGLContext, mTexture, mSize)) {
+        mGLContext->fDeleteTextures(1, &mTexture);
+    }
+    mJihadPixmap = pixmap;
+    mTexture = pixmap->texture;
+    ScopedBindTexture bind(mGLContext, mTexture);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MIN_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MAG_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_S, mWrapMode);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_T, mWrapMode);
+    mTextureState = Allocated;   // a pooled pixmap holds another tile's pixels: the next update is whole
+    UpdateUploadSize((size_t)pixmap->stride * mSize.height);
+    return true;
+}
+
+void
+BasicTextureImage::JihadDetachPixmap()
+{
+    if (!mJihadPixmap) {
+        return;
+    }
+    JihadNPixmapGive(mGLContext, mJihadPixmap);
+    mJihadPixmap = nullptr;
+    mGLContext->fGenTextures(1, &mTexture);
+    ScopedBindTexture bind(mGLContext, mTexture);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MIN_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_MAG_FILTER, mTexFilter);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_S, mWrapMode);
+    mGLContext->fTexParameteri(LOCAL_GL_TEXTURE_2D, LOCAL_GL_TEXTURE_WRAP_T, mWrapMode);
+    mTextureState = Created;
+}
+
+GLuint
+BasicTextureImage::GetTextureID()
+{
+    if (mJihadPixmap) {
+        JihadNPixmapBound(mJihadPixmap);   // Jihad T-636: whoever asks for the name draws with it
+    }
+    return mTexture;
+}
+
 void
 BasicTextureImage::BindTexture(GLenum aTextureUnit)
 {
+    if (mJihadPixmap) {
+        JihadNPixmapBound(mJihadPixmap);   // Jihad T-636: the GPU reads the pixmap until the next sync
+    }
     mGLContext->fActiveTexture(aTextureUnit);
     mGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, mTexture);
     mGLContext->fActiveTexture(LOCAL_GL_TEXTURE0);
@@ -343,6 +410,24 @@ BasicTextureImage::BindTexture(GLenum aTextureUnit)
 bool
 BasicTextureImage::DirectUpdate(gfx::DataSourceSurface* aSurf, const nsIntRegion& aRegion, const gfx::IntPoint& aFrom /* = gfx::IntPoint(0, 0) */)
 {
+    // Jihad T-636 (JIHAD_GPU_NPIXMAP_TILES=1): the pixels are copied into the native pixmap the
+    // texture samples, and nothing is uploaded. Memory in B,G,R,A order is sampled as R,G,B,A (the
+    // device run), which is what a BGRA upload leaves in a texture: the formats below are that
+    // upload's, so the shaders do not swap.
+    const bool pixmapFormat = aSurf->GetFormat() == SurfaceFormat::B8G8R8A8 ||
+                              aSurf->GetFormat() == SurfaceFormat::B8G8R8X8;
+    if (!pixmapFormat) {
+        JihadDetachPixmap();   // the GL upload below, into a plain name
+    } else if (JihadAttachPixmap()) {
+        const nsIntRegion whole(IntRect(0, 0, mSize.width, mSize.height));
+        if (JihadNPixmapWrite(mGLContext, mJihadPixmap, aSurf, mTextureState == Valid ? aRegion : whole, aFrom)) {
+            mTextureFormat = aSurf->GetFormat() == SurfaceFormat::B8G8R8X8 ? SurfaceFormat::R8G8B8X8
+                                                                            : SurfaceFormat::R8G8B8A8;
+            mTextureState = Valid;
+            return true;
+        }
+        JihadDetachPixmap();   // a surface that does not cover the region: the GL upload
+    }
     JihadSwapTextures();   // Jihad T-502: the name the last composite is not reading
     nsIntRegion region;
     if (mTextureState == Valid) {
@@ -373,6 +458,23 @@ BasicTextureImage::DirectUpdate(gfx::DataSourceSurface* aSurf, const nsIntRegion
 void
 BasicTextureImage::Resize(const gfx::IntSize& aSize)
 {
+    // Jihad T-636: under the switch the storage is a native pixmap, taken here in glTexImage2D's place
+    if (mJihadPixmap && aSize != mSize) {
+        JihadDetachPixmap();
+    }
+    if (mJihadPixmap) {
+        mTextureState = Allocated;
+        return;
+    }
+    if (JihadNPixmapWanted(aSize)) {
+        const gfx::IntSize was = mSize;
+        mSize = aSize;
+        if (JihadAttachPixmap()) {
+            mTextureState = Allocated;
+            return;
+        }
+        mSize = was;
+    }
     mGLContext->fBindTexture(LOCAL_GL_TEXTURE_2D, mTexture);
 
     // This matches the logic in UploadImageDataToTexture so that
@@ -721,10 +823,12 @@ CreateBasicTextureImage(GLContext* aGL,
       return nullptr;
     }
 
-    GLuint texture = JihadTakePooledTexture(aGL, aSize);   // Jihad T-504
+    // Jihad T-636: a texture that will sample a native pixmap needs a bare name alone until then
+    const bool pixmapWanted = aContentType != TextureImage::ContentType::ALPHA && JihadNPixmapWanted(aSize);
+    GLuint texture = pixmapWanted ? 0 : JihadTakePooledTexture(aGL, aSize);   // Jihad T-504
     if (!texture) {
         aGL->fGenTextures(1, &texture);
-        if (JihadPoolCap() && !getenv("JIHAD_GPU_NO_TEX_CONVERT")) {
+        if (!pixmapWanted && JihadPoolCap() && !getenv("JIHAD_GPU_NO_TEX_CONVERT")) {
             JihadConvertTexture(aGL, texture);
         }
     }
