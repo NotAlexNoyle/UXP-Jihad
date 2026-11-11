@@ -3686,12 +3686,23 @@ PluginInstanceChild::DoAsyncSetWindow(const gfxSurfaceType& aSurfaceType,
     }
 
     mWindow.window = nullptr;
+    // Jihad T-638 (Pale Moon d078ed24), an experiment: JIHAD_PLUGIN_SETWINDOW_DEDUP=1 tells the plugin its window
+    // attributes only when something changed (size, clip, position, type), saving it a spurious repaint
+    static const bool sDedup = [] {
+        const char* v = getenv("JIHAD_PLUGIN_SETWINDOW_DEDUP");
+        return v && v[0] == '1';
+    }();
+    bool windowChanged = false;
     if (mWindow.width != aWindow.width || mWindow.height != aWindow.height ||
         mWindow.clipRect.top != aWindow.clipRect.top ||
         mWindow.clipRect.left != aWindow.clipRect.left ||
         mWindow.clipRect.bottom != aWindow.clipRect.bottom ||
-        mWindow.clipRect.right != aWindow.clipRect.right)
+        mWindow.clipRect.right != aWindow.clipRect.right) {
+        windowChanged = true;
         mAccumulatedInvalidRect = nsIntRect(0, 0, aWindow.width, aWindow.height);
+    } else {
+        windowChanged = mWindow.x != aWindow.x || mWindow.y != aWindow.y || mWindow.type != aWindow.type;
+    }
 
     mWindow.x = aWindow.x;
     mWindow.y = aWindow.y;
@@ -3708,7 +3719,9 @@ PluginInstanceChild::DoAsyncSetWindow(const gfxSurfaceType& aSurfaceType,
 
     mLayersRendering = true;
     mSurfaceType = aSurfaceType;
-    UpdateWindowAttributes(true);
+    if (!sDedup || windowChanged) {
+        UpdateWindowAttributes(true);
+    }
 
 #ifdef XP_WIN
     if (GetQuirks() & QUIRK_FLASH_THROTTLE_WMUSER_EVENTS)
