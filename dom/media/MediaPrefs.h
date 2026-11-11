@@ -109,6 +109,8 @@ private:
 #endif
 #ifdef MOZ_FFVPX
   DECL_MEDIA_PREF("media.ffvpx.enabled",                      PDMFFVPXEnabled, bool, true);
+  // Jihad (T-558): false hands VP8/VP9 to libvpx, ffvpx keeping FLAC (FFmpegDecoderModule.h).
+  DECL_MEDIA_PREF("media.ffvpx.vpx.enabled",                  PDMFFVPXVpxEnabled, bool, true);
 #endif
 #ifdef MOZ_AV1
   DECL_MEDIA_PREF("media.av1.enabled",                        AV1Enabled, bool, true);
