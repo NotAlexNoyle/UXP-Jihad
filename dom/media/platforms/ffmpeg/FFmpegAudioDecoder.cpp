@@ -46,7 +46,13 @@ FFmpegAudioDecoder<LIBAV_VER>::InitCodecContext()
   // isn't implemented.
   mCodecContext->thread_count = 1;
   // FFmpeg takes this as a suggestion for what format to use for audio samples.
+#ifdef MOZ_SAMPLE_TYPE_FLOAT32
   mCodecContext->request_sample_fmt = AV_SAMPLE_FMT_FLT;
+#else
+  // An S16 build (ARM): ask for what the engine plays. Decoders that can only
+  // produce float (AAC, mp3float) still do; CopyAndPackAudio converts them.
+  mCodecContext->request_sample_fmt = AV_SAMPLE_FMT_S16;
+#endif
 }
 
 static AlignedAudioBuffer
@@ -59,6 +65,7 @@ CopyAndPackAudio(AVFrame* aFrame, uint32_t aNumChannels, uint32_t aNumAFrames)
     return audio;
   }
 
+#ifdef MOZ_SAMPLE_TYPE_FLOAT32
   if (aFrame->format == AV_SAMPLE_FMT_FLT) {
     // Audio data already packed. No need to do anything other than copy it
     // into a buffer we own.
@@ -113,6 +120,49 @@ CopyAndPackAudio(AVFrame* aFrame, uint32_t aNumChannels, uint32_t aNumAFrames)
     }
   }
 
+#else
+  // AudioDataValue is int16_t here (MOZ_SAMPLE_TYPE_S16, the ARM builds). The
+  // float path's conversions above would store float bits or a value in
+  // [-1, 1] into int16_t: noise for AAC and MP3, silence for FLAC.
+  // After roytam1/UXP 28f55eb5c and 27c36d1ea, with S32 added.
+  AudioDataValue* tmp = audio.get();
+  if (aFrame->format == AV_SAMPLE_FMT_FLT) {
+    float* data = reinterpret_cast<float**>(aFrame->data)[0];
+    for (uint32_t i = 0; i < aNumChannels * aNumAFrames; i++) {
+      *tmp++ = FloatToAudioSample<int16_t>(*data++);
+    }
+  } else if (aFrame->format == AV_SAMPLE_FMT_FLTP) {
+    float** data = reinterpret_cast<float**>(aFrame->extended_data);
+    for (uint32_t frame = 0; frame < aNumAFrames; frame++) {
+      for (uint32_t channel = 0; channel < aNumChannels; channel++) {
+        *tmp++ = FloatToAudioSample<int16_t>(data[channel][frame]);
+      }
+    }
+  } else if (aFrame->format == AV_SAMPLE_FMT_S16) {
+    memcpy(audio.get(), aFrame->data[0],
+           aNumChannels * aNumAFrames * sizeof(AudioDataValue));
+  } else if (aFrame->format == AV_SAMPLE_FMT_S16P) {
+    int16_t** data = reinterpret_cast<int16_t**>(aFrame->extended_data);
+    for (uint32_t frame = 0; frame < aNumAFrames; frame++) {
+      for (uint32_t channel = 0; channel < aNumChannels; channel++) {
+        *tmp++ = data[channel][frame];
+      }
+    }
+  } else if (aFrame->format == AV_SAMPLE_FMT_S32) {
+    int32_t* data = reinterpret_cast<int32_t**>(aFrame->data)[0];
+    for (uint32_t i = 0; i < aNumChannels * aNumAFrames; i++) {
+      *tmp++ = static_cast<int16_t>(*data++ >> 16);
+    }
+  } else if (aFrame->format == AV_SAMPLE_FMT_S32P) {
+    int32_t** data = reinterpret_cast<int32_t**>(aFrame->extended_data);
+    for (uint32_t frame = 0; frame < aNumAFrames; frame++) {
+      for (uint32_t channel = 0; channel < aNumChannels; channel++) {
+        *tmp++ = static_cast<int16_t>(data[channel][frame] >> 16);
+      }
+    }
+  }
+
+#endif
   return audio;
 }
 
