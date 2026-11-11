@@ -269,6 +269,13 @@ CompositorOGL::CleanupResources()
   mJihadReadFBO = mJihadReadRB = 0;
   if (mJihadSwizzleProg) mGLContext->fDeleteProgram(mJihadSwizzleProg);
   mJihadSwizzleProg = 0;
+  for (int t = 0; t < 4; ++t) {   // T-637: the 565 twins
+    if (mJihad565FBO[t]) mGLContext->fDeleteFramebuffers(1, &mJihad565FBO[t]);
+    if (mJihad565RB[t]) mGLContext->fDeleteRenderbuffers(1, &mJihad565RB[t]);
+    mJihad565FBO[t] = mJihad565RB[t] = 0;
+  }
+  mJihad565Now = mJihad565Want = false;
+  mJihad565Cur[0] = mJihad565Cur[1] = false;
 
   mBlitTextureImageHelper = nullptr;
 
@@ -838,6 +845,8 @@ CompositorOGL::BeginFrame(const nsIntRegion& aInvalidRegion,
   mJihadProbed = false;
   for (int i = 0; i < 4; i++) { mJihadRawSc[i] = mJihadCacheSc[i] = mJihadRawVp[i] = mJihadCacheVp[i] = -1; }
   mJihadClipBottomMin = 1 << 30;
+  // T-637: a drag's frame goes into its target's 565 twin (a whole composite, or one on the side the last whole one took)
+  JihadUse565Target(!aClipRectIn || (aClipRectIn->x <= 0 && aClipRectIn->y <= 0 && aClipRectIn->XMost() >= width && aClipRectIn->YMost() >= height));
   RefPtr<CompositingRenderTargetOGL> rt =
     CompositingRenderTargetOGL::RenderTargetForWindow(this,
                                                       IntSize(width, height),
@@ -2112,6 +2121,204 @@ CompositorOGL::JihadEnsureSwizzlePass(int aW, int aH)
   return true;
 }
 
+// ---- Jihad T-637: a drag's frames in RGB565 ------------------------------------------------------
+// JIHAD_GPU_DRAG565=1 turns the lever on; =0 leaves it off and prints the reads' totals all the same (the control
+// of an A/B); unset, nothing here runs. The daemon says when the card is dragged (jihad_gpu_drag565, any thread)
+// and asks how many 565 reads there have been (jihad_gpu_drag565_frames): when the drag ends and that count has
+// moved, it has every slot painted whole again, so no 565 row outlives the drag on the card.
+static std::atomic<int> gJihadDrag565(0);
+static std::atomic<uint32_t> gJihadDrag565Reads(0);
+
+static int
+JihadDrag565Mode()   // 0 unset, 1 the totals only, 2 on
+{
+  static const int sMode = [] { const char* e = getenv("JIHAD_GPU_DRAG565"); return !e ? 0 : (atoi(e) != 0 ? 2 : 1); }();
+  return sMode;
+}
+
+// The reads' totals by mode, for the device A/B: a line every 50 reads (the compositor thread's reads; the read
+// thread's are not counted, and with it the lever is off). "frames" are read calls: a band frame is one, a whole
+// frame one or two (its bands), a column read one.
+static void
+JihadReadStat(bool a565, int aW, int aRows, double aReadMs, double aConvMs)
+{
+  if (!JihadDrag565Mode()) return;
+  struct Tot { uint32_t n; uint64_t px; double read, conv; };
+  static Tot sTot[2] = {};
+  static uint32_t sN = 0;
+  Tot& t = sTot[a565 ? 1 : 0];
+  ++t.n; t.px += (uint64_t)aW * aRows; t.read += aReadMs; t.conv += aConvMs;
+  if ((++sN % 50) == 0) {
+    const Tot& a = sTot[0]; const Tot& b = sTot[1];
+    fprintf(stderr, "[jihad-gpu] drag565 totals: 8888 frames %u (%.0f kpx each): read %.2f ms, swizzle/flip %.2f ms a frame; "
+                    "565 frames %u (%.0f kpx each): read %.2f ms, expand %.2f ms a frame\n",
+            a.n, a.n ? a.px / 1000.0 / a.n : 0.0, a.n ? a.read / a.n : 0.0, a.n ? a.conv / a.n : 0.0,
+            b.n, b.n ? b.px / 1000.0 / b.n : 0.0, b.n ? b.read / b.n : 0.0, b.n ? b.conv / b.n : 0.0);
+  }
+}
+
+// One row of 565 pixels (red in the top five bits, as GL_UNSIGNED_SHORT_5_6_5 packs them) -> BGRA bytes, alpha
+// 0xFF, each channel's top bits repeated in its low ones (so white stays 255 and black 0).
+static void
+JihadExpand565Row(const uint16_t* aSrc, uint8_t* aDst, int aW)
+{
+  int x = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+  const uint8x8_t alpha = vdup_n_u8(0xff);
+  for (; x + 8 <= aW; x += 8) {
+    const uint16x8_t v = vld1q_u16(aSrc + x);
+    uint8x8_t r = vshrn_n_u16(v, 8);              // RRRRRGGG
+    uint8x8_t g = vshrn_n_u16(v, 3);              // GGGGGGBB
+    uint8x8_t b = vshl_n_u8(vmovn_u16(v), 3);     // BBBBB000
+    uint8x8x4_t o;
+    o.val[0] = vsri_n_u8(b, b, 5);
+    o.val[1] = vsri_n_u8(g, g, 6);
+    o.val[2] = vsri_n_u8(r, r, 5);
+    o.val[3] = alpha;
+    vst4_u8(aDst + (size_t)x * 4, o);
+  }
+#endif
+  for (; x < aW; x++) {
+    const uint32_t v = aSrc[x];
+    const uint32_t r = v >> 11, g = (v >> 5) & 0x3f, b = v & 0x1f;
+    uint8_t* d = aDst + (size_t)x * 4;
+    d[0] = (uint8_t)((b << 3) | (b >> 2)); d[1] = (uint8_t)((g << 2) | (g >> 4)); d[2] = (uint8_t)((r << 3) | (r >> 2)); d[3] = 0xff;
+  }
+}
+
+// Whether a 565 target reads as 565 here: the implementation's own read format with one bound (ES 2 promises only
+// RGBA bytes and that one). Asked at the first read of a twin and kept; when it is something else, the frame in
+// hand is read as RGBA bytes from its twin by the usual path and no later frame takes a twin.
+static int sJihad565ReadOk = -1;
+static bool
+JihadRead565Ok(GLContext* aGL)
+{
+  if (sJihad565ReadOk < 0) {
+    GLint implFmt = 0, implType = 0;
+    aGL->fGetIntegerv(LOCAL_GL_IMPLEMENTATION_COLOR_READ_FORMAT, &implFmt);
+    aGL->fGetIntegerv(LOCAL_GL_IMPLEMENTATION_COLOR_READ_TYPE, &implType);
+    sJihad565ReadOk = (implFmt == LOCAL_GL_RGB && implType == LOCAL_GL_UNSIGNED_SHORT_5_6_5) ? 1 : 0;
+    fprintf(stderr, "[jihad-gpu] drag565: a 565 target's own read format is 0x%x/0x%x: %s\n", (unsigned)implFmt, (unsigned)implType,
+            sJihad565ReadOk ? "read as 565" : "NOT 565, the lever is off (this frame read as RGBA bytes)");
+  }
+  return sJihad565ReadOk == 1;
+}
+
+void
+CompositorOGL::JihadLatch565()
+{
+  // Once a job's stage (its composites and their reads), so the composites of one frame agree. Not with the read
+  // thread (its context has FBOs on the 8888 targets only) nor the texture target of the swizzle pass.
+  static const bool sReadThread = getenv("JIHAD_GPU_READ_THREAD") != nullptr;
+  mJihad565Want = JihadDrag565Mode() == 2 && gJihadDrag565.load(std::memory_order_relaxed) != 0 && !mJihad565Failed &&
+                  sJihad565ReadOk != 0 && !sReadThread && !mJihadWindowTex && mJihadTargetRB[0] != 0;
+}
+
+void
+CompositorOGL::JihadUse565Target(bool aWhole)
+{
+  if (mJihad565Now || !mJihadWindowFBO || mJihadClearTransparent || !JihadDrag565Mode()) {
+    return;   // on the twin already (a job's second composite on a band target), or a frame that keeps its alpha
+  }
+  // JIHAD_GPU_DRAG565_NODITHER=1: GL_DITHER (on by default in GL) off for the composites into a twin and on again
+  // for the others, set at every frame. The driver may dither a 565 target by the pixel's place on it, and a band is
+  // composed at another place than the rows it lands on: for the A/B by eye, banding against a dither that jumps.
+  struct DitherScope {
+    CompositorOGL* c;
+    ~DitherScope() {
+      static const bool sNoDither = getenv("JIHAD_GPU_DRAG565_NODITHER") != nullptr;
+      if (!sNoDither || JihadDrag565Mode() != 2) return;
+      if (c->mJihad565Now) c->mGLContext->fDisable(LOCAL_GL_DITHER); else c->mGLContext->fEnable(LOCAL_GL_DITHER);
+    }
+  } ditherScope{this};
+  int t = -1;
+  gfx::IntSize size;
+  if (mJihadWindowFBO == mJihadTargetFBO[0]) { t = 0; size = mJihadTargetSize; }
+  else if (mJihadTargetFBO[1] && mJihadWindowFBO == mJihadTargetFBO[1]) { t = 1; size = mJihadTargetSize; }
+  else if (mJihadBandFBO && mJihadWindowFBO == mJihadBandFBO) { t = 2; size = gfx::IntSize(mJihadBandW, JihadBandRows()); }
+  else if (mJihadBandTallFBO && mJihadWindowFBO == mJihadBandTallFBO) { t = 3; size = gfx::IntSize(mJihadBandTallW, JihadBandTallRows()); }
+  if (t < 0 || size.width <= 0 || size.height <= 0) {
+    return;
+  }
+  // the side this composite takes: a band pass and a whole composite the one the job wants; a composite of less
+  // than the frame on a window target the side that holds the running frame (mJihad565Cur)
+  const bool windowTarget = t < 2;
+  const bool anySide = !windowTarget || aWhole;
+  if (anySide ? !mJihad565Want : !mJihad565Cur[t]) {
+    if (windowTarget && aWhole) mJihad565Cur[t] = false;   // the 8888 target holds the frame again
+    return;
+  }
+  GLContext* gl = mGLContext;
+  if (!mJihad565FBO[t] || mJihad565Size[t] != size) {
+    if (!anySide) {
+      // the twin's rows went with its size (as the 8888 target's did): nothing to build on there
+      mJihad565Cur[t] = false;
+      return;
+    }
+    // the twin at its target's size (on the Adreno 220 every target must match the current surface's size, and
+    // the 8888 target does). White once, like the 8888 targets: its first contents are whatever the driver had.
+    if (!mJihad565RB[t]) gl->fGenRenderbuffers(1, &mJihad565RB[t]);
+    gl->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, mJihad565RB[t]);
+    gl->fRenderbufferStorage(LOCAL_GL_RENDERBUFFER, LOCAL_GL_RGB565, size.width, size.height);
+    gl->fBindRenderbuffer(LOCAL_GL_RENDERBUFFER, 0);
+    if (!mJihad565FBO[t]) gl->fGenFramebuffers(1, &mJihad565FBO[t]);
+    gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihad565FBO[t]);
+    gl->fFramebufferRenderbuffer(LOCAL_GL_FRAMEBUFFER, LOCAL_GL_COLOR_ATTACHMENT0, LOCAL_GL_RENDERBUFFER, mJihad565RB[t]);
+    const GLenum st = gl->fCheckFramebufferStatus(LOCAL_GL_FRAMEBUFFER);
+    if (st != LOCAL_GL_FRAMEBUFFER_COMPLETE) {
+      fprintf(stderr, "[jihad-gpu] drag565: the 565 twin of target %d (%dx%d) is incomplete (0x%x): the lever is off\n", t, size.width, size.height, st);
+      gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+      gl->fDeleteFramebuffers(1, &mJihad565FBO[t]);
+      gl->fDeleteRenderbuffers(1, &mJihad565RB[t]);
+      mJihad565FBO[t] = mJihad565RB[t] = 0;
+      mJihad565Failed = true; mJihad565Want = false;
+      if (windowTarget) mJihad565Cur[t] = false;
+      return;
+    }
+    gl->fDisable(LOCAL_GL_SCISSOR_TEST);   // BeginFrame sets the frame's own scissor after this
+    gl->fClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    gl->fClear(LOCAL_GL_COLOR_BUFFER_BIT);
+    mJihad565Size[t] = size;
+    JIHAD_GPU_LOG("[jihad-gpu] drag565: 565 twin of target %d, %dx%d: FBO %u\n", t, size.width, size.height, mJihad565FBO[t]);
+  }
+  mJihadWindowFBO = mJihad565FBO[t];
+  mJihad565Now = true;
+  if (windowTarget && aWhole) mJihad565Cur[t] = true;
+}
+
+// The bound 565 twin's columns [aX0, aX0 + aW) of GL rows [aGlY, aGlY + aRows), read as 565 into private memory
+// and widened into aDest as BGRA rows top-down (the view is flipped: the highest GL row first), alpha 0xFF.
+// False when the request was given up while the GPU was read: nothing is written then.
+bool
+CompositorOGL::JihadRead565(uint8_t* aDest, int aStride, int aX0, int aGlY, int aW, int aRows, double* aReadMs, double* aExpandMs)
+{
+  const size_t px = (size_t)aW * aRows;
+  if (!mJihad565Scratch || mJihad565ScratchSize < px) {
+    mJihad565Scratch = MakeUnique<uint16_t[]>(px);
+    mJihad565ScratchSize = px;
+  }
+  uint16_t* src = mJihad565Scratch.get();
+  const TimeStamp t0 = TimeStamp::Now();
+  {
+    ScopedPackState safePackState(mGLContext);
+    mGLContext->fPixelStorei(LOCAL_GL_PACK_ALIGNMENT, 2);   // rows of aW shorts, no padding
+    mGLContext->fReadPixels(aX0, aGlY, aW, aRows, LOCAL_GL_RGB, LOCAL_GL_UNSIGNED_SHORT_5_6_5, src);
+  }
+  const TimeStamp t1 = TimeStamp::Now();
+  if (mJihadCancel && *mJihadCancel) {
+    return false;   // T-513's rule: given up while the GPU was read; the slot is not touched
+  }
+  for (int r = 0; r < aRows; r++) {
+    JihadExpand565Row(src + (size_t)(aRows - 1 - r) * aW, aDest + (size_t)r * aStride, aW);
+  }
+  ++gJihadDrag565Reads;
+  *aReadMs = (t1 - t0).ToMilliseconds();
+  *aExpandMs = (TimeStamp::Now() - t1).ToMilliseconds();
+  JihadReadStat(true, aW, aRows, *aReadMs, *aExpandMs);
+  return true;
+}
+
+
 // ---- Jihad T-502: the read thread --------------------------------------------------------------
 namespace {
 void JihadReadThreadInitTrampoline(CompositorOGL* aC) { aC->JihadReadThreadInit(); }
@@ -2214,6 +2421,7 @@ CompositorOGL::JihadStopReadThread()
 void
 CompositorOGL::JihadSelectTarget()
 {
+  mJihad565Now = false;   // T-637: the 8888 target again; a drag's next composite takes its twin (BeginFrame)
   if (!mJihadTargetFBO[1]) {
     // a single target (the pass, or the pbuffer itself); after a band frame it is the window again
     if (mJihadTargetFBO[0]) mJihadWindowFBO = mJihadTargetFBO[0];
@@ -2455,6 +2663,8 @@ CompositorOGL::JihadBeginBandPass(int aWidth, int aRows)
     JIHAD_GPU_LOG("[jihad-gpu] band target %dx%d: FBO %u on its own pbuffer%s\n", aWidth, rows, fbo, tall ? " (the tall one)" : "");
   }
   mJihadWindowFBO = fbo;
+  mJihad565Now = false;   // T-637: the band's 8888 target; the composite takes its twin when the frame is a drag's
+  JihadLatch565();
   return rows;
 }
 
@@ -2470,6 +2680,7 @@ CompositorOGL::JihadEndBandPass()
 void
 CompositorOGL::JihadUseFrameSurface()
 {
+  JihadLatch565();   // T-637: a job's composites on the frame's surface begin here
   if (mGLContext->GetContextType() == GLContextType::EGL) {
     static_cast<GLContextEGL*>(mGLContext.get())->JihadUseFramePBuffer();
   }
@@ -2726,6 +2937,20 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
     return true;
   }
   mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+  if (mJihad565Now && JihadRead565Ok(mGLContext)) {
+    // T-637: a drag's frame, in its target's 565 twin: the same GL rows [h-hi, h-lo), read as 565 and widened
+    double readMs = 0, expandMs = 0;
+    if (!JihadRead565(band, aStride, 0, h - hi, w, rows, &readMs, &expandMs)) {
+      return false;
+    }
+    static uint32_t sTimed565 = 0;
+    static const bool sTimeline565 = getenv("JIHAD_GPU_TIMELINE") != nullptr;
+    if (sTimed565++ < 12 || (sTimed565 % 100) == 0 || sTimeline565) {
+      JIHAD_GPU_LOG("[jihad-gpu] 565 read: glReadPixels %d rows %.1f ms, expand to BGRA %.1f ms\n", rows, readMs, expandMs);
+    }
+    return true;
+  }
+  if (mJihad565Now) ++gJihadDrag565Reads;   // a twin read as RGBA bytes: 565 rows all the same, the daemon repaints them
   // JIHAD_GPU_READ_FINISH=1: a glFinish before the read (round 100's guess at the white rows,
   // which were the driver binning by the surface's size, round 104; 19 ms a whole frame, off)
   static const bool sReadFinish = getenv("JIHAD_GPU_READ_FINISH") != nullptr;
@@ -2791,6 +3016,7 @@ CompositorOGL::JihadReadFrame(uint8_t* aDest, int aStride, int aWidth, int aHeig
   }
   TimeStamp t1 = TimeStamp::Now();
   JihadReadDone(band, aStride, w, rows, !mJihadKeepAlpha, JihadReadFormat(mGLContext));   // T-504: an overview's read keeps its alpha
+  JihadReadStat(false, w, rows, (t1 - tFin).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());   // T-637: the A/B's 8888 side
   {
     static const bool sDrawStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
     if (sDrawStats && lo == 0 && hi == h && h > 700) {
@@ -2881,6 +3107,25 @@ CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int 
       aX0 < 0 || aX1 * 4 > aStride || (destX + w) * 4 > aStride || aDestRowLo < 0) {
     return false;
   }
+  if (mJihad565Now) {
+    // T-637: a drag's frame, in its target's 565 twin: the columns read as 565, widened straight into the frame
+    mGLContext->MakeCurrent();
+    mGLContext->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mJihadWindowFBO);
+    if (JihadRead565Ok(mGLContext)) {
+      double readMs = 0, expandMs = 0;
+      if (!JihadRead565(aDest + (size_t)aDestRowLo * aStride + (size_t)destX * 4, aStride, aX0, aSurfaceH - (aSrcRowLo + aRows), w, aRows,
+                        &readMs, &expandMs)) {
+        return false;
+      }
+      static uint32_t sN565 = 0;
+      if (sN565++ < 12 || (sN565 % 100) == 0) {
+        JIHAD_GPU_LOG("[jihad-gpu] 565 column read x %d..%d, rows %d..%d: glReadPixels %.1f ms, expand to BGRA %.1f ms\n",
+                aX0, aX1, aDestRowLo, aDestRowLo + aRows, readMs, expandMs);
+      }
+      return true;
+    }
+    ++gJihadDrag565Reads;   // a twin read as RGBA bytes: 565 rows all the same, the daemon repaints them
+  }
   static uint8_t* sBuf = nullptr;
   static size_t sCap = 0;
   const size_t bytes = (size_t)w * 4 * aRows;
@@ -2906,6 +3151,7 @@ CompositorOGL::JihadReadColumns(uint8_t* aDest, int aStride, int aSurfaceH, int 
   for (int r = 0; r < aRows; r++) {
     memcpy(aDest + (size_t)(aDestRowLo + r) * aStride + (size_t)destX * 4, sBuf + (size_t)r * w * 4, (size_t)w * 4);
   }
+  JihadReadStat(false, w, aRows, (t1 - t0).ToMilliseconds(), (TimeStamp::Now() - t1).ToMilliseconds());   // T-637
   static uint32_t sN = 0;
   if (sN++ < 12 || (sN % 100) == 0) {
     JIHAD_GPU_LOG("[jihad-gpu] column read x %d..%d, rows %d..%d (target rows from %d of %d): glReadPixels %.1f ms, swizzle+copy %.1f ms\n",
@@ -3215,3 +3461,18 @@ PerFrameTexturePoolOGL::EndFrame()
 
 } // namespace layers
 } // namespace mozilla
+
+// Jihad T-637: the daemon's two calls (weak on its side: an engine without them leaves the lever off). The first
+// from any thread: the card is being dragged (1) or has come to rest (0). The second: the 565 reads so far.
+extern "C" {
+MOZ_EXPORT void
+jihad_gpu_drag565(int aOn)
+{
+  mozilla::layers::gJihadDrag565.store(aOn ? 1 : 0, std::memory_order_relaxed);
+}
+MOZ_EXPORT uint32_t
+jihad_gpu_drag565_frames()
+{
+  return mozilla::layers::gJihadDrag565Reads.load(std::memory_order_relaxed);
+}
+}

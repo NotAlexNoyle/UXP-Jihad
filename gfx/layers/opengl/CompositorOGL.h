@@ -508,6 +508,27 @@ private:
   GLint mJihadSwizzlePos = -1, mJihadSwizzleTex = -1, mJihadSwizzleScale = -1;
   bool mJihadSwizzleFailed = false;
   bool JihadEnsureSwizzlePass(int aW, int aH);
+  // T-637 (JIHAD_GPU_DRAG565=1): while the card is dragged (the daemon says so: jihad_gpu_drag565), a frame is
+  // composed into an RGB565 renderbuffer of its target's size and read in the driver's own 565 format, then
+  // widened to the adapter's BGRA rows on the CPU (gpu-bench section 19 on the Adreno 220: 1024x768 drawn in 7.6 ms
+  // against 14.5 and read in 6.8 against 16.6). Each 8888 target has a 565 twin, made when first wanted: the two
+  // window targets (0, 1), the band target (2) and the tall one (3). A frame that keeps its alpha (an overview, the
+  // parts' picture) is never one of these.
+  GLuint mJihad565RB[4] = {0, 0, 0, 0}, mJihad565FBO[4] = {0, 0, 0, 0};
+  gfx::IntSize mJihad565Size[4];
+  bool mJihad565Failed = false;     // a twin came out incomplete: the lever is off for this compositor
+  bool mJihad565Want = false;       // this job's frame is a drag's (JihadLatch565, before its composites)
+  bool mJihad565Now = false;        // mJihadWindowFBO is a twin (JihadUse565Target, from BeginFrame)
+  // Which of a window target and its twin holds the running frame. A composite narrower than the frame is read by
+  // whole rows, so the columns beside it must be the frame's as it stood: it goes where the last whole composite
+  // went, and only a whole composite changes sides (the band targets are composed region by region, read region by
+  // region: they change sides at any pass).
+  bool mJihad565Cur[2] = {false, false};
+  UniquePtr<uint16_t[]> mJihad565Scratch;   // the 565 rows as read, widened from here
+  size_t mJihad565ScratchSize = 0;          // in pixels
+  void JihadLatch565();
+  void JihadUse565Target(bool aWhole);
+  bool JihadRead565(uint8_t* aDest, int aStride, int aX0, int aGlY, int aW, int aRows, double* aReadMs, double* aExpandMs);
   RefPtr<GLContext> mGLContext;
   UniquePtr<GLBlitTextureImageHelper> mBlitTextureImageHelper;
   gfx::Matrix4x4 mProjMatrix;
