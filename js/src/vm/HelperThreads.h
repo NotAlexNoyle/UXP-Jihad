@@ -497,6 +497,13 @@ struct AutoEnqueuePendingParseTasksAfterGC {
 bool
 StartOffThreadCompression(ExclusiveContext* cx, SourceCompressionTask* task);
 
+// Jihad (T-620, an experiment): JIHAD_JS_COMPRESS=off starts no source compression,
+// =nowait takes a task no helper has started off the list instead of waiting for it,
+// =log only reports the main thread's waits. Unset: upstream's behaviour.
+enum class JihadCompressMode { Upstream, Off, NoWait, Log };
+JihadCompressMode
+JihadJsCompressMode();
+
 class MOZ_RAII AutoLockHelperThreadState : public LockGuard<Mutex>
 {
     using Base = LockGuard<Mutex>;

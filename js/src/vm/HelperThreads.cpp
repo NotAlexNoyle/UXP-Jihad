@@ -8,6 +8,9 @@
 #include "mozilla/DebugOnly.h"
 #include "mozilla/Unused.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "jsnativestack.h"
 #include "jsnum.h" // For FIX_FPU()
 #include "js/SourceBufferHolder.h"
@@ -1742,6 +1745,24 @@ GlobalHelperThreadState::compressionInProgress(SourceCompressionTask* task,
     return false;
 }
 
+JihadCompressMode
+js::JihadJsCompressMode()
+{
+    static const JihadCompressMode mode = [] {
+        const char* v = getenv("JIHAD_JS_COMPRESS");
+        if (!v)
+            return JihadCompressMode::Upstream;
+        if (!strcmp(v, "off"))
+            return JihadCompressMode::Off;
+        if (!strcmp(v, "nowait"))
+            return JihadCompressMode::NoWait;
+        if (!strcmp(v, "log"))
+            return JihadCompressMode::Log;
+        return JihadCompressMode::Upstream;
+    }();
+    return mode;
+}
+
 bool
 SourceCompressionTask::complete()
 {
@@ -1750,8 +1771,29 @@ SourceCompressionTask::complete()
 
     {
         AutoLockHelperThreadState lock;
-        while (HelperThreadState().compressionInProgress(this, lock))
+        JihadCompressMode mode = JihadJsCompressMode();
+        if (mode == JihadCompressMode::NoWait) {
+            // Not started yet: drop it rather than make the main thread wait for its turn on
+            // the helpers. The source stays uncompressed, as a tiny script's does.
+            auto& list = HelperThreadState().compressionWorklist(lock);
+            for (size_t i = 0; i < list.length(); i++) {
+                if (list[i] == this) {
+                    list.erase(&list[i]);
+                    ss = nullptr;
+                    return true;
+                }
+            }
+        }
+        int64_t start = mode == JihadCompressMode::Log ? PRMJ_Now() : 0;
+        bool waited = false;
+        while (HelperThreadState().compressionInProgress(this, lock)) {
+            waited = true;
             HelperThreadState().wait(lock, GlobalHelperThreadState::CONSUMER);
+        }
+        if (mode == JihadCompressMode::Log && waited) {
+            fprintf(stderr, "[jihad-js] source compression wait %lld us (%zu chars)\n",
+                    (long long)(PRMJ_Now() - start), ss->length());
+        }
     }
 
     if (result == Success) {

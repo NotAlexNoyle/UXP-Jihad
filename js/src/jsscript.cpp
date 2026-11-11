@@ -46,6 +46,7 @@
 #include "vm/ArgumentsObject.h"
 #include "vm/Compression.h"
 #include "vm/Debugger.h"
+#include "vm/HelperThreads.h"
 #include "vm/Opcodes.h"
 #include "vm/SelfHosting.h"
 #include "vm/Shape.h"
@@ -1952,6 +1953,9 @@ ScriptSource::setSourceCopy(ExclusiveContext* cx, SourceBufferHolder& srcBuf,
         HelperThreadState().threadCount >= 2 &&
         CanUseExtraThreads();
     const size_t TINY_SCRIPT = 256;
+    // Jihad (T-620): JIHAD_JS_COMPRESS=off compresses nothing (TenFourFox 6a91f966).
+    if (JihadJsCompressMode() == JihadCompressMode::Off)
+        canCompressOffThread = false;
     if (TINY_SCRIPT <= srcBuf.length() && canCompressOffThread) {
         task->ss = this;
         if (!StartOffThreadCompression(cx, task))
