@@ -1407,6 +1407,37 @@ NewStringCopyUTF8N(JSContext* cx, const JS::UTF8Chars utf8)
 template JSFlatString*
 NewStringCopyUTF8N<CanGC>(JSContext* cx, const JS::UTF8Chars utf8);
 
+// Jihad (T-625, an experiment; Mozilla bug 1352323, TenFourFox eb6f6264): a short
+// Latin-1 DOM string is copied inline instead of becoming an external two-byte string.
+// JIHAD_JS_INLINE_DOMSTR=1 turns it on; unset, every string stays external, as upstream.
+static bool
+JihadInlineDOMStrings()
+{
+    static const bool on = [] {
+        const char* v = getenv("JIHAD_JS_INLINE_DOMSTR");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+JSString*
+NewMaybeExternalString(JSContext* cx, const char16_t* s, size_t n, const JSStringFinalizer* fin,
+                       bool* isExternal)
+{
+    if (JihadInlineDOMStrings()) {
+        if (JSString* str = TryEmptyOrStaticString(cx, s, n)) {
+            *isExternal = false;
+            return str;
+        }
+        if (JSThinInlineString::lengthFits<Latin1Char>(n) && CanStoreCharsAsLatin1(s, n)) {
+            *isExternal = false;
+            return NewInlineStringDeflated<CanGC>(cx, mozilla::Range<const char16_t>(s, n));
+        }
+    }
+    *isExternal = true;
+    return JSExternalString::new_(cx, s, n, fin);
+}
+
 } /* namespace js */
 
 #ifdef DEBUG

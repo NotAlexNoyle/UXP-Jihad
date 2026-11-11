@@ -1306,6 +1306,10 @@ NewStringCopyZ(js::ExclusiveContext* cx, const char* s)
     return NewStringCopyN<allowGC>(cx, s, strlen(s));
 }
 
+JSString*
+NewMaybeExternalString(JSContext* cx, const char16_t* s, size_t n, const JSStringFinalizer* fin,
+                       bool* isExternal);
+
 template <js::AllowGC allowGC>
 extern JSFlatString*
 NewStringCopyUTF8N(JSContext* cx, const JS::UTF8Chars utf8);
