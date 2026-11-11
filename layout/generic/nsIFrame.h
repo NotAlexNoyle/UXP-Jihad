@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "CaretAssociationHint.h"
 #include "FrameProperties.h"
@@ -1076,9 +1077,24 @@ public:
 
   NS_DECLARE_FRAME_PROPERTY_WITHOUT_DTOR(PlaceholderFrameProperty, nsPlaceholderFrame)
 
+  // T-621 (bug 1358275): JIHAD_BIDI_SKIPLTR=1 skips bidi resolution for pure LTR blocks; unset is upstream.
+  static bool JihadBidiSkipLTR() {
+    static const bool on = [] {
+      const char* v = getenv("JIHAD_BIDI_SKIPLTR");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
   mozilla::FrameBidiData GetBidiData()
   {
-    return GetProperty(BidiDataProperty());
+    bool exists;
+    mozilla::FrameBidiData bidiData = GetProperty(BidiDataProperty(), &exists);
+    // T-621 (bug 1358275): a skipped frame has no property, which must not read as a control at level 0.
+    if (!exists && JihadBidiSkipLTR()) {
+      bidiData.precedingControl = mozilla::kBidiLevelNone;
+    }
+    return bidiData;
   }
 
   nsBidiLevel GetBaseLevel()

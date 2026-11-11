@@ -19,6 +19,7 @@
 #include "nsFirstLetterFrame.h"
 #include "nsUnicodeProperties.h"
 #include "nsTextFrame.h"
+#include "nsTextFragment.h"
 #include "nsBlockFrame.h"
 #include "nsIFrameInlines.h"
 #include "nsStyleStructInlines.h"
@@ -698,6 +699,31 @@ nsBidiPresUtils::Resolve(nsBlockFrame* aBlockFrame)
   char16_t ch = GetBidiOverride(aBlockFrame->StyleContext());
   if (ch != 0) {
     bpd.PushBidiControl(ch);
+  } else if (nsIFrame::JihadBidiSkipLTR() && bpd.mParaLevel == NSBIDI_LTR) {
+    // T-621 (bug 1358275): an LTR block with no override, no unicode-bidi descendant, no RTL or
+    // bidi-control character and no bidi data left by an earlier pass needs no resolution.
+    bool requiresBidi = false;
+    nsIContent* currContent = nullptr;
+    for (nsBlockFrame* block = aBlockFrame; block && !requiresBidi;
+         block = static_cast<nsBlockFrame*>(block->GetNextContinuation())) {
+      requiresBidi =
+        ChildListMayRequireBidi(block->PrincipalChildList().FirstChild(),
+                                &currContent);
+      if (!requiresBidi) {
+        nsBlockFrame::FrameLines* overflowLines = block->GetOverflowLines();
+        requiresBidi = overflowLines &&
+          ChildListMayRequireBidi(overflowLines->mFrames.FirstChild(),
+                                  &currContent);
+      }
+    }
+    if (!requiresBidi) {
+      // Bug 1362423: the bit comes off every continuation, as the full pass below does.
+      for (nsBlockFrame* block = aBlockFrame; block;
+           block = static_cast<nsBlockFrame*>(block->GetNextContinuation())) {
+        block->RemoveStateBits(NS_BLOCK_NEEDS_BIDI_RESOLUTION);
+      }
+      return NS_OK;
+    }
   }
   for (nsBlockFrame* block = aBlockFrame; block;
        block = static_cast<nsBlockFrame*>(block->GetNextContinuation())) {
@@ -1242,6 +1268,90 @@ nsBidiPresUtils::TraverseFrames(nsBlockInFlowLineIterator* aLineIter,
   } while (childFrame);
 
   MOZ_ASSERT(initialLineContainer == aLineIter->GetContainer());
+}
+
+// T-621 (bug 1358275, bug 1428774): true if the text holds anything that can raise a bidi level in an LTR paragraph.
+// Covers R, AL and AN (all inside the RTL blocks or behind their lead surrogates) and, more cautious than
+// upstream, every bidi control character, LTR ones included.
+static bool
+JihadTextMayRequireBidi(const char16_t* aText, uint32_t aLength)
+{
+  const char16_t* end = aText + aLength;
+  for (const char16_t* cp = aText; cp < end; ++cp) {
+    char16_t ch = *cp;
+    if (ch < 0x0590) {
+      continue;
+    }
+    if (IS_IN_BMP_RTL_BLOCK(ch) || IS_RTL_PRESENTATION_FORM(ch) ||
+        ch == 0xD802 || ch == 0xD803 || ch == 0xD83A || ch == 0xD83B ||
+        IsBidiControl(ch)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool
+nsBidiPresUtils::ChildListMayRequireBidi(nsIFrame*    aFirstChild,
+                                         nsIContent** aCurrContent)
+{
+  MOZ_ASSERT(!aFirstChild || !aFirstChild->GetPrevSibling(),
+             "Expecting to traverse from the start of a child list");
+
+  for (nsIFrame* childFrame = aFirstChild; childFrame;
+       childFrame = childFrame->GetNextSibling()) {
+    nsIFrame* frame = childFrame;
+
+    // As TraverseFrames: a placeholder for a first-letter frame stands for that frame.
+    if (childFrame->GetType() == nsGkAtoms::placeholderFrame) {
+      nsIFrame* realFrame =
+        nsPlaceholderFrame::GetRealFrameForPlaceholder(childFrame);
+      if (realFrame->GetType() == nsGkAtoms::letterFrame) {
+        frame = realFrame;
+      }
+    }
+
+    // unicode-bidi (embed, isolate, override, plaintext) or upright vertical text needs resolution.
+    nsStyleContext* sc = frame->StyleContext();
+    if (GetBidiControl(sc) || GetBidiOverride(sc)) {
+      return true;
+    }
+
+    // Bug 1366623: bidi data or the bidi state left by an earlier pass must be redone or removed by a full pass.
+    // Upstream tests text frames only; every visited frame is tested here.
+    if ((frame->GetStateBits() & NS_FRAME_IS_BIDI) ||
+        frame->HasProperty(nsIFrame::BidiDataProperty())) {
+      return true;
+    }
+
+    // TraverseFrames drains an inline's overflow list into its child list first, so that list counts too.
+    if (frame->IsFrameOfType(nsIFrame::eBidiInlineContainer) &&
+        ChildListMayRequireBidi(
+          frame->GetChildList(nsIFrame::kOverflowList).FirstChild(),
+          aCurrContent)) {
+      return true;
+    }
+
+    if (IsBidiLeaf(frame)) {
+      if (frame->GetType() == nsGkAtoms::textFrame) {
+        nsIContent* content = frame->GetContent();
+        if (content != *aCurrContent) {
+          *aCurrContent = content;
+          const nsTextFragment* txt = content->GetText();
+          // 1-byte text is Latin-1 and holds no RTL or control character.
+          if (txt->Is2b() &&
+              JihadTextMayRequireBidi(txt->Get2b(), txt->GetLength())) {
+            return true;
+          }
+        }
+      }
+    } else if (ChildListMayRequireBidi(frame->PrincipalChildList().FirstChild(),
+                                       aCurrContent)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 void

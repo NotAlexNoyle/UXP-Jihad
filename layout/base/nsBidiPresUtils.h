@@ -399,6 +399,11 @@ private:
                              nsIFrame*                  aCurrentFrame,
                              BidiParagraphData*         aBpd);
 
+  // T-621 (bug 1358275): pre-scan of the frames TraverseFrames would visit; false only for pure LTR content.
+  // aCurrContent is the content node last scanned, so continuations of one text node are scanned once.
+  static bool ChildListMayRequireBidi(nsIFrame*    aFirstChild,
+                                      nsIContent** aCurrContent);
+
   /**
    * Position ruby content frames (ruby base/text frame).
    * Called from RepositionRubyFrame.
