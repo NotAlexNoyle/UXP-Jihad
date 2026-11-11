@@ -726,6 +726,21 @@ CompositorOGL::SetRenderTarget(CompositingRenderTarget *aSurface)
   }
 
   PrepareViewport(mCurrentRenderTarget);
+  // T-605 diagnostic (JIHAD_GPU_DRAWSTATS): back on the frame's target, as after an intermediate surface, the driver's
+  // scissor box and viewport against the context's cache of them, logged when they differ (a draw whose scissor the
+  // cache thinks already set is skipped, and the surface's box would clip it)
+  static const bool sJihadBackStats = getenv("JIHAD_GPU_DRAWSTATS") != nullptr;
+  if (sJihadBackStats && JihadIsWindowTarget()) {
+    GLint rs[4], cs[4], rv[4], cv[4];
+    mGLContext->JihadRawAndCached(rs, cs, rv, cv);
+    static uint32_t sBackN = 0;
+    const bool differ = rs[0] != cs[0] || rs[1] != cs[1] || rs[2] != cs[2] || rs[3] != cs[3] ||
+                        rv[0] != cv[0] || rv[1] != cv[1] || rv[2] != cv[2] || rv[3] != cv[3];
+    if (differ && sBackN++ < 40) {
+      JIHAD_GPU_LOG("[jihad-gpu] back on the frame's target: scissor raw %d,%d %dx%d cached %d,%d %dx%d, viewport raw %d,%d %dx%d cached %d,%d %dx%d\n",
+                    rs[0], rs[1], rs[2], rs[3], cs[0], cs[1], cs[2], cs[3], rv[0], rv[1], rv[2], rv[3], cv[0], cv[1], cv[2], cv[3]);
+    }
+  }
 }
 
 CompositingRenderTarget*
