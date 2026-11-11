@@ -16,6 +16,7 @@
 #include "gfxTextRun.h"
 #include "nsDisplayList.h"
 #include "JustificationUtils.h"
+#include "nsGenericDOMDataNode.h"
 #include "RubyUtils.h"
 
 // Undo the windows.h damage
@@ -91,7 +92,31 @@ public:
       aNextContinuation->RemoveStateBits(NS_FRAME_IS_FLUID_CONTINUATION);
     // Setting a non-fluid continuation might affect our flow length (they're
     // quite rare so we assume it always does) so we delete our cached value:
-    GetContent()->DeleteProperty(nsGkAtoms::flowlength);
+    DeleteFlowLengthProperty(GetContent());
+  }
+  // T-624 (Mozilla bug 1385395): the node flags say whether a frame property exists.
+  // JIHAD_TEXT_PROPFLAGS=1 lets a missing flag skip the property table; unset, every
+  // lookup and delete happens as upstream, and only the flags are kept up to date.
+  static bool UsePropertyFlags() {
+    static const bool on = [] {
+      const char* v = getenv("JIHAD_TEXT_PROPFLAGS");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+  static void DeleteFlowLengthProperty(nsIContent* aContent) {
+    if (UsePropertyFlags() && !aContent->HasFlag(NS_HAS_FLOWLENGTH_PROPERTY)) {
+      return;
+    }
+    aContent->DeleteProperty(nsGkAtoms::flowlength);
+    aContent->UnsetFlags(NS_HAS_FLOWLENGTH_PROPERTY);
+  }
+  static void DeleteNewlineProperty(nsIContent* aContent) {
+    if (UsePropertyFlags() && !aContent->HasFlag(NS_HAS_NEWLINE_PROPERTY)) {
+      return;
+    }
+    aContent->DeleteProperty(nsGkAtoms::newline);
+    aContent->UnsetFlags(NS_HAS_NEWLINE_PROPERTY);
   }
   virtual nsIFrame* GetNextInFlowVirtual() const override { return GetNextInFlow(); }
   nsIFrame* GetNextInFlow() const {
@@ -108,7 +133,7 @@ public:
         !mNextContinuation->HasAnyStateBits(NS_FRAME_IS_FLUID_CONTINUATION)) {
       // Changing from non-fluid to fluid continuation might affect our flow
       // length, so we delete our cached value:
-      GetContent()->DeleteProperty(nsGkAtoms::flowlength);
+      DeleteFlowLengthProperty(GetContent());
     }
     if (aNextInFlow) {
       aNextInFlow->AddStateBits(NS_FRAME_IS_FLUID_CONTINUATION);

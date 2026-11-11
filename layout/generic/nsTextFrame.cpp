@@ -730,7 +730,9 @@ int32_t nsTextFrame::GetInFlowContentLength() {
   }
 
   FlowLengthProperty* flowLength =
-    static_cast<FlowLengthProperty*>(mContent->GetProperty(nsGkAtoms::flowlength));
+    (UsePropertyFlags() && !mContent->HasFlag(NS_HAS_FLOWLENGTH_PROPERTY))
+    ? nullptr
+    : static_cast<FlowLengthProperty*>(mContent->GetProperty(nsGkAtoms::flowlength));
 
   /**
    * This frame must start inside the cached flow. If the flow starts at
@@ -757,6 +759,8 @@ int32_t nsTextFrame::GetInFlowContentLength() {
                                         nsINode::DeleteProperty<FlowLengthProperty>))) {
       delete flowLength;
       flowLength = nullptr;
+    } else {
+      mContent->SetFlags(NS_HAS_FLOWLENGTH_PROPERTY);
     }
   }
   if (flowLength) {
@@ -4258,9 +4262,9 @@ nsTextFrame::Init(nsIContent*       aContent,
 
   // Remove any NewlineOffsetProperty or InFlowContentLengthProperty since they
   // might be invalid if the content was modified while there was no frame
-  aContent->DeleteProperty(nsGkAtoms::newline);
-  if (PresContext()->BidiEnabled()) {
-    aContent->DeleteProperty(nsGkAtoms::flowlength);
+  DeleteNewlineProperty(aContent);
+  if (UsePropertyFlags() || PresContext()->BidiEnabled()) {
+    DeleteFlowLengthProperty(aContent);
   }
 
   // Since our content has a frame now, this flag is no longer needed.
@@ -4738,9 +4742,9 @@ nsTextFrame::DisconnectTextRuns()
 nsresult
 nsTextFrame::CharacterDataChanged(CharacterDataChangeInfo* aInfo)
 {
-  mContent->DeleteProperty(nsGkAtoms::newline);
-  if (PresContext()->BidiEnabled()) {
-    mContent->DeleteProperty(nsGkAtoms::flowlength);
+  DeleteNewlineProperty(mContent);
+  if (UsePropertyFlags() || PresContext()->BidiEnabled()) {
+    DeleteFlowLengthProperty(mContent);
   }
 
   // Find the first frame whose text has changed. Frames that are entirely
@@ -9011,7 +9015,9 @@ nsTextFrame::ReflowText(nsLineLayout& aLineLayout, nscoord aAvailableWidth,
   NewlineProperty* cachedNewlineOffset = nullptr;
   if (textStyle->NewlineIsSignificant(this)) {
     cachedNewlineOffset =
-      static_cast<NewlineProperty*>(mContent->GetProperty(nsGkAtoms::newline));
+      (UsePropertyFlags() && !mContent->HasFlag(NS_HAS_NEWLINE_PROPERTY))
+      ? nullptr
+      : static_cast<NewlineProperty*>(mContent->GetProperty(nsGkAtoms::newline));
     if (cachedNewlineOffset && cachedNewlineOffset->mStartOffset <= offset &&
         (cachedNewlineOffset->mNewlineOffset == -1 ||
          cachedNewlineOffset->mNewlineOffset >= offset)) {
@@ -9497,6 +9503,8 @@ nsTextFrame::ReflowText(nsLineLayout& aLineLayout, nscoord aAvailableWidth,
                                           nsINode::DeleteProperty<NewlineProperty>))) {
         delete cachedNewlineOffset;
         cachedNewlineOffset = nullptr;
+      } else {
+        mContent->SetFlags(NS_HAS_NEWLINE_PROPERTY);
       }
     }
     if (cachedNewlineOffset) {
@@ -9504,7 +9512,7 @@ nsTextFrame::ReflowText(nsLineLayout& aLineLayout, nscoord aAvailableWidth,
       cachedNewlineOffset->mNewlineOffset = contentNewLineOffset;
     }
   } else if (cachedNewlineOffset) {
-    mContent->DeleteProperty(nsGkAtoms::newline);
+    DeleteNewlineProperty(mContent);
   }
 
   // Compute space and letter counts for justification, if required
@@ -9991,7 +9999,7 @@ void
 nsTextFrame::AdjustOffsetsForBidi(int32_t aStart, int32_t aEnd)
 {
   AddStateBits(NS_FRAME_IS_BIDI);
-  mContent->DeleteProperty(nsGkAtoms::flowlength);
+  DeleteFlowLengthProperty(mContent);
 
   /*
    * After Bidi resolution we may need to reassign text runs.
