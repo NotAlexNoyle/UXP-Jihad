@@ -1212,7 +1212,20 @@ CompositorBridgeParent::JihadHideForJob()
             }
           }
         }
-        l->AsLayerComposite()->SetShadowOpacity(0.0f);
+        // T-605: the part's leaves at 0, never the part itself. A container at opacity 0 with more than one child is
+        // composed through an intermediate surface (DefaultComputeEffectiveTransforms), and on the frames that had one
+        // (the contents sidebar's 9 children during desktop Wikipedia's load) the layers drawn after it, the article,
+        // came out only inside the surface's extent (x below 208, the GL scissor's 787 rows from the bottom): a blank
+        // article under the dressed sidebar. With one child the opacity folds into it and the frames were right. A
+        // leaf at 0 needs no surface, and the hidden part costs no offscreen pass either. JIHAD_GPU_HIDE_PART=1: as before
+        static const bool sHideWhole = getenv("JIHAD_GPU_HIDE_PART") != nullptr;
+        if (sHideWhole) {
+          l->AsLayerComposite()->SetShadowOpacity(0.0f);
+        } else {
+          ForEachNode<ForwardIterator>(l, [](Layer* d) {
+            if (!d->GetFirstChild()) d->AsLayerComposite()->SetShadowOpacity(0.0f);
+          });
+        }
       }
       return;
     }
