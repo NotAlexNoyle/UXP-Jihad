@@ -2674,9 +2674,11 @@ CompositorBridgeParent::JihadComposeAndRead(JihadFrameRequest* aReq, float aScal
   {
     static const int sStallAt = getenv("JIHAD_GPU_TEST_STALL") ? atoi(getenv("JIHAD_GPU_TEST_STALL")) : 0;
     static int sJobsSeen = 0;
+    // JIHAD_GPU_TEST_STALL_S=<s>: the hold's length (6 s by default); a large one stands for a driver call that never returns
+    static const int sStallS = getenv("JIHAD_GPU_TEST_STALL_S") ? atoi(getenv("JIHAD_GPU_TEST_STALL_S")) : 6;
     if (sStallAt > 0 && aReq && ++sJobsSeen == sStallAt) {
-      JIHAD_GPU_LOG("[jihad-gpu] JIHAD_GPU_TEST_STALL: job %d holds the compositor thread 6 s\n", sJobsSeen);
-      sleep(6);
+      fprintf(stderr, "[jihad-gpu] JIHAD_GPU_TEST_STALL: job %d holds the compositor thread %d s\n", sJobsSeen, sStallS);
+      sleep(sStallS);
     }
   }
   if (aReq && aReq->cancelled) {
