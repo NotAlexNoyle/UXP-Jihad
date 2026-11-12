@@ -38,6 +38,7 @@
 #include "mozilla/gfx/JihadGpuLog.h"   // Jihad (T-512): JIHAD_GPU_LOG
 namespace mozilla { namespace gl { extern std::atomic<uint32_t> gJihadUploads; extern std::atomic<uint64_t> gJihadUploadUs; } }   // T-517, GLUploadHelpers.cpp
 namespace mozilla { namespace layers { extern std::atomic<uint32_t> gJihadLateWrites; } }   // T-513, CompositorOGL.cpp
+namespace mozilla { namespace layers { extern std::atomic<bool> gJihadCompositorAbandoned; } }   // CompositorBridgeChild.cpp
 #include "base/task.h"
 // Jihad offscreen render-document support:
 #include "gfxContext.h"
@@ -660,6 +661,7 @@ PuppetWidget::GetLayerManager(PLayerTransactionChild* aShadowManager,
   if (!mLayerManager) {
     if (JihadOffscreen()) {
       if (JihadGpuCompositor() && !mJihadCompositorTried && !mTabChild &&
+          !mozilla::layers::gJihadCompositorAbandoned &&   // a new card after the give-up: software layers
           gfxPlatform::UsesOffMainThreadCompositing()) {
         // Jihad T-502: an in-process compositor behind a ClientLayerManager. Tried once: on
         // failure CreateCompositor leaves mLayerManager null and the software path below
@@ -1529,6 +1531,7 @@ MOZ_EXPORT void
 jihad_offscreen_gpu_given_up()
 {
   sJihadGpuGivenUp = true;
+  mozilla::layers::gJihadCompositorAbandoned = true;   // nothing on the main thread waits on the compositor again
 }
 // T-513 (review): how many reads of a given-up frame had already written into its slot (a GPU stall
 // inside glReadPixels outlasting the daemon's bound); the daemon repaints in software when it moves

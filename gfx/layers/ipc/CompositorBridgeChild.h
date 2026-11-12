@@ -18,6 +18,7 @@
 #include "nsISupportsImpl.h"            // for NS_INLINE_DECL_REFCOUNTING
 #include "ThreadSafeRefcountingWithMainThreadDestruction.h"
 #include "nsWeakReference.h"
+#include <atomic>                       // Jihad: gJihadCompositorAbandoned
 
 namespace mozilla {
 
@@ -30,6 +31,13 @@ class CompositorWidget;
 } // namespace widget
 
 namespace layers {
+
+// Jihad (Atlas issue #3's class, 2026-11-12): set when the daemon gives the GPU path up
+// (jihad_offscreen_gpu_given_up). The compositor thread may be stuck in a GPU call that never
+// returns, so from then on nothing on the main thread waits on it: no synchronous message
+// (FlushRendering, WillClose, MakeSnapshot, SyncWithCompositor...), no layer transaction, and a
+// card's bridge closes without talking to it (its objects leak, the daemon goes on).
+extern std::atomic<bool> gJihadCompositorAbandoned;
 
 using mozilla::dom::TabChild;
 

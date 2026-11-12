@@ -764,7 +764,8 @@ ShadowLayerForwarder::SetLayerObserverEpoch(uint64_t aLayerObserverEpoch)
 bool
 ShadowLayerForwarder::IPCOpen() const
 {
-  return HasShadowManager() && mShadowManager->IPCOpen();
+  // Jihad: no layer transaction to a compositor given up (gJihadCompositorAbandoned)
+  return HasShadowManager() && mShadowManager->IPCOpen() && !gJihadCompositorAbandoned;
 }
 
 /**

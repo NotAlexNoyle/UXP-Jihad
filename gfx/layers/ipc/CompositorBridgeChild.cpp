@@ -52,6 +52,8 @@ using mozilla::gfx::GPUProcessManager;
 namespace mozilla {
 namespace layers {
 
+std::atomic<bool> gJihadCompositorAbandoned(false);
+
 static int sShmemCreationCounter = 0;
 
 static void ResetShmemCounter()
@@ -62,7 +64,7 @@ static void ResetShmemCounter()
 static void ShmemAllocated(CompositorBridgeChild* aProtocol)
 {
   sShmemCreationCounter++;
-  if (sShmemCreationCounter > 256) {
+  if (sShmemCreationCounter > 256 && !gJihadCompositorAbandoned) {
     aProtocol->SendSyncWithCompositor();
     ResetShmemCounter();
     MOZ_PERFORMANCE_WARNING("gfx", "The number of shmem allocations is too damn high!");
@@ -113,6 +115,14 @@ CompositorBridgeChild::Destroy()
   mTexturesWaitingRecycled.Clear();
 
   if (!mCanSend) {
+    return;
+  }
+
+  // Jihad: the compositor was given up: the textures, the layer transactions, WillClose and the
+  // channel's close all wait on its thread, which may never answer. The bridge is left as it is.
+  if (gJihadCompositorAbandoned) {
+    mCanSend = false;
+    fprintf(stderr, "[jihad-gpu] compositor bridge %p closed without its compositor (given up): left in place\n", (void*)this);
     return;
   }
 
@@ -745,13 +755,16 @@ bool
 CompositorBridgeChild::SendWillClose()
 {
   MOZ_RELEASE_ASSERT(mCanSend);
+  if (gJihadCompositorAbandoned) {
+    return false;
+  }
   return PCompositorBridgeChild::SendWillClose();
 }
 
 bool
 CompositorBridgeChild::SendPause()
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendPause();
@@ -760,7 +773,7 @@ CompositorBridgeChild::SendPause()
 bool
 CompositorBridgeChild::SendResume()
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendResume();
@@ -769,7 +782,7 @@ CompositorBridgeChild::SendResume()
 bool
 CompositorBridgeChild::SendNotifyChildCreated(const uint64_t& id)
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendNotifyChildCreated(id);
@@ -778,7 +791,7 @@ CompositorBridgeChild::SendNotifyChildCreated(const uint64_t& id)
 bool
 CompositorBridgeChild::SendAdoptChild(const uint64_t& id)
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendAdoptChild(id);
@@ -787,7 +800,7 @@ CompositorBridgeChild::SendAdoptChild(const uint64_t& id)
 bool
 CompositorBridgeChild::SendMakeSnapshot(const SurfaceDescriptor& inSnapshot, const gfx::IntRect& dirtyRect)
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendMakeSnapshot(inSnapshot, dirtyRect);
@@ -796,7 +809,7 @@ CompositorBridgeChild::SendMakeSnapshot(const SurfaceDescriptor& inSnapshot, con
 bool
 CompositorBridgeChild::SendFlushRendering()
 {
-  if (!mCanSend) {
+  if (!mCanSend || gJihadCompositorAbandoned) {
     return false;
   }
   return PCompositorBridgeChild::SendFlushRendering();
