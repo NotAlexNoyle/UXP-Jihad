@@ -40,6 +40,8 @@ if CONFIG['MOZ_DEBUG']:
 # ICU requires RTTI
 if CONFIG['GNU_CXX']:
     CXXFLAGS += ['-frtti']
+    # Jihad (T-633): <typeinfo> with default visibility before gcc_hidden.h's push(hidden) applies (GCC 12, ARM EABI)
+    CXXFLAGS += ['-include', '%s/config/external/icu/typeinfo-default.h' % TOPSRCDIR]
 elif CONFIG['OS_TARGET'] == 'WINNT':
     CXXFLAGS += ['-GR']
 
