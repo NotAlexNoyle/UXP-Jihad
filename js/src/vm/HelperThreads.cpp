@@ -1769,6 +1769,12 @@ SourceCompressionTask::complete()
     if (!active())
         return true;
 
+    // Jihad (2026-11-12): a task no helper has started is taken off the list and run here, on this
+    // thread; only one a helper is already running is waited for. Tasks on the helpers wait for their
+    // own sources' compression too (an off-thread module parse), so with every helper busy that way
+    // nothing was left to run the compressions: GitHub's module scripts deadlocked the daemon on the
+    // job's two-thread pool (JIHAD_JS_HELPER_THREADS=2), the main thread and both helpers waiting here.
+    bool runHere = false;
     {
         AutoLockHelperThreadState lock;
         JihadCompressMode mode = JihadJsCompressMode();
@@ -1784,9 +1790,17 @@ SourceCompressionTask::complete()
                 }
             }
         }
+        auto& queued = HelperThreadState().compressionWorklist(lock);
+        for (size_t i = 0; i < queued.length(); i++) {
+            if (queued[i] == this) {
+                queued.erase(&queued[i]);
+                runHere = true;
+                break;
+            }
+        }
         int64_t start = mode == JihadCompressMode::Log ? PRMJ_Now() : 0;
         bool waited = false;
-        while (HelperThreadState().compressionInProgress(this, lock)) {
+        while (!runHere && HelperThreadState().compressionInProgress(this, lock)) {
             waited = true;
             HelperThreadState().wait(lock, GlobalHelperThreadState::CONSUMER);
         }
@@ -1795,6 +1809,9 @@ SourceCompressionTask::complete()
                     (long long)(PRMJ_Now() - start), ss->length());
         }
     }
+
+    if (runHere)
+        result = work();
 
     if (result == Success) {
         MOZ_ASSERT(resultString);
