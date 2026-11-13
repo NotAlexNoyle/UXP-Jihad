@@ -969,15 +969,15 @@ GlobalHelperThreadState::maxParseThreads() const
 {
     if (IsHelperThreadSimulatingOOM(js::oom::THREAD_TYPE_PARSE))
         return 1;
-    // Use the number of logical processors in a system.
-    if (cpuCount < 4)
-        return 2;
-    //return cpuCount - 2;
     // XXX Issue #3172 XXX
     // For the time being, return a hard-coded value of 2 on all targets and CPUs.
     // It's unclear where the contention happens, but it has shown to be detrimental
     // especially on *nixes and older hardware. 
     static const size_t sJihadParse = JihadEnvCount("JIHAD_JS_PARSE_THREADS", 2, 1);   // Jihad T-556
+    // Parses never hold every helper: one waits for the exclusive-access lock, which the GC holds
+    // through a slice while it waits for its own helper tasks, so a pool of parses alone deadlocks.
+    if (threadCount > 1 && sJihadParse >= threadCount)
+        return threadCount - 1;
     return sJihadParse;
 }
 
