@@ -1151,6 +1151,26 @@ js::GCParallelTask::joinWithLockHeld(AutoLockHelperThreadState& locked)
     if (state == NotStarted)
         return;
 
+    // A task no helper has started runs here: the GC joins its sweep tasks while it holds the
+    // exclusive-access lock, and off-thread parses on every helper can be waiting for that lock.
+    if (!CurrentHelperThread()) {
+        GlobalHelperThreadState::GCParallelTaskVector& worklist = HelperThreadState().gcParallelWorklist(locked);
+        for (size_t i = 0; i < worklist.length(); i++) {
+            if (worklist[i] != this)
+                continue;
+            worklist.erase(&worklist[i]);
+            {
+                AutoUnlockHelperThreadState unlock(locked);
+                uint64_t timeStart = PRMJ_Now();
+                runTask();
+                duration_ = PRMJ_Now() - timeStart;
+            }
+            state = NotStarted;
+            cancel_ = false;
+            return;
+        }
+    }
+
     while (state != Finished)
         HelperThreadState().wait(locked, GlobalHelperThreadState::CONSUMER);
     state = NotStarted;
