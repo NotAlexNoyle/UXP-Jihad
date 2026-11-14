@@ -408,6 +408,25 @@ nsresult nsPluginInstanceOwner::GetInstance(nsNPAPIPluginInstance **aInstance)
   return NS_OK;
 }
 
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+// Jihad (T-576): the user's last pen down or up on a movie (ms, PR_IntervalNow), and a movie's link to a new
+// window waiting for its page's daemon (GetURL, jihad_plugin_take_new_window)
+static uint32_t gJihadPenMs = 0;
+static void* gJihadNewWindowShell = nullptr;
+static nsCString gJihadNewWindowUrl;
+extern "C" MOZ_EXPORT int
+jihad_plugin_take_new_window(nsIDocShell* aRootShell, char* aBuf, int aLen)
+{
+  if (!aRootShell || !gJihadNewWindowShell || gJihadNewWindowShell != static_cast<void*>(aRootShell) ||
+      aLen <= 0 || gJihadNewWindowUrl.IsEmpty())
+    return 0;
+  snprintf(aBuf, aLen, "%s", gJihadNewWindowUrl.get());
+  gJihadNewWindowShell = nullptr;
+  gJihadNewWindowUrl.Truncate();
+  return 1;
+}
+#endif
+
 NS_IMETHODIMP nsPluginInstanceOwner::GetURL(const char *aURL,
                                             const char *aTarget,
                                             nsIInputStream *aPostStream,
@@ -492,6 +511,36 @@ NS_IMETHODIMP nsPluginInstanceOwner::GetURL(const char *aURL,
       BasePrincipal::Cast(content->NodePrincipal())->OriginAttributesRef();
     triggeringPrincipal = BasePrincipal::CreateCodebasePrincipal(uri, attrs);
   }
+
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+  // Jihad (T-576): a movie's link to a new window (a game's sponsor logo, getURL(url, "_blank")) goes to a NEW
+  // CARD, as the stock browser opens it, and never in place: this embedding answers a link with a target with
+  // the window that asked (PageChrome::ProvideWindow), so the link took the game's own card away (Achievement
+  // Unlocked, 2026-11-14: the splash tapped, the card on armorgames.com). Only within a second of the user's
+  // own pen event on a movie, a GET to a web address: anything else from a movie is refused, never in place.
+  // The daemon takes the address for its page's root docshell (jihad_plugin_take_new_window).
+  if (unitarget.EqualsLiteral("_blank") && !aPostStream) {
+    bool web = false;
+    uri->SchemeIs("http", &web);
+    if (!web) uri->SchemeIs("https", &web);
+    const uint32_t nowMs = PR_IntervalToMilliseconds(PR_IntervalNow());
+    const bool gesture = gJihadPenMs && nowMs - gJihadPenMs < 1000;
+    nsCOMPtr<nsIDocShellTreeItem> root;
+    container->GetSameTypeRootTreeItem(getter_AddRefs(root));
+    nsCOMPtr<nsIDocShell> rootShell = do_QueryInterface(root);
+    nsAutoCString spec;
+    uri->GetSpec(spec);
+    if (web && gesture && rootShell) {
+      gJihadNewWindowShell = rootShell.get();
+      gJihadNewWindowUrl = spec;
+      fprintf(stderr, "[jihad-bs] plugin link to a new window: to a new card (%s)\n", spec.get());
+    } else {
+      fprintf(stderr, "[jihad-bs] plugin link to a new window refused (%s, %u ms after a pen event)\n",
+              web ? "no tap on the movie" : "not a web address", gJihadPenMs ? nowMs - gJihadPenMs : 0);
+    }
+    return NS_OK;
+  }
+#endif
 
   rv = nsDocShell::Cast(container)->OnLinkClick(content,
                                                 uri,
@@ -2627,8 +2676,8 @@ nsEventStatus nsPluginInstanceOwner::ProcessEvent(const WidgetGUIEvent& anEvent)
       const WidgetMouseEvent& mouseEvent = *anEvent.AsMouseEvent();
 
       switch (anEvent.mMessage) {
-        case eMouseDown:   pluginEvent.eventType = npPalmPenDownEvent; break;
-        case eMouseUp:     pluginEvent.eventType = npPalmPenUpEvent;   break;
+        case eMouseDown:   pluginEvent.eventType = npPalmPenDownEvent; gJihadPenMs = PR_IntervalToMilliseconds(PR_IntervalNow()); break;
+        case eMouseUp:     pluginEvent.eventType = npPalmPenUpEvent;   gJihadPenMs = PR_IntervalToMilliseconds(PR_IntervalNow()); break;
         case eMouseMove:   pluginEvent.eventType = npPalmPenMoveEvent; break;
         // The synthesized click/dblclick that follows a down/up pair. Palm's host sends these
         // as their own event types rather than swallowing them (libWebKitLuna
