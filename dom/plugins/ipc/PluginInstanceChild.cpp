@@ -1223,8 +1223,14 @@ PluginInstanceChild::AnswerNPP_HandleEvent(const NPRemoteEvent& event,
     // a second time while it's in the previous call.
     if (!mPluginIface->event)
         *handled = false;
-    else
+    else {
+        ++mJihadEventDepth;
         *handled = mPluginIface->event(&mData, reinterpret_cast<void*>(&evcopy));
+        --mJihadEventDepth;
+    }
+    // pen events that came during this call: a task delivers them once the movie is out of it (Jihad, T-576)
+    if (mJihadEventDepth == 0 && !mJihadPenQueue.IsEmpty())
+        JihadPostPenTask();
 
     // Guard MUST match the one npapi.h uses to define NPEvent as Palm's union. Any other
     // predicate compiles this against `typedef void* NPEvent` and does not build.
@@ -4328,6 +4334,58 @@ PluginInstanceChild::RecvJihadShowDone()
 }
 
 bool
+PluginInstanceChild::RecvJihadPenEvent(const NPRemoteEvent& event)
+{
+    // The same delivery as NPP_HandleEvent; nobody waits for its answer. Never delivered here: this message is
+    // dispatched whenever the channel is read, also while the movie waits on a call of its own to the host
+    // (inside an event call, or inside a frame's NPN call), and a pen event delivered inside the movie's own
+    // code is lost (2026-11-14: n-up 0 in the tap and lock tests; then a tap's down lost, its up counted).
+    // A task delivers it from the loop, as DoAsyncSetWindow is for the same reason; in order, after the
+    // event call in progress if there is one.
+    mJihadPenQueue.AppendElement(event);
+    JihadPostPenTask();
+    return true;
+}
+
+void
+PluginInstanceChild::JihadPostPenTask()
+{
+    if (mJihadPenTask)
+        return;
+    mJihadPenTask = NewNonOwningCancelableRunnableMethod(this, &PluginInstanceChild::JihadPenTaskRun);
+    RefPtr<Runnable> addrefedTask = mJihadPenTask;
+    MessageLoop::current()->PostTask(addrefedTask.forget());
+}
+
+void
+PluginInstanceChild::JihadPenTaskRun()
+{
+    mJihadPenTask = nullptr;
+    // inside an event call still (a nested loop ran this task): that call's end posts the task again
+    if (mJihadEventDepth == 0 && !mJihadPenDraining)
+        JihadDrainPen();
+}
+
+void
+PluginInstanceChild::JihadDrainPen()
+{
+    mJihadPenDraining = true;
+    while (!mJihadPenQueue.IsEmpty()) {
+        NPRemoteEvent next = mJihadPenQueue[0];
+        mJihadPenQueue.RemoveElementAt(0);
+        int16_t handled = 0;
+        AnswerNPP_HandleEvent(next, &handled);
+        int kind = next.event.eventType == npPalmPenDownEvent ? 0 : next.event.eventType == npPalmPenUpEvent ? 1 : 2;
+        int16_t h = handled ? 1 : 0;
+        if (h != mJihadPenToldHandled[kind]) {
+            mJihadPenToldHandled[kind] = h;
+            SendJihadPenHandled(kind, h);
+        }
+    }
+    mJihadPenDraining = false;
+}
+
+bool
 PluginInstanceChild::RecvJihadRequestFrame()
 {
     sJihadEverHostDriven = true;
@@ -5672,6 +5730,11 @@ PluginInstanceChild::Destroy()
         mCurrentAsyncSetWindowTask->Cancel();
         mCurrentAsyncSetWindowTask = nullptr;
     }
+    if (mJihadPenTask) {
+        mJihadPenTask->Cancel();
+        mJihadPenTask = nullptr;
+    }
+    mJihadPenQueue.Clear();
     {
         MutexAutoLock autoLock(mAsyncInvalidateMutex);
         if (mAsyncInvalidateTask) {

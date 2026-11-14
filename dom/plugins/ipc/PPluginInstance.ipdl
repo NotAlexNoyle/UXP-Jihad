@@ -151,6 +151,14 @@ child:
   // The parent has taken its copy of a frame sent by JihadShow: that surface is the child's again.
   async JihadShowDone();
 
+  // Jihad (T-576): a pen down, move or up, delivered without waiting. intr NPP_HandleEvent waits for
+  // the movie's frame to end, and a game whose frame takes 80-150 ms (Raft Wars) held the daemon's
+  // main thread for seconds under a drag: nothing was published while the finger moved. All three
+  // kinds go this way so they stay in order. The parent answers each with the movie's last answer to
+  // that kind (JihadPenHandled; Flash's answer depends on the movie, not on the event: an AVM2 movie
+  // takes downs and ups, 1, an older one 0).
+  async JihadPenEvent(NPRemoteEvent event);
+
   // ********************** Async plugins rendering
   // see https://wiki.mozilla.org/Gecko:AsyncPluginPainting
   // **********************
@@ -272,6 +280,9 @@ parent:
   // Show without the wait: the player's thread goes on while the parent's main thread gets to the
   // frame. Answered by JihadShowDone.
   async JihadShow(NPRect updatedRect, SurfaceDescriptor newSurface);
+
+  // Jihad (T-576): the movie's answer to a pen down, up or move (kind 0, 1, 2) changed; sent only then.
+  async JihadPenHandled(int16_t kind, int16_t handled);
 
   sync Show(NPRect updatedRect, SurfaceDescriptor newSurface)
     returns (SurfaceDescriptor prevSurface);

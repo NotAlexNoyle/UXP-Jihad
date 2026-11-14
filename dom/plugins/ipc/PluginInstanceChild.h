@@ -148,6 +148,21 @@ protected:
     virtual bool
     RecvJihadShowDone() override;
 
+    // Jihad (T-576): a pen event with no answer awaited. See PPluginInstance.ipdl.
+    virtual bool
+    RecvJihadPenEvent(const NPRemoteEvent& event) override;
+    // the plugin's event calls in progress, and the pen events that came during one: the movie gets them after
+    // it returns, in order, never inside its own handling of the one before
+    int mJihadEventDepth = 0;
+    bool mJihadPenDraining = false;
+    nsTArray<NPRemoteEvent> mJihadPenQueue;
+    void JihadDrainPen();
+    void JihadPostPenTask();
+    void JihadPenTaskRun();
+    RefPtr<CancelableRunnable> mJihadPenTask;
+    // the answers to each pen kind (down, up, move) the parent was last told of (JihadPenHandled); it starts at 1
+    int16_t mJihadPenToldHandled[3] = { 1, 1, 1 };
+
     virtual bool
     AnswerNPP_Destroy(NPError* result) override;
 

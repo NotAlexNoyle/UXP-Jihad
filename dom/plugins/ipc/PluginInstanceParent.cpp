@@ -1142,6 +1142,14 @@ jihad_plugin_lane_copy(unsigned char* aDest, int aDestStride, int aX, int aY, in
 }
 
 bool
+PluginInstanceParent::RecvJihadPenHandled(const int16_t& aKind, const int16_t& aHandled)
+{
+    if (aKind >= 0 && aKind < 3)
+        mJihadPenHandled[aKind] = aHandled;
+    return true;
+}
+
+bool
 PluginInstanceParent::RecvJihadShow(const NPRect& updatedRect,
                                     const SurfaceDescriptor& newSurface)
 {
@@ -2040,6 +2048,21 @@ PluginInstanceParent::NPP_HandleEvent(void* event)
                 }
             break;
         }
+    }
+#endif
+
+#if defined(XP_UNIX) && defined(MOZ_WIDGET_HEADLESS)
+    // Jihad (T-576): pen events go without waiting for the movie's frame (PPluginInstance.ipdl,
+    // JihadPenEvent); the movie's last answer to that kind is returned (RecvJihadPenHandled): a handled down
+    // keeps the page's own default for the press (2026-11-14: a fixed 0 for an AVM2 movie, which answers 1,
+    // lost the Enyo card the drag that followed a hold). JIHAD_PLUGIN_PEN_ASYNC=0 waits as before.
+    static const bool sPenAsync = !getenv("JIHAD_PLUGIN_PEN_ASYNC") || atoi(getenv("JIHAD_PLUGIN_PEN_ASYNC")) != 0;
+    if (sPenAsync && (npevent->eventType == npPalmPenDownEvent || npevent->eventType == npPalmPenUpEvent ||
+                      npevent->eventType == npPalmPenMoveEvent)) {
+        if (!SendJihadPenEvent(npremoteevent))
+            return 0;
+        int kind = npevent->eventType == npPalmPenDownEvent ? 0 : npevent->eventType == npPalmPenUpEvent ? 1 : 2;
+        return mJihadPenHandled[kind];
     }
 #endif
 

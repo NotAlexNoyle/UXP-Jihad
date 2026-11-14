@@ -215,6 +215,12 @@ public:
     RecvJihadShow(const NPRect& updatedRect,
                   const SurfaceDescriptor& newSurface) override;
 
+    // Jihad (T-576): the movie's last answer to each pen kind (down, up, move), returned for the pen
+    // events sent without a wait. Until the movie has answered one: handled (an AVM2 movie's answer).
+    virtual bool
+    RecvJihadPenHandled(const int16_t& aKind, const int16_t& aHandled) override;
+    int16_t mJihadPenHandled[3] = { 1, 1, 1 };
+
     // The plugin lane: the one live instance's newest opaque frame (jihad_plugin_lane_copy)
     static int JihadLaneCopy(unsigned char* aDest, int aDestStride, int aX, int aY, int aW, int aH,
                              int* aFullW, int* aFullH);
