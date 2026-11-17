@@ -3,6 +3,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "prinrval.h"
+#include <stdlib.h>
+#include <stdio.h>
 #include "mozilla/plugins/BrowserStreamChild.h"
 
 #include "mozilla/Attributes.h"
@@ -260,6 +263,27 @@ BrowserStreamChild::Deliver()
   }
 }
 
+// Jihad (cavekit-flash.md R8): what the player took of its streams and how often it asked for a wait, every two seconds
+// while bytes move. A progressive video is sought only inside what has been delivered, so a seek that fails is first
+// read against this (2026-11-17: a 5 MB clip was all delivered in three seconds with no wait asked).
+static void
+JihadStreamCount(int32_t aBytes, bool aSuspended)
+{
+  static uint64_t sBytes = 0;
+  static uint32_t sSuspends = 0, sWrites = 0;
+  static PRIntervalTime sSince = 0;
+  PRIntervalTime now = PR_IntervalNow();
+  if (!sSince) sSince = now;
+  if (aSuspended) sSuspends++; else { sBytes += aBytes; sWrites++; }
+  uint32_t ms = PR_IntervalToMilliseconds(now - sSince);
+  if (ms >= 2000) {
+    fprintf(stderr, "[jihad-npapi-child] streams: %llu bytes in %u ms (%llu kB/s), %u writes, %u waits asked\n",
+            (unsigned long long)sBytes, ms, (unsigned long long)(sBytes / ms), sWrites, sSuspends);
+    fflush(stderr);
+    sBytes = 0; sSuspends = 0; sWrites = 0; sSince = now;
+  }
+}
+
 bool
 BrowserStreamChild::DeliverPendingData()
 {
@@ -272,8 +296,10 @@ BrowserStreamChild::DeliverPendingData()
     int32_t r = mInstance->mPluginIface->writeready(&mInstance->mData, &mStream);
     if (kStreamOpen != mStreamStatus)
       return false;
-    if (0 == r) // plugin wants to suspend delivery
+    if (0 == r) { // plugin wants to suspend delivery
+      JihadStreamCount(0, true);
       return true;
+    }
 
     r = mInstance->mPluginIface->write(
       &mInstance->mData, &mStream,
@@ -289,6 +315,7 @@ BrowserStreamChild::DeliverPendingData()
       return false;
     }
     mPendingData[0].curpos += r;
+    JihadStreamCount(r, false);
   }
   mPendingData.RemoveElementAt(0);
   return false;
