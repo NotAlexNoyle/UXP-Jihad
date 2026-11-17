@@ -179,6 +179,7 @@ JihadTranslateFlashKey(NPEvent& aEvent)
 // Draws posted on this thread's loop: the pump stops, or the player runs its next frame first
 // and this one is never drawn. A count: several instances share the loop and the pump
 static int gJihadDrawsPosted = 0;
+static uint32_t gJihadGlibCalls = 0, gJihadGlibRuns = 0, gJihadGlibIters = 0, gJihadGlibUs = 0;
 // When the plugin last asked for a draw itself: the pump's short period is for a movie that plays
 static uint32_t gJihadSelfInvalMs = 0;
 static const char* const kJihadShowNames[kJihadShowSites] = {
@@ -4160,12 +4161,20 @@ JihadPumpGlib(int aMaxIterations)
         return 0;
     }
     int n = 0;
+    PRIntervalTime t0 = PR_IntervalNow();
     while (n < aMaxIterations && gJihadDrawsPosted == 0) {
         if (sPending && !sPending(nullptr)) {
             break;
         }
         sIterate(nullptr, 0 /* may_block = FALSE */);
         n++;
+    }
+    // where the loop's time goes between draws (the 2 s readout): the player's own work is in these iterations
+    gJihadGlibCalls++;
+    if (n) {
+        gJihadGlibRuns++;
+        gJihadGlibIters += n;
+        gJihadGlibUs += PR_IntervalToMicroseconds(PR_IntervalNow() - t0);
     }
     return n;
 }
@@ -4748,10 +4757,27 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
 
             // Let the plugin's own scheduled work run before we ask it to draw, so the
             // frame it paints is current rather than whatever it had at instantiation.
+            //
+            // NOT while the movie plays by its own clock (Jihad, cavekit-flash.md R3, 2026-11-17).
+            // A draw the player asked for itself (NPN_InvalidateRect out of its frame's tick) is
+            // of a frame that is current already, and the frame's timer is due again by the time
+            // the draw's task runs: the pump here then ran a WHOLE further tick of the movie
+            // before every draw. Measured in play (Achievement Unlocked, Enyo): the player
+            // invalidated 30 times a second and was drawn 10 times, 76-94 ms in this pump per
+            // draw, 7 frames a second shown where the stock browser shows 22 from the same
+            // player. The continuous pump (JihadGlibPumpTask) is the movie's clock; this one
+            // stays for a draw the host asked for of a movie that is not invalidating itself.
+            // $JIHAD_PLUGIN_PREDRAW_PUMP=1 brings the old behaviour back.
             {
-                PRIntervalTime t0 = PR_IntervalNow();
-                JihadPumpGlib(50);
-                gJihadPumpUs += PR_IntervalToMicroseconds(PR_IntervalNow() - t0);
+                static const bool sAlways = getenv("JIHAD_PLUGIN_PREDRAW_PUMP") &&
+                                            atoi(getenv("JIHAD_PLUGIN_PREDRAW_PUMP")) != 0;
+                const uint32_t preNowMs = uint32_t(PR_IntervalToMilliseconds(PR_IntervalNow()));
+                const bool selfDriven = gJihadSelfInvalMs && (preNowMs - gJihadSelfInvalMs) < 250;
+                if (sAlways || !selfDriven) {
+                    PRIntervalTime t0 = PR_IntervalNow();
+                    JihadPumpGlib(50);
+                    gJihadPumpUs += PR_IntervalToMicroseconds(PR_IntervalNow() - t0);
+                }
             }
 
             PRIntervalTime drawT0 = PR_IntervalNow();
@@ -4781,6 +4807,9 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
                     // plugin's own work between draws, or the loop idle
                     fprintf(stderr, "[jihad-npapi-child]   per draw: pump %u us, draw %u us, show %u us\n",
                             gJihadPumpUs / sDraws, gJihadDrawUs / sDraws, gJihadShowUs / sDraws);
+                    fprintf(stderr, "[jihad-npapi-child]   the loop: %u pumps, %u ran sources (%u iterations, %u us in them)\n",
+                            gJihadGlibCalls, gJihadGlibRuns, gJihadGlibIters, gJihadGlibUs);
+                    gJihadGlibCalls = gJihadGlibRuns = gJihadGlibIters = gJihadGlibUs = 0;
                     gJihadPumpUs = gJihadDrawUs = gJihadShowUs = 0;
                     // WHICH SITE ASKED FOR THOSE DRAWS. These are requests to draw, not draws:
                     // AsyncShowPluginFrame coalesces while an invalidate task is already pending,
