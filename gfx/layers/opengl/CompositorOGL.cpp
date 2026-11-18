@@ -156,8 +156,24 @@ CompositorOGL::CreateContext()
     context = gl::GLContextEGL::CreateEGLPBufferOffscreenContext(
         CreateContextFlags::REQUIRE_COMPAT_PROFILE, pb, SurfaceCaps::ForRGBA(), &failureId);
     mJihadPbSize = pb;
+    // T-659 device test (JIHAD_GPU_TEST_PBUFFER_FAIL_AFTER=<n>): the pbuffer context refused from the n-th
+    // made on, as when the GPU device cannot be opened (open(/dev/kgsl-3d0): ENOMEM, 2026-11-17)
+    static int sJihadMade = 0;
+    if (const char* e = getenv("JIHAD_GPU_TEST_PBUFFER_FAIL_AFTER")) {
+      if (sJihadMade++ >= atoi(e)) {
+        context = nullptr;
+        failureId.AssignLiteral("JIHAD_GPU_TEST_PBUFFER_FAIL_AFTER");
+      }
+    }
     fprintf(stderr, "[jihad-gpu] pbuffer context %dx%d: %s %s\n", pb.width, pb.height,
             context ? "created" : "FAILED", failureId.get());
+    // T-659: no pbuffer context is no GPU path. The window context tried next is not this platform's (the
+    // daemon has no window) and its provider ends the process when EGL cannot be set up
+    // (GLContextProviderEGL::CreateForWindow, MOZ_CRASH): 39 daemons died there on a device whose GPU
+    // device could not be opened. No context: the compositor is not made and the daemon renders in software.
+    if (!context) {
+      return nullptr;
+    }
   }
 
   // Allow to create offscreen GL context for main Layer Manager
