@@ -1326,6 +1326,9 @@ const char kJihadStockSamplingRate[] = "200000";
 // out from under a plugin that is still playing.
 nsTArray<NPP> gJihadBoostedInstances;
 bool gJihadBoostHeld = false;
+// Every card of the embedder in the background (cavekit-flash.md R10, T-580): the boost is given back while the
+// instances stay listed, and taken again when a card comes to the front (jihad_plugin_boost_background)
+bool gJihadBoostSuspended = false;
 char gJihadSavedUpThreshold[32];
 char gJihadSavedSamplingRate[32];
 
@@ -1389,12 +1392,20 @@ JihadCpuBoostEnabled()
     return !(e && e[0] == '0' && e[1] == '\0');
 }
 
+void JihadCpuBoostTake(const char* aWhy);
+
 void
 JihadCpuBoostAcquire(NPP aInstance)
 {
     if (!JihadCpuBoostEnabled() || gJihadBoostedInstances.Contains(aInstance)) return;
     gJihadBoostedInstances.AppendElement(aInstance);
-    if (gJihadBoostedInstances.Length() != 1 || gJihadBoostHeld) return;
+    if (gJihadBoostedInstances.Length() != 1 || gJihadBoostHeld || gJihadBoostSuspended) return;
+    JihadCpuBoostTake("");
+}
+
+void
+JihadCpuBoostTake(const char* aWhy)
+{
 
     const char* wantUp;
     const char* wantRate;
@@ -1414,8 +1425,8 @@ JihadCpuBoostAcquire(NPP aInstance)
     bool ok = JihadWriteTunable("up_threshold", wantUp);
     ok = JihadWriteTunable("sampling_rate", wantRate) && ok;
     gJihadBoostHeld = ok;
-    fprintf(stderr, "[jihad-npapi] cpu boost acquire: up_threshold %s->%s sampling_rate %s->%s%s\n",
-            gJihadSavedUpThreshold, wantUp, gJihadSavedSamplingRate, wantRate,
+    fprintf(stderr, "[jihad-npapi] cpu boost acquire%s: up_threshold %s->%s sampling_rate %s->%s%s\n",
+            aWhy, gJihadSavedUpThreshold, wantUp, gJihadSavedSamplingRate, wantRate,
             ok ? "" : "  FAILED (not root, or no ondemandtcl)");
     fflush(stderr);
 }
@@ -1452,6 +1463,30 @@ JihadCpuBoostReleaseAll()
 }
 
 } // anonymous namespace
+
+// 1: every card of the embedder is in the background; 0: one is in front again. A background movie keeps its
+// player and its sound (as the stock browser's does), but not the governor's boost, which it no longer needs to
+// draw anything anybody sees.
+extern "C" MOZ_EXPORT void
+jihad_plugin_boost_background(int aBackground)
+{
+    if (aBackground) {
+        if (gJihadBoostSuspended) return;
+        gJihadBoostSuspended = true;
+        if (!gJihadBoostHeld) return;
+        JihadWriteTunable("up_threshold", gJihadSavedUpThreshold);
+        JihadWriteTunable("sampling_rate", gJihadSavedSamplingRate);
+        gJihadBoostHeld = false;
+        fprintf(stderr, "[jihad-npapi] cpu boost release (every card in the background): up_threshold=%s sampling_rate=%s\n",
+                gJihadSavedUpThreshold, gJihadSavedSamplingRate);
+        fflush(stderr);
+    } else {
+        if (!gJihadBoostSuspended) return;
+        gJihadBoostSuspended = false;
+        if (gJihadBoostedInstances.IsEmpty() || gJihadBoostHeld) return;
+        JihadCpuBoostTake(" (a card in front again)");
+    }
+}
 
 NPError
 PluginModuleParent::NPP_Destroy(NPP instance,
