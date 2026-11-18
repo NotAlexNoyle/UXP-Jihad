@@ -3,6 +3,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <unistd.h>
+#include "prinrval.h"
 #include "mozilla/ipc/MessageChannel.h"
 #include "mozilla/ipc/ProtocolUtils.h"
 
@@ -1046,10 +1048,39 @@ MessageChannel::ProcessPendingRequests(AutoEnterTransaction& aTransaction)
     }
 }
 
+
+// Jihad (cavekit-flash.md R3, T-576): the calls a process makes that wait for the other side's answer, counted and
+// timed, with the three message types that waited longest. Read and cleared by the plugin child's two-second readout
+// (PluginInstanceChild.cpp): a player's frame that waits on the daemon's main thread is slow whatever the player does.
+extern "C" {
+MOZ_EXPORT uint32_t gJihadIpcWaits = 0;
+MOZ_EXPORT uint32_t gJihadIpcWaitUs = 0;
+MOZ_EXPORT uint32_t gJihadIpcTopType[3] = { 0, 0, 0 };
+MOZ_EXPORT uint32_t gJihadIpcTopUs[3] = { 0, 0, 0 };
+MOZ_EXPORT uint32_t gJihadIpcTopN[3] = { 0, 0, 0 };
+}
+namespace {
+struct JihadIpcWait {
+    PRIntervalTime mT0; uint32_t mType;
+    explicit JihadIpcWait(uint32_t aType) : mT0(PR_IntervalNow()), mType(aType) {}
+    ~JihadIpcWait() {
+        const uint32_t us = PR_IntervalToMicroseconds(PR_IntervalNow() - mT0);
+        gJihadIpcWaits++; gJihadIpcWaitUs += us;
+        int at = -1;
+        for (int i = 0; i < 3; i++) if (gJihadIpcTopType[i] == mType) at = i;
+        if (at < 0) for (int i = 0; i < 3; i++) if (!gJihadIpcTopType[i]) { at = i; break; }
+        if (at < 0) { at = 0; for (int i = 1; i < 3; i++) if (gJihadIpcTopUs[i] < gJihadIpcTopUs[at]) at = i;
+                      if (gJihadIpcTopUs[at] > us) return; gJihadIpcTopUs[at] = 0; gJihadIpcTopN[at] = 0; }
+        gJihadIpcTopType[at] = mType; gJihadIpcTopUs[at] += us; gJihadIpcTopN[at]++;
+    }
+};
+}
+
 bool
 MessageChannel::Send(Message* aMsg, Message* aReply)
 {
     nsAutoPtr<Message> msg(aMsg);
+    JihadIpcWait jihadWait(aMsg->type());
 
     // Sanity checks.
     AssertWorkerThread();
@@ -1238,6 +1269,7 @@ bool
 MessageChannel::Call(Message* aMsg, Message* aReply)
 {
     nsAutoPtr<Message> msg(aMsg);
+    JihadIpcWait jihadWait(aMsg->type());
     AssertWorkerThread();
     mMonitor->AssertNotCurrentThreadOwns();
 

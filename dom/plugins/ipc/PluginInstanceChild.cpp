@@ -179,6 +179,7 @@ JihadTranslateFlashKey(NPEvent& aEvent)
 // Draws posted on this thread's loop: the pump stops, or the player runs its next frame first
 // and this one is never drawn. A count: several instances share the loop and the pump
 static int gJihadDrawsPosted = 0;
+extern "C" { extern uint32_t gJihadIpcWaits, gJihadIpcWaitUs, gJihadIpcTopType[3], gJihadIpcTopUs[3], gJihadIpcTopN[3]; }
 static uint32_t gJihadGlibCalls = 0, gJihadGlibRuns = 0, gJihadGlibIters = 0, gJihadGlibUs = 0;
 // When the plugin last asked for a draw itself: the pump's short period is for a movie that plays
 static uint32_t gJihadSelfInvalMs = 0;
@@ -4810,6 +4811,14 @@ PluginInstanceChild::PaintRectToPlatformSurface(const nsIntRect& aRect,
                     fprintf(stderr, "[jihad-npapi-child]   the loop: %u pumps, %u ran sources (%u iterations, %u us in them)\n",
                             gJihadGlibCalls, gJihadGlibRuns, gJihadGlibIters, gJihadGlibUs);
                     gJihadGlibCalls = gJihadGlibRuns = gJihadGlibIters = gJihadGlibUs = 0;
+                    // the calls that waited for the daemon's answer in those two seconds (MessageChannel.cpp)
+                    fprintf(stderr, "[jihad-npapi-child]   waits on the parent: %u, %u us; longest types %u (%u, %u us) %u (%u, %u us) %u (%u, %u us)\n",
+                            gJihadIpcWaits, gJihadIpcWaitUs,
+                            gJihadIpcTopType[0], gJihadIpcTopN[0], gJihadIpcTopUs[0],
+                            gJihadIpcTopType[1], gJihadIpcTopN[1], gJihadIpcTopUs[1],
+                            gJihadIpcTopType[2], gJihadIpcTopN[2], gJihadIpcTopUs[2]);
+                    gJihadIpcWaits = gJihadIpcWaitUs = 0;
+                    for (int jw = 0; jw < 3; jw++) { gJihadIpcTopType[jw] = gJihadIpcTopUs[jw] = gJihadIpcTopN[jw] = 0; }
                     gJihadPumpUs = gJihadDrawUs = gJihadShowUs = 0;
                     // WHICH SITE ASKED FOR THOSE DRAWS. These are requests to draw, not draws:
                     // AsyncShowPluginFrame coalesces while an invalidate task is already pending,
