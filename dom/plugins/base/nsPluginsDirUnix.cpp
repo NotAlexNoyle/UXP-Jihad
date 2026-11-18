@@ -17,6 +17,15 @@
 #include "nsIFile.h"
 #include "nsIPrefBranch.h"
 #include "nsIPrefService.h"
+#include "nsReadableUtils.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
 
 #define LOCAL_PLUGIN_DLL_SUFFIX ".so"
 #ifdef XP_SOLARIS
@@ -296,11 +305,141 @@ nsresult nsPluginFile::LoadPlugin(PRLibrary **outLibrary)
     return NS_OK;
 }
 
+// JIHAD (cavekit-flash.md R10, T-580): the library read by plugin-container -jihad-plugin-scan, not loaded here.
+// Where the bundled loader launches the children (the device), every plugin folder library is read in a process
+// of its own under a time limit (JIHAD_PLUGIN_SCAN_MS, 10 s): one that hangs is killed, one that crashes or is not
+// a library is simply not a plugin, and none of them is ever mapped into the daemon. JIHAD_PLUGIN_SCAN_OOP=0 is the
+// old way. Returns NS_ERROR_NOT_AVAILABLE when the out-of-process scan is not in use.
+static nsresult
+JihadScanPluginOutOfProcess(const nsACString& aPath, nsPluginInfo& info)
+{
+    const char* loader = PR_GetEnv("MOZ_CHILD_PROCESS_LOADER");
+    const char* greDir = PR_GetEnv("MOZ_CHILD_PROCESS_LOADER_PATH");
+    const char* off = PR_GetEnv("JIHAD_PLUGIN_SCAN_OOP");
+    if (!loader || !*loader || !greDir || !*greDir || (off && !strcmp(off, "0"))) {
+        return NS_ERROR_NOT_AVAILABLE;
+    }
+    const char* msEnv = PR_GetEnv("JIHAD_PLUGIN_SCAN_MS");
+    const int limitMs = (msEnv && atoi(msEnv) > 0) ? atoi(msEnv) : 10000;
+    nsAutoCString child(greDir);
+    child.AppendLiteral("/plugin-container");
+    nsAutoCString path(aPath);
+    char* argv[] = { const_cast<char*>(loader), const_cast<char*>("--library-path"), const_cast<char*>(greDir),
+                     const_cast<char*>(child.get()), const_cast<char*>("-jihad-plugin-scan"),
+                     const_cast<char*>(path.get()), nullptr };
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return NS_ERROR_FAILURE;
+    }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    pid_t pid = -1;
+    const PRIntervalTime t0 = PR_IntervalNow();
+    int err = posix_spawn(&pid, loader, &fa, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (err != 0) {
+        close(fds[0]);
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: the scanner did not start (%d)\n", path.get(), err);
+        return NS_ERROR_FAILURE;
+    }
+    nsAutoCString out;
+    bool timedOut = false;
+    for (;;) {
+        const int left = limitMs - (int)PR_IntervalToMilliseconds(PR_IntervalNow() - t0);
+        if (left <= 0) {
+            timedOut = true;
+            break;
+        }
+        struct pollfd pfd = { fds[0], POLLIN, 0 };
+        const int r = poll(&pfd, 1, left);
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        if (r <= 0) {
+            timedOut = (r == 0);
+            break;
+        }
+        char buf[1024];
+        const ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0 || out.Length() > 65536) {
+            break;
+        }
+        out.Append(buf, n);
+    }
+    close(fds[0]);
+    if (timedOut) {
+        kill(pid, SIGKILL);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    const uint32_t ms = PR_IntervalToMilliseconds(PR_IntervalNow() - t0);
+    if (timedOut || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || !StringEndsWith(out, NS_LITERAL_CSTRING("end\n"))) {
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: not a plugin (%s, %u ms): left out\n", path.get(),
+                timedOut ? "the scanner did not answer in time, killed" :
+                WIFSIGNALED(status) ? "the scanner died by a signal" : "the scanner refused it", ms);
+        return NS_ERROR_FAILURE;
+    }
+    nsAutoCString mime, name, description, version;
+    int32_t start = 0;
+    while (start < int32_t(out.Length())) {
+        int32_t nl = out.FindChar('\n', start);
+        if (nl < 0) {
+            break;
+        }
+        const nsDependentCSubstring line(out, start, nl - start);
+        start = nl + 1;
+        int32_t tab = line.FindChar('\t');
+        if (tab < 0) {
+            continue;
+        }
+        const nsDependentCSubstring key(line, 0, tab);
+        const nsDependentCSubstring value(line, tab + 1);
+        if (key.EqualsLiteral("mime")) mime = value;
+        else if (key.EqualsLiteral("name")) name = value;
+        else if (key.EqualsLiteral("description")) description = value;
+        else if (key.EqualsLiteral("version")) version = value;
+    }
+    if (mime.IsEmpty()) {
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: no MIME types: left out\n", path.get());
+        return NS_ERROR_FAILURE;
+    }
+    nsresult rv = ParsePluginMimeDescription(mime.get(), info);
+    if (NS_FAILED(rv)) {
+        return rv;
+    }
+    info.fFullPath = PL_strdup(path.get());
+    int32_t slash = path.RFindChar('/');
+    info.fFileName = PL_strdup(slash >= 0 ? path.get() + slash + 1 : path.get());
+    info.fName = PL_strdup(name.IsEmpty() ? info.fFileName : name.get());
+    info.fDescription = PL_strdup(description.get());
+    info.fVersion = version.IsEmpty() ? nullptr : PL_strdup(version.get());
+    fprintf(stderr, "[jihad-npapi] plugin scan: %s: \"%s\" %s, read out of process in %u ms\n", path.get(),
+            info.fName, version.get(), ms);
+    return NS_OK;
+}
+
 nsresult nsPluginFile::GetPluginInfo(nsPluginInfo& info, PRLibrary **outLibrary)
 {
     *outLibrary = nullptr;
 
     info.fVersion = nullptr;
+
+    {
+        nsAutoCString scanPath;
+        if (NS_SUCCEEDED(mPlugin->GetNativePath(scanPath))) {
+            nsresult srv = JihadScanPluginOutOfProcess(scanPath, info);
+            if (srv != NS_ERROR_NOT_AVAILABLE) {
+                return srv;   // read, or left out; *outLibrary stays null: nothing of it is in this process
+            }
+        }
+    }
 
     // Sadly we have to load the library for this to work.
     nsresult rv = LoadPlugin(outLibrary);

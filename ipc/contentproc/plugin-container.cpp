@@ -111,6 +111,56 @@ MakeSandboxStarter()
 }
 #endif
 
+#if defined(XP_UNIX) && !defined(XP_MACOSX)
+#include <dlfcn.h>
+// A field for the daemon: tabs and line ends would break the line format, so they become spaces
+static void
+jihad_scan_print(const char* aKey, const char* aValue)
+{
+  if (!aValue) {
+    return;
+  }
+  printf("%s\t", aKey);
+  for (const char* c = aValue; *c; c++) {
+    putchar((*c == '\n' || *c == '\r' || *c == '\t') ? ' ' : *c);
+  }
+  putchar('\n');
+}
+
+static int
+jihad_plugin_scan(const char* aPath)
+{
+  void* lib = dlopen(aPath, RTLD_LAZY);
+  if (!lib) {
+    fprintf(stderr, "[jihad-npapi-child] plugin scan: %s: %s\n", aPath, dlerror());
+    return 2;
+  }
+  typedef const char* (*StrFn)();
+  typedef int16_t (*GetValueFn)(void*, int, void*);
+  StrFn version = (StrFn)dlsym(lib, "NP_GetPluginVersion");
+  StrFn mime = (StrFn)dlsym(lib, "NP_GetMIMEDescription");
+  GetValueFn getValue = (GetValueFn)dlsym(lib, "NP_GetValue");
+  if (!mime || !getValue) {
+    fprintf(stderr, "[jihad-npapi-child] plugin scan: %s: not an NPAPI plugin\n", aPath);
+    return 3;
+  }
+  if (version) {
+    jihad_scan_print("version", version());
+  }
+  jihad_scan_print("mime", mime());
+  const char* name = nullptr;
+  const char* description = nullptr;
+  getValue(nullptr, 1 /* NPPVpluginNameString */, &name);
+  getValue(nullptr, 2 /* NPPVpluginDescriptionString */, &description);
+  jihad_scan_print("name", name);
+  jihad_scan_print("description", description);
+  printf("end\n");
+  fflush(stdout);
+  // no dlclose, no exit handlers: a plugin's own destructors are not this scan's business
+  _exit(0);
+}
+#endif
+
 int
 content_process_main(int argc, char* argv[])
 {
@@ -154,6 +204,18 @@ content_process_main(int argc, char* argv[])
     if (getenv("MOZ_CHILD_PROCESS_LOADER")) {
       unsetenv("LD_LIBRARY_PATH");
     }
+
+#if defined(XP_UNIX) && !defined(XP_MACOSX)
+    // JIHAD (cavekit-flash.md R10, T-580): THE PLUGIN SCAN, OUT OF THE DAEMON. nsPluginFile::GetPluginInfo
+    // used to dlopen every library of the plugin folders in the daemon itself: a library whose constructor
+    // loops wedged it, one that aborts took it down, and Flash's own pulled libWebKitLuna, libPiranha and
+    // libv8 into it for good. The daemon now runs this process as
+    //     plugin-container -jihad-plugin-scan <library>
+    // under a time limit, and reads what it prints: one "key<TAB>value" line a field, "end" last.
+    if (argc == 3 && !strcmp(argv[1], "-jihad-plugin-scan")) {
+      return jihad_plugin_scan(argv[2]);
+    }
+#endif
 
 #ifdef MOZ_GMP
     XREChildData childData;
