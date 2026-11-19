@@ -1074,11 +1074,32 @@ TryPreserveWrapper(JSObject* obj)
     return true;
   }
 
-  // If this DOMClass is not cycle collected, then it isn't wrappercached,
-  // so it does not need to be preserved. If it is cycle collected, then
-  // we can't tell if it is wrappercached or not, so we just return false.
+  // Jihad: a WebIDL class that is not nsISupports (the WebGL objects, an
+  // AudioParam, many more) answered false here when it is cycle collected, so a
+  // WeakMap refused it as a key ("cannot use the given object as a weak map
+  // key"): EaglercraftX 1.8.8 stopped at its launch on that (cavekit-eaglercraft.md
+  // R2, T-666). The addProperty hook Codegen gives such a class (wantsAddProperty:
+  // concrete, wrapper cached, not a global) preserves the wrapper and does nothing
+  // else, so it is called, as later Gecko does (TryPreserveWrapper with the
+  // class's addProperty). A class without the hook keeps no wrapper cache and has
+  // nothing to preserve.
   const DOMJSClass* domClass = GetDOMClass(obj);
-  return domClass && !domClass->mParticipant;
+  if (!domClass) {
+    return false;
+  }
+  const js::Class* clasp = js::GetObjectClass(obj);
+  if (!clasp->isNative()) {
+    return false;   // DOM proxies are nsISupports, handled above
+  }
+  JSAddPropertyOp addProperty = clasp->getAddProperty();
+  if (!addProperty) {
+    return true;
+  }
+  MOZ_ASSERT(domClass->mParticipant);
+  JS::Rooted<JSObject*> rootedObj(RootingCx(), obj);
+  JS::Rooted<jsid> dummyId(RootingCx(), JSID_VOID);
+  JS::Rooted<JS::Value> dummyValue(RootingCx());
+  return addProperty(nullptr, rootedObj, dummyId, dummyValue);
 }
 
 // Can only be called with a DOM JSClass.
