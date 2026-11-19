@@ -46,6 +46,8 @@
 #include "mozilla/dom/WindowBinding.h"
 #include "mozilla/jsipc/CrossProcessObjectWrappers.h"
 #include "mozilla/Atomics.h"
+#include <stdio.h>     // Jihad: the memory guard's stop line
+#include <time.h>      // Jihad: clock_gettime (jihad_js_stop_scripts)
 #include "mozilla/Attributes.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ProcessHangMonitor.h"
@@ -1236,11 +1238,46 @@ XPCJSContext::ActivityCallback(void* arg, bool active)
     self->mWatchdogManager->RecordContextActivity(active);
 }
 
+// Jihad (T-672, cavekit-eaglercraft.md R6): the embedder's memory guard stops a content script that is running the
+// device out of memory. A page whose one task grew the daemon past half the RAM while free memory fell under 40 MB
+// hung the Adreno 220 for good (EaglercraftX 1.8.8's start, round t666-2026-11-18): the guard ran only between tasks
+// and that task lasted minutes. jihad_js_stop_scripts() may be called from any thread: it opens a short window in
+// which the next interrupt callback ends the running content script, as the slow-script dialog's "Stop script" does
+// (uncatchable; chrome is never stopped), and asks for that callback at once. A window no script used closes by
+// itself, so a later, innocent script is not stopped by it.
+static mozilla::Atomic<JSContext*> sJihadMainCx(nullptr);
+static mozilla::Atomic<int64_t> sJihadStopUntilMs(0);
+
+static int64_t
+JihadNowMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+extern "C" MOZ_EXPORT void
+jihad_js_stop_scripts()
+{
+    sJihadStopUntilMs = JihadNowMs() + 3000;
+    JSContext* cx = sJihadMainCx;
+    if (cx)
+        JS_RequestInterruptCallback(cx);
+}
+
 // static
 bool
 XPCJSContext::InterruptCallback(JSContext* cx)
 {
     XPCJSContext* self = XPCJSContext::Get();
+
+    if (sJihadStopUntilMs && JihadNowMs() < sJihadStopUntilMs &&
+        nsContentUtils::IsInitialized() && !nsContentUtils::IsCallerChrome())
+    {
+        sJihadStopUntilMs = 0;
+        fprintf(stderr, "[jihad-bs] memory guard: the running content script stopped\n");
+        return false;
+    }
 
     // Normally we record mSlowScriptCheckpoint when we start to process an
     // event. However, we can run JS outside of event handlers. This code takes
@@ -3190,6 +3227,7 @@ XPCJSContext::Initialize()
 
     MOZ_ASSERT(Context());
     JSContext* cx = Context();
+    sJihadMainCx = cx;   // jihad_js_stop_scripts (above InterruptCallback)
 
     mUnprivilegedJunkScope.init(cx, nullptr);
     mPrivilegedJunkScope.init(cx, nullptr);
