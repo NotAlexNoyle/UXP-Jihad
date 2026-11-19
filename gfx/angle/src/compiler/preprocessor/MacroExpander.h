@@ -24,7 +24,10 @@ struct SourceLocation;
 class MacroExpander : public Lexer
 {
   public:
-    MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics);
+    // allowedDepth: how many more argument pre-expansions may nest below this one (see collectMacroArgs).
+    MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics,
+                  int allowedDepth = kMaxNestedArgExpansion);
+    static const int kMaxNestedArgExpansion = 256;
     ~MacroExpander() override;
 
     void lex(Token *token) override;
@@ -81,6 +84,7 @@ class MacroExpander : public Lexer
     Lexer *mLexer;
     MacroSet *mMacroSet;
     Diagnostics *mDiagnostics;
+    int mAllowedDepth;
 
     std::unique_ptr<Token> mReserveToken;
     std::vector<MacroContext *> mContextStack;

@@ -46,8 +46,9 @@ class TokenLexer : public Lexer
     TokenVector::const_iterator mIter;
 };
 
-MacroExpander::MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics)
-    : mLexer(lexer), mMacroSet(macroSet), mDiagnostics(diagnostics)
+MacroExpander::MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics,
+                             int allowedDepth)
+    : mLexer(lexer), mMacroSet(macroSet), mDiagnostics(diagnostics), mAllowedDepth(allowedDepth)
 {
 }
 
@@ -220,8 +221,15 @@ bool MacroExpander::expandMacro(const Macro &macro,
         assert(macro.type == Macro::kTypeFunc);
         std::vector<MacroArg> args;
         args.reserve(macro.parameters.size());
-        if (replacements->size() == 0 ||
-            !collectMacroArgs(macro, identifier, &args, &replacementLocation))
+        // Jihad: UXP Issue #2978 (2026-03) put `replacements->size() == 0 ||` before this call, to
+        // stop an infinite recursion. `replacements` is this function's output, cleared above and
+        // filled only by replaceMacroParams below, so the test was always true: no function-like
+        // macro was ever expanded, and every shader that uses one failed with "'(' : syntax
+        // error" at its invocation (EaglercraftX's first shader, cavekit-eaglercraft.md R2, T-666;
+        // render/goanna/test/jihad-webgl-macro.html). The recursion that can run away is the
+        // arguments' pre-expansion in collectMacroArgs, each a MacroExpander of its own: it is
+        // bounded there instead, as later ANGLE bounds it.
+        if (!collectMacroArgs(macro, identifier, &args, &replacementLocation))
             return false;
 
         replaceMacroParams(macro, args, replacements);
@@ -321,8 +329,16 @@ bool MacroExpander::collectMacroArgs(const Macro &macro,
     for (std::size_t i = 0; i < args->size(); ++i)
     {
         MacroArg &arg = args->at(i);
+        if (mAllowedDepth < 1)
+        {
+            // An invocation nested this deep in another's arguments: refused, not expanded, as
+            // later ANGLE refuses it (PP_MACRO_INVOCATION_CHAIN_TOO_DEEP there).
+            mDiagnostics->report(Diagnostics::PP_MACRO_UNTERMINATED_INVOCATION,
+                                 identifier.location, identifier.text);
+            return false;
+        }
         TokenLexer lexer(&arg);
-        MacroExpander expander(&lexer, mMacroSet, mDiagnostics);
+        MacroExpander expander(&lexer, mMacroSet, mDiagnostics, mAllowedDepth - 1);
 
         arg.clear();
         expander.lex(&token);
