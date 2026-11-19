@@ -3072,7 +3072,17 @@ js::GetCPUCount()
         GetSystemInfo(&sysinfo);
         ncpus = unsigned(sysinfo.dwNumberOfProcessors);
 # else
+        // Jihad: the cores the system has, not only those awake at this instant. A device that
+        // parks its second core while idle (the HP TouchPad: /sys/devices/system/cpu/online "0",
+        // present "0-1"; the kernel brings it up under load) gave 1 here when the engine started,
+        // and with one CPU OffThreadCompilationAvailable is false: Ion then refuses every script
+        // over MAX_MAIN_THREAD_SCRIPT_SIZE or MAX_MAIN_THREAD_LOCALS_AND_ARGS ("too large"), and a
+        // page made of large functions (EaglercraftX's TeaVM code) runs in Baseline only
+        // (cavekit-eaglercraft.md R6, T-666).
         long n = sysconf(_SC_NPROCESSORS_ONLN);
+        long conf = sysconf(_SC_NPROCESSORS_CONF);
+        if (conf > n)
+            n = conf;
         ncpus = (n > 0) ? unsigned(n) : 1;
 # endif
     }
