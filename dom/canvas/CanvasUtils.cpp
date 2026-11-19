@@ -43,7 +43,11 @@ GetCanvasContextType(const nsAString& str, dom::CanvasContextType* const out_typ
     return true;
   }
 
-#ifdef MOZ_WEBGL_CONFORMANT
+  // Jihad: "webgl" always, not only in a build configured MOZ_WEBGL_CONFORMANT (a mozconfig
+  // variable this build never set): without it the standard name answered null, with no
+  // webglcontextcreationerror, while "experimental-webgl" answered a context of the same
+  // implementation; a page asking only for "webgl" had no WebGL at all, and EaglercraftX
+  // warned that its context was "experimental" (cavekit-eaglercraft.md R2, T-666).
   if (str.EqualsLiteral("webgl")) {
     /* WebGL 1.0, $2.1 "Context Creation":
      *   If the user agent supports both the webgl and experimental-webgl
@@ -52,7 +56,6 @@ GetCanvasContextType(const nsAString& str, dom::CanvasContextType* const out_typ
     *out_type = dom::CanvasContextType::WebGL1;
     return true;
   }
-#endif
 
   if (WebGL2Context::IsSupported()) {
     if (str.EqualsLiteral("webgl2")) {
