@@ -29,6 +29,7 @@
 #include "nsPrintfCString.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/Services.h"
+#include "nsThreadUtils.h"   // Jihad: NS_DispatchToMainThread (jihad-memory-script-stopped)
 #include "mozilla/dom/ScriptSettings.h"
 
 #include "nsContentUtils.h"
@@ -1271,10 +1272,26 @@ XPCJSContext::InterruptCallback(JSContext* cx)
 {
     XPCJSContext* self = XPCJSContext::Get();
 
+    // Only a script that has run for 2 s or more in this task: the guard is after a long task, and a script that has
+    // just begun inside the window (the window was opened while nothing ran) is not the one that took the memory
+    // (Codex review 2026-11-19). The window it ran in is told to the embedder on the next turn of the event loop
+    // ("jihad-memory-script-stopped", the outer window as the subject), so the page shed is that one, not merely the
+    // newest.
     if (sJihadStopUntilMs && JihadNowMs() < sJihadStopUntilMs &&
-        nsContentUtils::IsInitialized() && !nsContentUtils::IsCallerChrome())
+        nsContentUtils::IsInitialized() && !nsContentUtils::IsCallerChrome() &&
+        !self->mSlowScriptCheckpoint.IsNull() &&
+        (TimeStamp::NowLoRes() - self->mSlowScriptCheckpoint).ToSeconds() >= 2.0)
     {
         sJihadStopUntilMs = 0;
+        nsGlobalWindow* win = xpc::CurrentWindowOrNull(cx);
+        nsCOMPtr<nsPIDOMWindowOuter> outer = win ? win->GetOuterWindow() : nullptr;
+        if (outer) {
+            NS_DispatchToMainThread(NS_NewRunnableFunction([outer]() {
+                nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+                if (obs)
+                    obs->NotifyObservers(outer, "jihad-memory-script-stopped", nullptr);
+            }));
+        }
         fprintf(stderr, "[jihad-bs] memory guard: the running content script stopped\n");
         return false;
     }
@@ -1526,6 +1543,9 @@ XPCJSContext::~XPCJSContext()
     // Elsewhere we abort immediately if XPCJSContext initialization fails.
     // Therefore the context must be non-null.
     MOZ_ASSERT(MaybeContext());
+
+    // Jihad: jihad_js_stop_scripts may no longer reach this context (the embedder also stops its caller first)
+    sJihadMainCx = nullptr;
 
     // This destructor runs before ~CycleCollectedJSContext, which does the
     // actual JS_DestroyContext() call. But destroying the context triggers

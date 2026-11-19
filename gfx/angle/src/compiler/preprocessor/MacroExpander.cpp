@@ -47,9 +47,19 @@ class TokenLexer : public Lexer
 };
 
 MacroExpander::MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics,
-                             int allowedDepth)
-    : mLexer(lexer), mMacroSet(macroSet), mDiagnostics(diagnostics), mAllowedDepth(allowedDepth)
+                             int allowedDepth, size_t *sharedBudget)
+    : mLexer(lexer), mMacroSet(macroSet), mDiagnostics(diagnostics), mAllowedDepth(allowedDepth),
+      mOwnBudget(0), mBudget(sharedBudget ? sharedBudget : &mOwnBudget)
 {
+}
+
+// Jihad: n more tokens out of the shader's expansion budget, or false when it is spent
+bool MacroExpander::spend(size_t n)
+{
+    if (*mBudget + n > kMaxExpandedTokens)
+        return false;
+    *mBudget += n;
+    return true;
 }
 
 MacroExpander::~MacroExpander()
@@ -192,6 +202,11 @@ bool MacroExpander::expandMacro(const Macro &macro,
     SourceLocation replacementLocation = identifier.location;
     if (macro.type == Macro::kTypeObj)
     {
+        if (!spend(macro.replacements.size()))
+        {
+            mDiagnostics->report(Diagnostics::PP_OUT_OF_MEMORY, identifier.location, identifier.text);
+            return false;
+        }
         replacements->assign(macro.replacements.begin(),
                              macro.replacements.end());
 
@@ -232,7 +247,11 @@ bool MacroExpander::expandMacro(const Macro &macro,
         if (!collectMacroArgs(macro, identifier, &args, &replacementLocation))
             return false;
 
-        replaceMacroParams(macro, args, replacements);
+        if (!replaceMacroParams(macro, args, replacements))
+        {
+            mDiagnostics->report(Diagnostics::PP_OUT_OF_MEMORY, identifier.location, identifier.text);
+            return false;
+        }
     }
 
     for (std::size_t i = 0; i < replacements->size(); ++i)
@@ -338,12 +357,17 @@ bool MacroExpander::collectMacroArgs(const Macro &macro,
             return false;
         }
         TokenLexer lexer(&arg);
-        MacroExpander expander(&lexer, mMacroSet, mDiagnostics, mAllowedDepth - 1);
+        MacroExpander expander(&lexer, mMacroSet, mDiagnostics, mAllowedDepth - 1, mBudget);
 
         arg.clear();
         expander.lex(&token);
         while (token.type != Token::LAST)
         {
+            if (!spend(1))
+            {
+                mDiagnostics->report(Diagnostics::PP_OUT_OF_MEMORY, identifier.location, identifier.text);
+                return false;
+            }
             arg.push_back(token);
             expander.lex(&token);
         }
@@ -351,7 +375,7 @@ bool MacroExpander::collectMacroArgs(const Macro &macro,
     return true;
 }
 
-void MacroExpander::replaceMacroParams(const Macro &macro,
+bool MacroExpander::replaceMacroParams(const Macro &macro,
                                        const std::vector<MacroArg> &args,
                                        std::vector<Token> *replacements)
 {
@@ -360,6 +384,8 @@ void MacroExpander::replaceMacroParams(const Macro &macro,
         const Token &repl = macro.replacements[i];
         if (repl.type != Token::IDENTIFIER)
         {
+            if (!spend(1))
+                return false;
             replacements->push_back(repl);
             continue;
         }
@@ -371,6 +397,8 @@ void MacroExpander::replaceMacroParams(const Macro &macro,
             macro.parameters.begin(), macro.parameters.end(), repl.text);
         if (iter == macro.parameters.end())
         {
+            if (!spend(1))
+                return false;
             replacements->push_back(repl);
             continue;
         }
@@ -381,12 +409,15 @@ void MacroExpander::replaceMacroParams(const Macro &macro,
         {
             continue;
         }
+        if (!spend(arg.size()))
+            return false;
         std::size_t iRepl = replacements->size();
         replacements->insert(replacements->end(), arg.begin(), arg.end());
         // The replacement token inherits padding properties from
         // macro replacement token.
         replacements->at(iRepl).setHasLeadingSpace(repl.hasLeadingSpace());
     }
+    return true;
 }
 
 }  // namespace pp

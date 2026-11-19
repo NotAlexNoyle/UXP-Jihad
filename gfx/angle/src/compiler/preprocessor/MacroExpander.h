@@ -26,8 +26,11 @@ class MacroExpander : public Lexer
   public:
     // allowedDepth: how many more argument pre-expansions may nest below this one (see collectMacroArgs).
     MacroExpander(Lexer *lexer, MacroSet *macroSet, Diagnostics *diagnostics,
-                  int allowedDepth = kMaxNestedArgExpansion);
+                  int allowedDepth = kMaxNestedArgExpansion, size_t *sharedBudget = nullptr);
     static const int kMaxNestedArgExpansion = 256;
+    // Jihad: the tokens all expansions of one shader may produce, shared with the expanders nested in it (a small
+    // shader of nested D(x) x x calls produced tens of millions: Codex review 2026-11-19)
+    static const size_t kMaxExpandedTokens = 100000;
     ~MacroExpander() override;
 
     void lex(Token *token) override;
@@ -51,7 +54,8 @@ class MacroExpander : public Lexer
                           const Token &identifier,
                           std::vector<MacroArg> *args,
                           SourceLocation *closingParenthesisLocation);
-    void replaceMacroParams(const Macro &macro,
+    bool spend(size_t n);
+    bool replaceMacroParams(const Macro &macro,
                             const std::vector<MacroArg> &args,
                             std::vector<Token> *replacements);
 
@@ -85,6 +89,8 @@ class MacroExpander : public Lexer
     MacroSet *mMacroSet;
     Diagnostics *mDiagnostics;
     int mAllowedDepth;
+    size_t mOwnBudget;
+    size_t *mBudget;
 
     std::unique_ptr<Token> mReserveToken;
     std::vector<MacroContext *> mContextStack;
