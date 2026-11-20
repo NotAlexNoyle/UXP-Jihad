@@ -32,6 +32,7 @@ extern "C" int jihad_pmlog_sem_installed(void);
 // inherits from the daemon, so it lands in the variant's daemon.log. The maps dump is the
 // part that matters on ARM: even a single frame is enough to name the faulting library.
 #if defined(OS_POSIX) || defined(XP_UNIX)
+#include <errno.h>
 #include <execinfo.h>
 #include <signal.h>
 #include <ucontext.h>
@@ -161,6 +162,51 @@ jihad_plugin_scan(const char* aPath)
 }
 #endif
 
+#if defined(XP_LINUX)
+// JIHAD (cavekit-flash.md R3/R6, T-576, 2026-11-19): A PLAYER IN THE SYSTEM'S APP GROUP.
+// webOS divides the CPU between cgroups before it divides it between tasks (/dev/cpuacct,
+// /etc/default/cpushareholder): UX (7500 shares; UX/APP 10000 under it) against REST (2500;
+// REST/DAEMONS 2200, shared by some 270 tasks). Its rules put the `browserserver` job, and with
+// it the stock browser's in-process Flash player, in UX/APP beside LunaSysMgr and the web app
+// manager; our daemons' jobs (`jihad`, `jihad-mochi`, `jihad-mojo`) fall to the default,
+// REST/DAEMONS, and every player forked from them with them. Measured in play (Achievement
+// Unlocked, Enyo): the player's main thread runnable all the time and given 58-68 % of a core,
+// put off its core 600-800 times a second, with a fifth of the device idle; the stock player 81-84 %
+// and 87 times. The daemon itself stays where its job puts it (cavekit-device-headroom.md R1: a
+// page's script is what starves the system); the player goes where the stock player is.
+// Written to `tasks` here, before the process's first thread: every thread inherits the group of
+// the thread that creates it. $JIHAD_PLAYER_CGROUP names another group under /dev/cpuacct;
+// "0" or "none" leaves the process where it was started.
+static void
+jihad_join_player_cgroup()
+{
+  const char* g = getenv("JIHAD_PLAYER_CGROUP");
+  if (g && (!*g || !strcmp(g, "0") || !strcmp(g, "none"))) {
+    fprintf(stderr, "[jihad-npapi-child] cpu group: left as started ($JIHAD_PLAYER_CGROUP=%s)\n", g);
+    return;
+  }
+  if (!g) {
+    g = "UX/APP";
+  }
+  if (strstr(g, "..") || strlen(g) > 64) {
+    fprintf(stderr, "[jihad-npapi-child] cpu group: '%s' refused\n", g);
+    return;
+  }
+  char path[128];
+  snprintf(path, sizeof path, "/dev/cpuacct/%s/tasks", g);
+  FILE* f = fopen(path, "w");
+  if (!f) {
+    // a system without webOS's groups (a desktop build, a test): nothing to join
+    fprintf(stderr, "[jihad-npapi-child] cpu group %s: not joined (%s)\n", g, strerror(errno));
+    return;
+  }
+  const int wrote = fprintf(f, "%d", (int)getpid());
+  const int closed = fclose(f);
+  fprintf(stderr, "[jihad-npapi-child] cpu group %s: %s\n", g,
+          wrote > 0 && closed == 0 ? "joined" : strerror(errno));
+}
+#endif
+
 int
 content_process_main(int argc, char* argv[])
 {
@@ -222,6 +268,12 @@ content_process_main(int argc, char* argv[])
 #endif
 
     XRE_SetProcessType(argv[--argc]);
+
+#if defined(XP_LINUX)
+    if (XRE_GetProcessType() == GeckoProcessType_Plugin) {
+      jihad_join_player_cgroup();
+    }
+#endif
 
 #ifdef XP_WIN
     // For plugins, this is done in PluginProcessChild::Init, as we need to
