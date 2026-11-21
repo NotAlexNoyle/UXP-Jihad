@@ -2214,6 +2214,13 @@ nsresult nsPluginHost::ScanPluginsDirectory(nsIFile *pluginsDir,
       memset(&info, 0, sizeof(info));
       nsresult res;
       res = pluginFile.GetPluginInfo(info, &library);
+      // JIHAD (cavekit-flash.md R10): the out-of-process scan could not judge it (its time limit, the scanner not
+      // started, killed from outside): left out of this scan only, not recorded as invalid, so the next start reads it
+      // again (the inspector's review, 2026-11-21, F-001)
+      if (res == NS_ERROR_ABORT) {
+        pluginFile.FreePluginInfo(info);
+        continue;
+      }
       // if we don't have mime type don't proceed, this is not a plugin
       if (NS_FAILED(res) || !info.fMimeTypeArray) {
         RefPtr<nsInvalidPluginTag> invalidTag = new nsInvalidPluginTag(filePath.get(),

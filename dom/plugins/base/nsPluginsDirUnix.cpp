@@ -12,6 +12,8 @@
 #include "prenv.h"
 #include "prerror.h"
 #include "prio.h"
+#include "prthread.h"
+#include "nsTArray.h"
 #include <sys/stat.h>
 #include "nsString.h"
 #include "nsIFile.h"
@@ -309,7 +311,13 @@ nsresult nsPluginFile::LoadPlugin(PRLibrary **outLibrary)
 // Where the bundled loader launches the children (the device), every plugin folder library is read in a process
 // of its own under a time limit (JIHAD_PLUGIN_SCAN_MS, 10 s): one that hangs is killed, one that crashes or is not
 // a library is simply not a plugin, and none of them is ever mapped into the daemon. JIHAD_PLUGIN_SCAN_OOP=0 is the
-// old way. Returns NS_ERROR_NOT_AVAILABLE when the out-of-process scan is not in use.
+// old way. Returns NS_ERROR_NOT_AVAILABLE when the out-of-process scan is not in use, and NS_ERROR_ABORT when the scan
+// could not judge the library (the scanner did not start, did not finish in time, or was killed from outside): the
+// caller must not record such a library as invalid, or a scan made while the device swapped would leave Flash out
+// until pluginreg.dat was deleted (the inspector's review, 2026-11-21, F-001). A library that timed out is not scanned
+// again in this process (each try would cost the whole limit); the next start tries it afresh.
+static nsTArray<nsCString>* sJihadScanTimedOut;
+
 static nsresult
 JihadScanPluginOutOfProcess(const nsACString& aPath, nsPluginInfo& info)
 {
@@ -324,12 +332,17 @@ JihadScanPluginOutOfProcess(const nsACString& aPath, nsPluginInfo& info)
     nsAutoCString child(greDir);
     child.AppendLiteral("/plugin-container");
     nsAutoCString path(aPath);
+    if (sJihadScanTimedOut && sJihadScanTimedOut->Contains(path)) {
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: timed out earlier in this process: not judged\n", path.get());
+        return NS_ERROR_ABORT;
+    }
     char* argv[] = { const_cast<char*>(loader), const_cast<char*>("--library-path"), const_cast<char*>(greDir),
                      const_cast<char*>(child.get()), const_cast<char*>("-jihad-plugin-scan"),
                      const_cast<char*>(path.get()), nullptr };
     int fds[2];
     if (pipe(fds) != 0) {
-        return NS_ERROR_FAILURE;
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: no pipe (%d): not judged\n", path.get(), errno);
+        return NS_ERROR_ABORT;
     }
     fcntl(fds[0], F_SETFD, FD_CLOEXEC);
     posix_spawn_file_actions_t fa;
@@ -343,9 +356,11 @@ JihadScanPluginOutOfProcess(const nsACString& aPath, nsPluginInfo& info)
     close(fds[1]);
     if (err != 0) {
         close(fds[0]);
-        fprintf(stderr, "[jihad-npapi] plugin scan: %s: the scanner did not start (%d)\n", path.get(), err);
-        return NS_ERROR_FAILURE;
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: the scanner did not start (%d): not judged\n", path.get(), err);
+        return NS_ERROR_ABORT;
     }
+    // read until the scanner's last line ("end"), its end of output, or the limit; a scanner that closes its output
+    // and keeps running, or leaves a child holding it, is reaped below under the same limit (F-002)
     nsAutoCString out;
     bool timedOut = false;
     for (;;) {
@@ -368,21 +383,57 @@ JihadScanPluginOutOfProcess(const nsACString& aPath, nsPluginInfo& info)
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        if (n <= 0 || out.Length() > 65536) {
+        if (n <= 0) {
             break;
         }
         out.Append(buf, n);
+        if (StringEndsWith(out, NS_LITERAL_CSTRING("end\n")) || out.Length() > 65536) {
+            break;
+        }
     }
     close(fds[0]);
-    if (timedOut) {
-        kill(pid, SIGKILL);
-    }
+    // the scanner reaped within what is left of the limit, killed if it is still there at its end
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    bool reaped = false, lost = false;
+    while (!timedOut) {
+        const pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            break;
+        }
+        if (w < 0 && errno != EINTR) {
+            // reaped by someone else (ECHILD): its number may be another process's by now, so no signal goes to it,
+            // and the output alone decides
+            lost = true;
+            status = 0;
+            break;
+        }
+        const int left = limitMs - (int)PR_IntervalToMilliseconds(PR_IntervalNow() - t0);
+        if (left <= 0) {
+            timedOut = true;
+            break;
+        }
+        PR_Sleep(PR_MillisecondsToInterval(left < 20 ? left : 20));
+    }
+    if (!reaped && !lost) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
     const uint32_t ms = PR_IntervalToMilliseconds(PR_IntervalNow() - t0);
-    if (timedOut || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || !StringEndsWith(out, NS_LITERAL_CSTRING("end\n"))) {
+    // not judged: the limit, or a SIGKILL from outside (the kernel's OOM killer under swap): tried again next start
+    if (timedOut || (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+        if (timedOut) {
+            if (!sJihadScanTimedOut) {
+                sJihadScanTimedOut = new nsTArray<nsCString>();
+            }
+            sJihadScanTimedOut->AppendElement(path);
+        }
+        fprintf(stderr, "[jihad-npapi] plugin scan: %s: not judged (%s, %u ms): left out of this start only\n", path.get(),
+                timedOut ? "the scanner did not finish in time, killed" : "the scanner was killed", ms);
+        return NS_ERROR_ABORT;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !StringEndsWith(out, NS_LITERAL_CSTRING("end\n"))) {
         fprintf(stderr, "[jihad-npapi] plugin scan: %s: not a plugin (%s, %u ms): left out\n", path.get(),
-                timedOut ? "the scanner did not answer in time, killed" :
                 WIFSIGNALED(status) ? "the scanner died by a signal" : "the scanner refused it", ms);
         return NS_ERROR_FAILURE;
     }
